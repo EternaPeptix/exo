@@ -26,4 +26,15 @@ KV_CACHE_BITS: int | None = _parse_optional_int("EXO_KV_CACHE_BITS")
 DEFAULT_TOP_LOGPROBS: int = 5
 
 # TODO: We should really make this opt-in, but Kimi requires trust_remote_code=True
+
+# Expert-parallel sharding: when enabled, attention is replicated (not head-split)
+# while MoE experts are weight-sharded.
+EXO_EXPERT_PARALLEL: bool = os.environ.get("EXO_EXPERT_PARALLEL", "").lower() in ("1", "true", "yes")
+
+# MTP (Multi-Token Prediction) speculative decoding: uses model's NextN prediction head.
+EXO_MTP_SPECULATIVE: bool = os.environ.get("EXO_MTP_SPECULATIVE", "").lower() in ("1", "true", "yes")
+MTP_NUM_DRAFT_TOKENS: int = int(os.environ.get("EXO_MTP_NUM_DRAFT", "1"))
+
+# N-gram speculative decoding: uses tokenizer n-gram statistics.
+EXO_NGRAM_SPECULATIVE: bool = os.environ.get("EXO_NGRAM_SPECULATIVE", "").lower() in ("1", "true", "yes")
 TRUST_REMOTE_CODE: bool = True

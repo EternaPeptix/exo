@@ -526,7 +526,7 @@ class API:
                 status_code=400, detail=f"Failed to load model card: {exc}"
             ) from exc
         instance_combinations: list[tuple[Sharding, InstanceMeta, int]] = []
-        for sharding in (Sharding.Pipeline, Sharding.Tensor):
+        for sharding in (Sharding.Pipeline, Sharding.Tensor, Sharding.ExpertParallel):
             for instance_meta in (InstanceMeta.MlxRing, InstanceMeta.MlxJaccl):
                 instance_combinations.extend(
                     [

@@ -10,6 +10,7 @@ from exo.utils.pydantic_ext import TaggedModel
 class Sharding(str, Enum):
     Tensor = "Tensor"
     Pipeline = "Pipeline"
+    ExpertParallel = "ExpertParallel"
 
 
 class BaseShardMetadata(TaggedModel):
@@ -79,6 +80,15 @@ class TensorShardMetadata(BaseShardMetadata):
     pass
 
 
-ShardMetadata: TypeAlias = (
-    PipelineShardMetadata | CfgShardMetadata | TensorShardMetadata
+@final
+class ExpertParallelShardMetadata(TensorShardMetadata):
+    """Expert-parallel shard metadata.
+
+    Same structure as tensor-parallel (each node has all layers), but
+    attention is replicated while MoE experts are split across nodes.
+    This avoids replicating MLA latent KV across tensor-parallel ranks.
+    """
+
+
+ShardMetadata: TypeAlias = (    PipelineShardMetadata | CfgShardMetadata | TensorShardMetadata
 )

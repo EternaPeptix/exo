@@ -732,6 +732,8 @@ def tensor_auto_parallel(
         group=group,
     )
 
+    _use_expert_parallel = os.environ.get("EXO_EXPERT_PARALLEL", "").lower() in ("1", "true", "yes")
+
     if isinstance(model, (LlamaModel, Ministral3Model)):
         tensor_parallel_sharding_strategy = LlamaShardingStrategy(
             group,
@@ -741,7 +743,9 @@ def tensor_auto_parallel(
             sharded_to_all_linear_in_place,
         )
     elif isinstance(model, (DeepseekV3Model, DeepseekV32Model, KimiK25Model)):
-        tensor_parallel_sharding_strategy = DeepSeekShardingStrategy(
+        if _use_expert_parallel:
+            logger.info("Expert-parallel: attention replicated, MoE weight-sharded")
+            tensor_parallel_sharding_strategy = DeepSeekExpertParallelShardingStrategy(
             group,
             all_to_sharded_linear,
             sharded_to_all_linear,
@@ -983,6 +987,37 @@ class DeepSeekShardingStrategy(TensorParallelShardingStrategy):
 
             yield ModelLoadingResponse(layers_loaded=i, total=total)
 
+        return model
+
+
+
+class DeepSeekExpertParallelShardingStrategy(DeepSeekShardingStrategy):
+    """Expert-parallel sharding: attention replicated, MoE weight-sharded.
+
+    Avoids MLA latent KV replication across tensor-parallel ranks.
+    """
+    def shard_model(self, model: nn.Module) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(DeepseekV3Model, model)
+        total = len(model.layers)
+        for i, layer in enumerate(model.layers):
+            mx.eval(layer.parameters())
+            # ATTENTION: keep replicated (no sharding)
+            if isinstance(layer.mlp, (DeepseekV3MLP, DeepseekV32MLP)):
+                layer.mlp.gate_proj = self.all_to_sharded_linear(layer.mlp.gate_proj)
+                layer.mlp.down_proj = self.sharded_to_all_linear(layer.mlp.down_proj)
+                layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
+            else:
+                if getattr(layer.mlp, "shared_experts", None) is not None:
+                    self.all_to_sharded_linear_in_place(layer.mlp.shared_experts.gate_proj)
+                    self.sharded_to_all_linear_in_place(layer.mlp.shared_experts.down_proj)
+                    self.all_to_sharded_linear_in_place(layer.mlp.shared_experts.up_proj)
+                self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.gate_proj)
+                self.sharded_to_all_linear_in_place(layer.mlp.switch_mlp.down_proj)
+                self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.up_proj)
+                layer.mlp = ShardedMoE(layer.mlp)
+                layer.mlp.sharding_group = self.group
+            mx.eval(layer)
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 
 

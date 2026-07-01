@@ -291,6 +291,11 @@ def get_shard_assignments(
                 model_card=model_card,
                 cycle=cycle,
             )
+        case Sharding.ExpertParallel:
+            return get_shard_assignments_for_expert_parallel(
+                model_card=model_card,
+                cycle=cycle,
+            )
 
 
 def get_mlx_jaccl_devices_matrix(
