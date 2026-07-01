@@ -11,8 +11,8 @@ from anyio import (
     move_on_after,
     sleep_forever,
 )
-from exo_rs import (
-    FromSwarm,
+from exo_pyo3_bindings import (
+    PyFromSwarm as FromSwarm,
     NetworkingHandle,
 )
 from loguru import logger

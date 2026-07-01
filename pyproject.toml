@@ -81,7 +81,7 @@ build-backend = "setuptools.build_meta"
 members = ["rust/exo_rs", "bench", "tools"]
 
 [tool.maturin]
-manifest-path = "rust/exo_pyo3_bindings/Cargo.toml"
+manifest-path = "rust/exo_rs/Cargo.toml"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
