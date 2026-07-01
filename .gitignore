@@ -44,3 +44,12 @@ launchagent-exo.sh
 restart-cluster-tb.sh
 target/
 tmp/models
+<<<<<<< HEAD
+=======
+/build/exo
+/.agents
+/.claude/skills
+/.claude
+/.codex
+skills-lock.json
+>>>>>>> pr-2129

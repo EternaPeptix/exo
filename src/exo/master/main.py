@@ -11,6 +11,10 @@ from exo.master.placement import (
     place_instance,
 )
 from exo.master.placement_utils import find_ip_prioritised
+from exo.routing.event_router import (
+    EventRouterBrokenResourceError,
+    EventRouterClosedResourceError,
+)
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
 from exo.shared.types.commands import (
@@ -151,6 +155,9 @@ class Master:
                 tg.start_soon(self._event_processor)
                 tg.start_soon(self._command_processor)
                 tg.start_soon(self._plan)
+        except* (EventRouterBrokenResourceError, EventRouterClosedResourceError):
+            # Event router has been closed (try-star syntax handles error groups)
+            pass
         finally:
             self._event_log.close()
             self.global_event_sender.close()
@@ -174,6 +181,7 @@ class Master:
                         case TestCommand():
                             pass
                         case TextGeneration():
+                            # set-difference => prefill-only nodes
                             prefill_only: set[InstanceId] = set()
                             for link in self.state.instance_links.values():
                                 prefill_only.update(link.prefill_instances)
@@ -181,11 +189,13 @@ class Master:
                                 prefill_only.difference_update(link.decode_instances)
 
                             for instance in self.state.instances.values():
+                                # NON-prefill-only instances matching the model ID
                                 if (
                                     instance.shard_assignments.model_id
                                     == command.task_params.model
                                     and instance.instance_id not in prefill_only
                                 ):
+                                    # count in-flight tasks of that instance
                                     in_flight = {TaskStatus.Pending, TaskStatus.Running}
                                     task_count = sum(
                                         1
@@ -197,6 +207,7 @@ class Master:
                                         task_count
                                     )
 
+                            # there are no NON-prefill-only instances matching this model ID
                             if not instance_task_counts:
                                 raise ValueError(
                                     f"No instance found for model {command.task_params.model}"
@@ -448,7 +459,9 @@ class Master:
                                 self._event_log.read_range(command.since_idx, end),
                                 start=command.since_idx,
                             ):
-                                await self._send_event(IndexedEvent(idx=i, event=event))
+                                await self._send_indexed_event(
+                                    IndexedEvent(idx=i, event=event)
+                                )
                     for event in generated_events:
                         await self.event_sender.send(event)
                 except ValueError as e:
@@ -506,10 +519,10 @@ class Master:
                     self.state = apply(self.state, indexed)
 
                     self._event_log.append(event)
-                    await self._send_event(indexed)
+                    await self._send_indexed_event(indexed)
 
     # This function is re-entrant, take care!
-    async def _send_event(self, event: IndexedEvent):
+    async def _send_indexed_event(self, event: IndexedEvent):
         # Convenience method since this line is ugly
         await self.global_event_sender.send(
             GlobalForwarderEvent(
