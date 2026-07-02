@@ -11,7 +11,7 @@ from anyio import (
     move_on_after,
     sleep_forever,
 )
-from exo_pyo3_bindings import (
+from exo_rs import (
     PyFromSwarm as FromSwarm,
     NetworkingHandle,
 )

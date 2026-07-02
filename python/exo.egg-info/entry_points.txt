@@ -1,0 +1,2 @@
+[console_scripts]
+exo = exo.main:main

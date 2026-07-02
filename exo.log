@@ -1,0 +1,401 @@
+[ 06:56:33.9583AM | [1mINFO    [0m] [1m========================================[0m
+[ 06:56:33.9585AM | [1mINFO    [0m] [1mStarting EXO | pid=9423[0m
+[ 06:56:33.9586AM | [1mINFO    [0m] [1m========================================[0m
+[ 06:56:33.9586AM | [1mINFO    [0m] [1mEXO_LIBP2P_NAMESPACE: None[0m
+[ 06:56:33.9624AM | [1mINFO    [0m] [1mStarting node 12D3KooWE5TcmzusDVMat1Y7fdTYvR2QCAiX7dsQt6Qf5CQB2hYL[0m
+[ 06:56:33.9902AM | [1mINFO    [0m] [1mStarting Election[0m
+
+╔═══════════════════════════════════════════════════════════════════════╗
+║                                                                       ║
+║   ███████╗██╗  ██╗ ██████╗                                            ║
+║   ██╔════╝╚██╗██╔╝██╔═══██╗                                           ║
+║   █████╗   ╚███╔╝ ██║   ██║                                           ║
+║   ██╔══╝   ██╔██╗ ██║   ██║                                           ║
+║   ███████╗██╔╝ ██╗╚██████╔╝                                           ║
+║   ╚══════╝╚═╝  ╚═╝ ╚═════╝                                            ║
+║                                                                       ║
+║   Distributed AI Inference Cluster                                    ║
+║                                                                       ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+╔═══════════════════════════════════════════════════════════════════════╗
+║                                                                       ║
+║  🌐 Dashboard & API Ready                                             ║
+║                                                                       ║
+║  http://localhost:52415                                               ║
+║                                                                       ║
+║  Click the URL above to open the dashboard in your browser            ║
+║                                                                       ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+
+[ 06:56:33.9904AM | [1mINFO    [0m] [1mStarting DownloadCoordinator[0m
+[ 06:56:33.9904AM | [1mINFO    [0m] [1mStarting Worker[0m
+[ 06:56:33.9905AM | [1mINFO    [0m] [1mStarting Master[0m
+[ 06:56:33.9906AM | [1mINFO    [0m] [1mStarting API[0m
+[ 06:56:34.0112AM | [1mINFO    [0m] [1mSubscribed to global_events[0m
+[ 06:56:34.0117AM | [1mINFO    [0m] [1mSubscribed to local_events[0m
+[ 06:56:34.0118AM | [1mINFO    [0m] [1mSubscribed to commands[0m
+[ 06:56:34.0131AM | [1mINFO    [0m] [1mSubscribed to election_messages[0m
+[ 06:56:34.0134AM | [1mINFO    [0m] [1mNode elected Master[0m
+[ 06:56:34.0135AM | [1mINFO    [0m] [1mUnpausing API[0m
+[ 06:56:34.0141AM | [1mINFO    [0m] [1mRunning on http://0.0.0.0:52415 (CTRL + C to quit)[0m
+[ 06:56:34.0142AM | [1mINFO    [0m] [1mRunning on http://0.0.0.0:52415 (CTRL + C to quit)[0m
+[ 06:56:34.0151AM | [1mINFO    [0m] [1mSubscribed to connection_messages[0m
+[ 06:56:34.0153AM | [1mINFO    [0m] [1mSubscribed to download_commands[0m
+[ 06:56:36.4281AM | [1mINFO    [0m] [1mWaiting for other campaign to finish[0m
+[ 06:56:39.4307AM | [1mINFO    [0m] [1mNode elected Master[0m
+[ 06:56:39.4312AM | [1mINFO    [0m] [1mUnpausing API[0m
+[ 06:56:39.9896AM | [1mINFO    [0m] [1mExecuting command: RequestEventLog(command_id='52fd1533-441a-456a-8dba-6878ef19fca0' since_idx=0)[0m
+[ 06:57:09.3422AM | [1mINFO    [0m] [1mExecuting command: CreateInstance(command_id='3619ae56-2b47-4bf1-98a4-bab4ff45978f' instance=MlxJacclInstance(instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08', shard_assignments=ShardAssignments(model_id='pipenetwork/GLM-5.2-MLX-8bit', runner_to_shard={'eae89070-74d7-44dc-88ae-e80c46a8d697': TensorShardMetadata(model_card=ModelCard(model_id='pipenetwork/GLM-5.2-MLX-8bit', storage_size=Memory.from_bytes(789949828608), n_layers=78, hidden_size=6144, supports_tensor=True, num_key_value_heads=64, tasks=[<ModelTask.TextGeneration: 'TextGeneration'>], components=None, family='', quantization='', base_model='', capabilities=[], backends=[<Backend.MlxMetal: 'MlxMetal'>, <Backend.MlxCpu: 'MlxCpu'>, <Backend.MlxCuda: 'MlxCuda'>, <Backend.Vllm: 'Vllm'>], reasoning_dialect='none', context_length=1048576, uses_cfg=False, trust_remote_code=False, is_custom=True, vision=None, sampling_defaults=SamplingDefaults(temperature=None, top_p=None, top_k=None, min_p=None, repetition_penalty=None, presence_penalty=None, frequency_penalty=None, thinking=None, non_thinking=None)), device_rank=0, world_size=2, immediate_exception=False, should_timeout=None, start_layer=0, end_layer=78, n_layers=78), '3faaa083-a42f-4e99-b1f9-1e41475af977': TensorShardMetadata(model_card=ModelCard(model_id='pipenetwork/GLM-5.2-MLX-8bit', storage_size=Memory.from_bytes(789949828608), n_layers=78, hidden_size=6144, supports_tensor=True, num_key_value_heads=64, tasks=[<ModelTask.TextGeneration: 'TextGeneration'>], components=None, family='', quantization='', base_model='', capabilities=[], backends=[<Backend.MlxMetal: 'MlxMetal'>, <Backend.MlxCpu: 'MlxCpu'>, <Backend.MlxCuda: 'MlxCuda'>, <Backend.Vllm: 'Vllm'>], reasoning_dialect='none', context_length=1048576, uses_cfg=False, trust_remote_code=False, is_custom=True, vision=None, sampling_defaults=SamplingDefaults(temperature=None, top_p=None, top_k=None, min_p=None, repetition_penalty=None, presence_penalty=None, frequency_penalty=None, thinking=None, non_thinking=None)), device_rank=1, world_size=2, immediate_exception=False, should_timeout=None, start_layer=0, end_layer=78, n_layers=78)}, node_to_runner={'12D3KooWD1grWK48K2KJjFR1XJt8DLeGdUfnChUmdCKyjmYUxa2C': 'eae89070-74d7-44dc-88ae-e80c46a8d697', '12D3KooWE5TcmzusDVMat1Y7fdTYvR2QCAiX7dsQt6Qf5CQB2hYL': '3faaa083-a42f-4e99-b1f9-1e41475af977'}), jaccl_devices=[[None, 'rdma_en5'], ['rdma_en5', None]], jaccl_coordinators={'12D3KooWD1grWK48K2KJjFR1XJt8DLeGdUfnChUmdCKyjmYUxa2C': '0.0.0.0:60165', '12D3KooWE5TcmzusDVMat1Y7fdTYvR2QCAiX7dsQt6Qf5CQB2hYL': '192.168.0.3:60165'}))[0m
+[ 06:57:09.3783AM | [1mINFO    [0m] [1mWorker plan: CreateRunner[0m
+[ 06:57:09.8008AM | [1mINFO    [0m] [1mFast synch flag: 1[0m
+[ 06:57:10.3488AM | [33m[1mWARNING [0m] [33m[1mRunner 3faaa083-a42f-4e99-b1f9-1e41475af977 crashed with critical exception cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)[0m
+[33m[1mTraceback (most recent call last):[0m
+
+  File "<string>", line 1, in <module>
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mspawn.py[0m", line [33m122[0m, in [35mspawn_main[0m
+    [1mexitcode[0m [35m[1m=[0m [1m_main[0m[1m([0m[1mfd[0m[1m,[0m [1mparent_sentinel[0m[1m)[0m
+    [36m           │     │   └ [0m[36m[1m3[0m
+    [36m           │     └ [0m[36m[1m91[0m
+    [36m           └ [0m[36m[1m<function _main at 0x105fcc4a0>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mspawn.py[0m", line [33m135[0m, in [35m_main[0m
+    [35m[1mreturn[0m [1mself[0m[35m[1m.[0m[1m_bootstrap[0m[1m([0m[1mparent_sentinel[0m[1m)[0m
+    [36m       │    │          └ [0m[36m[1m3[0m
+    [36m       │    └ [0m[36m[1m<function BaseProcess._bootstrap at 0x105eed580>[0m
+    [36m       └ [0m[36m[1m<Process name='Process-1' parent=9423 started daemon>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mprocess.py[0m", line [33m313[0m, in [35m_bootstrap[0m
+    [1mself[0m[35m[1m.[0m[1mrun[0m[1m([0m[1m)[0m
+    [36m│    └ [0m[36m[1m<function BaseProcess.run at 0x105eecae0>[0m
+    [36m└ [0m[36m[1m<Process name='Process-1' parent=9423 started daemon>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mprocess.py[0m", line [33m108[0m, in [35mrun[0m
+    [1mself[0m[35m[1m.[0m[1m_target[0m[1m([0m[35m[1m*[0m[1mself[0m[35m[1m.[0m[1m_args[0m[1m,[0m [35m[1m**[0m[1mself[0m[35m[1m.[0m[1m_kwargs[0m[1m)[0m
+    [36m│    │        │    │        │    └ [0m[36m[1m{}[0m
+    [36m│    │        │    │        └ [0m[36m[1m<Process name='Process-1' parent=9423 started daemon>[0m
+    [36m│    │        │    └ [0m[36m[1m(<multiprocessing.resource_sharer.DupFd object at 0x1060702f0>, <multiprocessing.resource_sharer.DupFd object at 0x109dea210>...[0m
+    [36m│    │        └ [0m[36m[1m<Process name='Process-1' parent=9423 started daemon>[0m
+    [36m│    └ [0m[36m[1m<function _run_with_captured_stdio at 0x109e6e2a0>[0m
+    [36m└ [0m[36m[1m<Process name='Process-1' parent=9423 started daemon>[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/utils/[0m[32m[1masync_process.py[0m", line [33m268[0m, in [35m_run_with_captured_stdio[0m
+    [1mtarget[0m[1m([0m[35m[1m*[0m[1mtarget_args[0m[1m,[0m [35m[1m**[0m[1mtarget_kwargs[0m[1m)[0m
+    [36m│       │              └ [0m[36m[1m{}[0m
+    [36m│       └ [0m[36m[1m(BoundInstance(instance=MlxJacclInstance(instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08', shard_assignments=ShardAssignmen...[0m
+    [36m└ [0m[36m[1m<function entrypoint at 0x109db0f40>[0m
+
+> File "[32m/Users/jeweled/exo/src/exo/worker/runner/[0m[32m[1mbootstrap.py[0m", line [33m75[0m, in [35mentrypoint[0m
+    [35m[1mfrom[0m [1mexo[0m[35m[1m.[0m[1mworker[0m[35m[1m.[0m[1mengines[0m[35m[1m.[0m[1mmlx[0m[35m[1m.[0m[1mpatches[0m [35m[1mimport[0m [1mapply_mlx_patches[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/[0m[32m[1m__init__.py[0m", line [33m1[0m, in [35m<module>[0m
+    [35m[1mfrom[0m [1mexo[0m[35m[1m.[0m[1mworker[0m[35m[1m.[0m[1mengines[0m[35m[1m.[0m[1mmlx[0m[35m[1m.[0m[1mpatches[0m[35m[1m.[0m[1mopt_batch_gen[0m [35m[1mimport[0m [1mapply_batch_gen_patch[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/[0m[32m[1mopt_batch_gen.py[0m", line [33m5[0m, in [35m<module>[0m
+    [35m[1mfrom[0m [1mmlx_lm[0m[35m[1m.[0m[1mgenerate[0m [35m[1mimport[0m [1mGenerationBatch[0m
+
+[31m[1mImportError[0m:[1m cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)[0m
+[ 06:57:10.3525AM | [1mINFO    [0m] [1mbye from the runner[0m
+[ 06:57:10.3525AM | [1mINFO    [0m] [1mChecking runner's status[0m
+[ 06:57:10.3527AM | [1mINFO    [0m] [1mRunner was found to be alive, stopping process[0m
+[ 06:57:10.4337AM | [1mINFO    [0m] [1mRunner exited with exit code 1[0m
+[ 06:57:10.4338AM | [31m[1mERROR   [0m] [31m[1mRunner terminated with exitcode=1
+Runner error: ImportError: cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)
+Traceback (most recent call last):
+  File "/Users/jeweled/exo/src/exo/worker/runner/bootstrap.py", line 75, in entrypoint
+    from exo.worker.engines.mlx.patches import apply_mlx_patches
+  File "/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/__init__.py", line 1, in <module>
+    from exo.worker.engines.mlx.patches.opt_batch_gen import apply_batch_gen_patch
+  File "/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/opt_batch_gen.py", line 5, in <module>
+    from mlx_lm.generate import GenerationBatch
+ImportError: cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)
+[0m
+[ 06:57:10.4344AM | [1mINFO    [0m] [1mRunner supervisor shutting down[0m
+[ 06:57:10.4349AM | [1mINFO    [0m] [1mRunner process successfully terminated: 1[0m
+[ 06:57:10.4989AM | [1mINFO    [0m] [1mWorker plan: Shutdown[0m
+[ 06:57:10.4991AM | [1mINFO    [0m] [1mStarting task Shutdown(task_id='ec0f0a08-f28a-4ef0-9d7a-7872249412e9' task_status=<TaskStatus.Pending: 'Pending'> instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08' runner_id='3faaa083-a42f-4e99-b1f9-1e41475af977')[0m
+[ 06:57:10.4994AM | [33m[1mWARNING [0m] [33m[1mTask Shutdown(task_id='ec0f0a08-f28a-4ef0-9d7a-7872249412e9' task_status=<TaskStatus.Pending: 'Pending'> instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08' runner_id='3faaa083-a42f-4e99-b1f9-1e41475af977') dropped, runner closed communication.[0m
+[ 06:57:10.6016AM | [1mINFO    [0m] [1mWorker plan: CreateRunner[0m
+[ 06:57:11.0033AM | [1mINFO    [0m] [1mFast synch flag: 1[0m
+[ 06:57:11.5314AM | [33m[1mWARNING [0m] [33m[1mRunner 3faaa083-a42f-4e99-b1f9-1e41475af977 crashed with critical exception cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)[0m
+[33m[1mTraceback (most recent call last):[0m
+
+  File "<string>", line 1, in <module>
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mspawn.py[0m", line [33m122[0m, in [35mspawn_main[0m
+    [1mexitcode[0m [35m[1m=[0m [1m_main[0m[1m([0m[1mfd[0m[1m,[0m [1mparent_sentinel[0m[1m)[0m
+    [36m           │     │   └ [0m[36m[1m3[0m
+    [36m           │     └ [0m[36m[1m115[0m
+    [36m           └ [0m[36m[1m<function _main at 0x1055b84a0>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mspawn.py[0m", line [33m135[0m, in [35m_main[0m
+    [35m[1mreturn[0m [1mself[0m[35m[1m.[0m[1m_bootstrap[0m[1m([0m[1mparent_sentinel[0m[1m)[0m
+    [36m       │    │          └ [0m[36m[1m3[0m
+    [36m       │    └ [0m[36m[1m<function BaseProcess._bootstrap at 0x1054d9580>[0m
+    [36m       └ [0m[36m[1m<Process name='Process-2' parent=9423 started daemon>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mprocess.py[0m", line [33m313[0m, in [35m_bootstrap[0m
+    [1mself[0m[35m[1m.[0m[1mrun[0m[1m([0m[1m)[0m
+    [36m│    └ [0m[36m[1m<function BaseProcess.run at 0x1054d8ae0>[0m
+    [36m└ [0m[36m[1m<Process name='Process-2' parent=9423 started daemon>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mprocess.py[0m", line [33m108[0m, in [35mrun[0m
+    [1mself[0m[35m[1m.[0m[1m_target[0m[1m([0m[35m[1m*[0m[1mself[0m[35m[1m.[0m[1m_args[0m[1m,[0m [35m[1m**[0m[1mself[0m[35m[1m.[0m[1m_kwargs[0m[1m)[0m
+    [36m│    │        │    │        │    └ [0m[36m[1m{}[0m
+    [36m│    │        │    │        └ [0m[36m[1m<Process name='Process-2' parent=9423 started daemon>[0m
+    [36m│    │        │    └ [0m[36m[1m(<multiprocessing.resource_sharer.DupFd object at 0x1056882f0>, <multiprocessing.resource_sharer.DupFd object at 0x109402210>...[0m
+    [36m│    │        └ [0m[36m[1m<Process name='Process-2' parent=9423 started daemon>[0m
+    [36m│    └ [0m[36m[1m<function _run_with_captured_stdio at 0x1094862a0>[0m
+    [36m└ [0m[36m[1m<Process name='Process-2' parent=9423 started daemon>[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/utils/[0m[32m[1masync_process.py[0m", line [33m268[0m, in [35m_run_with_captured_stdio[0m
+    [1mtarget[0m[1m([0m[35m[1m*[0m[1mtarget_args[0m[1m,[0m [35m[1m**[0m[1mtarget_kwargs[0m[1m)[0m
+    [36m│       │              └ [0m[36m[1m{}[0m
+    [36m│       └ [0m[36m[1m(BoundInstance(instance=MlxJacclInstance(instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08', shard_assignments=ShardAssignmen...[0m
+    [36m└ [0m[36m[1m<function entrypoint at 0x1093c8f40>[0m
+
+> File "[32m/Users/jeweled/exo/src/exo/worker/runner/[0m[32m[1mbootstrap.py[0m", line [33m75[0m, in [35mentrypoint[0m
+    [35m[1mfrom[0m [1mexo[0m[35m[1m.[0m[1mworker[0m[35m[1m.[0m[1mengines[0m[35m[1m.[0m[1mmlx[0m[35m[1m.[0m[1mpatches[0m [35m[1mimport[0m [1mapply_mlx_patches[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/[0m[32m[1m__init__.py[0m", line [33m1[0m, in [35m<module>[0m
+    [35m[1mfrom[0m [1mexo[0m[35m[1m.[0m[1mworker[0m[35m[1m.[0m[1mengines[0m[35m[1m.[0m[1mmlx[0m[35m[1m.[0m[1mpatches[0m[35m[1m.[0m[1mopt_batch_gen[0m [35m[1mimport[0m [1mapply_batch_gen_patch[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/[0m[32m[1mopt_batch_gen.py[0m", line [33m5[0m, in [35m<module>[0m
+    [35m[1mfrom[0m [1mmlx_lm[0m[35m[1m.[0m[1mgenerate[0m [35m[1mimport[0m [1mGenerationBatch[0m
+
+[31m[1mImportError[0m:[1m cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)[0m
+[ 06:57:11.5331AM | [1mINFO    [0m] [1mbye from the runner[0m
+[ 06:57:11.5332AM | [1mINFO    [0m] [1mChecking runner's status[0m
+[ 06:57:11.5334AM | [1mINFO    [0m] [1mRunner was found to be alive, stopping process[0m
+[ 06:57:11.6129AM | [1mINFO    [0m] [1mRunner exited with exit code 1[0m
+[ 06:57:11.6131AM | [31m[1mERROR   [0m] [31m[1mRunner terminated with exitcode=1
+Runner error: ImportError: cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)
+Traceback (most recent call last):
+  File "/Users/jeweled/exo/src/exo/worker/runner/bootstrap.py", line 75, in entrypoint
+    from exo.worker.engines.mlx.patches import apply_mlx_patches
+  File "/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/__init__.py", line 1, in <module>
+    from exo.worker.engines.mlx.patches.opt_batch_gen import apply_batch_gen_patch
+  File "/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/opt_batch_gen.py", line 5, in <module>
+    from mlx_lm.generate import GenerationBatch
+ImportError: cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)
+[0m
+[ 06:57:11.6137AM | [1mINFO    [0m] [1mRunner supervisor shutting down[0m
+[ 06:57:11.6142AM | [1mINFO    [0m] [1mRunner process successfully terminated: 1[0m
+[ 06:57:11.6166AM | [1mINFO    [0m] [1mWorker plan: Shutdown[0m
+[ 06:57:11.6169AM | [1mINFO    [0m] [1mStarting task Shutdown(task_id='7a1be314-078d-4eeb-8b0e-1d34d341831c' task_status=<TaskStatus.Pending: 'Pending'> instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08' runner_id='3faaa083-a42f-4e99-b1f9-1e41475af977')[0m
+[ 06:57:11.6172AM | [33m[1mWARNING [0m] [33m[1mTask Shutdown(task_id='7a1be314-078d-4eeb-8b0e-1d34d341831c' task_status=<TaskStatus.Pending: 'Pending'> instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08' runner_id='3faaa083-a42f-4e99-b1f9-1e41475af977') dropped, runner closed communication.[0m
+[ 06:57:12.6388AM | [1mINFO    [0m] [1mWorker plan: CreateRunner[0m
+[ 06:57:13.0878AM | [1mINFO    [0m] [1mFast synch flag: 1[0m
+[ 06:57:13.6169AM | [33m[1mWARNING [0m] [33m[1mRunner 3faaa083-a42f-4e99-b1f9-1e41475af977 crashed with critical exception cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)[0m
+[33m[1mTraceback (most recent call last):[0m
+
+  File "<string>", line 1, in <module>
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mspawn.py[0m", line [33m122[0m, in [35mspawn_main[0m
+    [1mexitcode[0m [35m[1m=[0m [1m_main[0m[1m([0m[1mfd[0m[1m,[0m [1mparent_sentinel[0m[1m)[0m
+    [36m           │     │   └ [0m[36m[1m3[0m
+    [36m           │     └ [0m[36m[1m129[0m
+    [36m           └ [0m[36m[1m<function _main at 0x109b244a0>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mspawn.py[0m", line [33m135[0m, in [35m_main[0m
+    [35m[1mreturn[0m [1mself[0m[35m[1m.[0m[1m_bootstrap[0m[1m([0m[1mparent_sentinel[0m[1m)[0m
+    [36m       │    │          └ [0m[36m[1m3[0m
+    [36m       │    └ [0m[36m[1m<function BaseProcess._bootstrap at 0x109a45580>[0m
+    [36m       └ [0m[36m[1m<Process name='Process-3' parent=9423 started daemon>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mprocess.py[0m", line [33m313[0m, in [35m_bootstrap[0m
+    [1mself[0m[35m[1m.[0m[1mrun[0m[1m([0m[1m)[0m
+    [36m│    └ [0m[36m[1m<function BaseProcess.run at 0x109a44ae0>[0m
+    [36m└ [0m[36m[1m<Process name='Process-3' parent=9423 started daemon>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mprocess.py[0m", line [33m108[0m, in [35mrun[0m
+    [1mself[0m[35m[1m.[0m[1m_target[0m[1m([0m[35m[1m*[0m[1mself[0m[35m[1m.[0m[1m_args[0m[1m,[0m [35m[1m**[0m[1mself[0m[35m[1m.[0m[1m_kwargs[0m[1m)[0m
+    [36m│    │        │    │        │    └ [0m[36m[1m{}[0m
+    [36m│    │        │    │        └ [0m[36m[1m<Process name='Process-3' parent=9423 started daemon>[0m
+    [36m│    │        │    └ [0m[36m[1m(<multiprocessing.resource_sharer.DupFd object at 0x109ba02f0>, <multiprocessing.resource_sharer.DupFd object at 0x10d8f2210>...[0m
+    [36m│    │        └ [0m[36m[1m<Process name='Process-3' parent=9423 started daemon>[0m
+    [36m│    └ [0m[36m[1m<function _run_with_captured_stdio at 0x10d9762a0>[0m
+    [36m└ [0m[36m[1m<Process name='Process-3' parent=9423 started daemon>[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/utils/[0m[32m[1masync_process.py[0m", line [33m268[0m, in [35m_run_with_captured_stdio[0m
+    [1mtarget[0m[1m([0m[35m[1m*[0m[1mtarget_args[0m[1m,[0m [35m[1m**[0m[1mtarget_kwargs[0m[1m)[0m
+    [36m│       │              └ [0m[36m[1m{}[0m
+    [36m│       └ [0m[36m[1m(BoundInstance(instance=MlxJacclInstance(instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08', shard_assignments=ShardAssignmen...[0m
+    [36m└ [0m[36m[1m<function entrypoint at 0x10d8b8f40>[0m
+
+> File "[32m/Users/jeweled/exo/src/exo/worker/runner/[0m[32m[1mbootstrap.py[0m", line [33m75[0m, in [35mentrypoint[0m
+    [35m[1mfrom[0m [1mexo[0m[35m[1m.[0m[1mworker[0m[35m[1m.[0m[1mengines[0m[35m[1m.[0m[1mmlx[0m[35m[1m.[0m[1mpatches[0m [35m[1mimport[0m [1mapply_mlx_patches[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/[0m[32m[1m__init__.py[0m", line [33m1[0m, in [35m<module>[0m
+    [35m[1mfrom[0m [1mexo[0m[35m[1m.[0m[1mworker[0m[35m[1m.[0m[1mengines[0m[35m[1m.[0m[1mmlx[0m[35m[1m.[0m[1mpatches[0m[35m[1m.[0m[1mopt_batch_gen[0m [35m[1mimport[0m [1mapply_batch_gen_patch[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/[0m[32m[1mopt_batch_gen.py[0m", line [33m5[0m, in [35m<module>[0m
+    [35m[1mfrom[0m [1mmlx_lm[0m[35m[1m.[0m[1mgenerate[0m [35m[1mimport[0m [1mGenerationBatch[0m
+
+[31m[1mImportError[0m:[1m cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)[0m
+[ 06:57:13.6187AM | [1mINFO    [0m] [1mbye from the runner[0m
+[ 06:57:13.6187AM | [1mINFO    [0m] [1mChecking runner's status[0m
+[ 06:57:13.6189AM | [1mINFO    [0m] [1mRunner was found to be alive, stopping process[0m
+[ 06:57:13.6990AM | [1mINFO    [0m] [1mRunner exited with exit code 1[0m
+[ 06:57:13.6991AM | [31m[1mERROR   [0m] [31m[1mRunner terminated with exitcode=1
+Runner error: ImportError: cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)
+Traceback (most recent call last):
+  File "/Users/jeweled/exo/src/exo/worker/runner/bootstrap.py", line 75, in entrypoint
+    from exo.worker.engines.mlx.patches import apply_mlx_patches
+  File "/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/__init__.py", line 1, in <module>
+    from exo.worker.engines.mlx.patches.opt_batch_gen import apply_batch_gen_patch
+  File "/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/opt_batch_gen.py", line 5, in <module>
+    from mlx_lm.generate import GenerationBatch
+ImportError: cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)
+[0m
+[ 06:57:13.6997AM | [1mINFO    [0m] [1mRunner supervisor shutting down[0m
+[ 06:57:13.7001AM | [1mINFO    [0m] [1mRunner process successfully terminated: 1[0m
+[ 06:57:13.7668AM | [1mINFO    [0m] [1mWorker plan: Shutdown[0m
+[ 06:57:13.7673AM | [1mINFO    [0m] [1mStarting task Shutdown(task_id='7f64feec-78ab-41f6-8bce-598f860a3949' task_status=<TaskStatus.Pending: 'Pending'> instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08' runner_id='3faaa083-a42f-4e99-b1f9-1e41475af977')[0m
+[ 06:57:13.7677AM | [33m[1mWARNING [0m] [33m[1mTask Shutdown(task_id='7f64feec-78ab-41f6-8bce-598f860a3949' task_status=<TaskStatus.Pending: 'Pending'> instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08' runner_id='3faaa083-a42f-4e99-b1f9-1e41475af977') dropped, runner closed communication.[0m
+[ 06:57:16.7328AM | [1mINFO    [0m] [1mWorker plan: CreateRunner[0m
+[ 06:57:17.1742AM | [1mINFO    [0m] [1mFast synch flag: 1[0m
+[ 06:57:17.7078AM | [33m[1mWARNING [0m] [33m[1mRunner 3faaa083-a42f-4e99-b1f9-1e41475af977 crashed with critical exception cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)[0m
+[33m[1mTraceback (most recent call last):[0m
+
+  File "<string>", line 1, in <module>
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mspawn.py[0m", line [33m122[0m, in [35mspawn_main[0m
+    [1mexitcode[0m [35m[1m=[0m [1m_main[0m[1m([0m[1mfd[0m[1m,[0m [1mparent_sentinel[0m[1m)[0m
+    [36m           │     │   └ [0m[36m[1m3[0m
+    [36m           │     └ [0m[36m[1m129[0m
+    [36m           └ [0m[36m[1m<function _main at 0x105d644a0>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mspawn.py[0m", line [33m135[0m, in [35m_main[0m
+    [35m[1mreturn[0m [1mself[0m[35m[1m.[0m[1m_bootstrap[0m[1m([0m[1mparent_sentinel[0m[1m)[0m
+    [36m       │    │          └ [0m[36m[1m3[0m
+    [36m       │    └ [0m[36m[1m<function BaseProcess._bootstrap at 0x105c85580>[0m
+    [36m       └ [0m[36m[1m<Process name='Process-4' parent=9423 started daemon>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mprocess.py[0m", line [33m313[0m, in [35m_bootstrap[0m
+    [1mself[0m[35m[1m.[0m[1mrun[0m[1m([0m[1m)[0m
+    [36m│    └ [0m[36m[1m<function BaseProcess.run at 0x105c84ae0>[0m
+    [36m└ [0m[36m[1m<Process name='Process-4' parent=9423 started daemon>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mprocess.py[0m", line [33m108[0m, in [35mrun[0m
+    [1mself[0m[35m[1m.[0m[1m_target[0m[1m([0m[35m[1m*[0m[1mself[0m[35m[1m.[0m[1m_args[0m[1m,[0m [35m[1m**[0m[1mself[0m[35m[1m.[0m[1m_kwargs[0m[1m)[0m
+    [36m│    │        │    │        │    └ [0m[36m[1m{}[0m
+    [36m│    │        │    │        └ [0m[36m[1m<Process name='Process-4' parent=9423 started daemon>[0m
+    [36m│    │        │    └ [0m[36m[1m(<multiprocessing.resource_sharer.DupFd object at 0x105de02f0>, <multiprocessing.resource_sharer.DupFd object at 0x109b46210>...[0m
+    [36m│    │        └ [0m[36m[1m<Process name='Process-4' parent=9423 started daemon>[0m
+    [36m│    └ [0m[36m[1m<function _run_with_captured_stdio at 0x109bca2a0>[0m
+    [36m└ [0m[36m[1m<Process name='Process-4' parent=9423 started daemon>[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/utils/[0m[32m[1masync_process.py[0m", line [33m268[0m, in [35m_run_with_captured_stdio[0m
+    [1mtarget[0m[1m([0m[35m[1m*[0m[1mtarget_args[0m[1m,[0m [35m[1m**[0m[1mtarget_kwargs[0m[1m)[0m
+    [36m│       │              └ [0m[36m[1m{}[0m
+    [36m│       └ [0m[36m[1m(BoundInstance(instance=MlxJacclInstance(instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08', shard_assignments=ShardAssignmen...[0m
+    [36m└ [0m[36m[1m<function entrypoint at 0x109b0cf40>[0m
+
+> File "[32m/Users/jeweled/exo/src/exo/worker/runner/[0m[32m[1mbootstrap.py[0m", line [33m75[0m, in [35mentrypoint[0m
+    [35m[1mfrom[0m [1mexo[0m[35m[1m.[0m[1mworker[0m[35m[1m.[0m[1mengines[0m[35m[1m.[0m[1mmlx[0m[35m[1m.[0m[1mpatches[0m [35m[1mimport[0m [1mapply_mlx_patches[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/[0m[32m[1m__init__.py[0m", line [33m1[0m, in [35m<module>[0m
+    [35m[1mfrom[0m [1mexo[0m[35m[1m.[0m[1mworker[0m[35m[1m.[0m[1mengines[0m[35m[1m.[0m[1mmlx[0m[35m[1m.[0m[1mpatches[0m[35m[1m.[0m[1mopt_batch_gen[0m [35m[1mimport[0m [1mapply_batch_gen_patch[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/[0m[32m[1mopt_batch_gen.py[0m", line [33m5[0m, in [35m<module>[0m
+    [35m[1mfrom[0m [1mmlx_lm[0m[35m[1m.[0m[1mgenerate[0m [35m[1mimport[0m [1mGenerationBatch[0m
+
+[31m[1mImportError[0m:[1m cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)[0m
+[ 06:57:17.7095AM | [1mINFO    [0m] [1mbye from the runner[0m
+[ 06:57:17.7095AM | [1mINFO    [0m] [1mChecking runner's status[0m
+[ 06:57:17.7097AM | [1mINFO    [0m] [1mRunner was found to be alive, stopping process[0m
+[ 06:57:17.7884AM | [1mINFO    [0m] [1mRunner exited with exit code 1[0m
+[ 06:57:17.7885AM | [31m[1mERROR   [0m] [31m[1mRunner terminated with exitcode=1
+Runner error: ImportError: cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)
+Traceback (most recent call last):
+  File "/Users/jeweled/exo/src/exo/worker/runner/bootstrap.py", line 75, in entrypoint
+    from exo.worker.engines.mlx.patches import apply_mlx_patches
+  File "/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/__init__.py", line 1, in <module>
+    from exo.worker.engines.mlx.patches.opt_batch_gen import apply_batch_gen_patch
+  File "/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/opt_batch_gen.py", line 5, in <module>
+    from mlx_lm.generate import GenerationBatch
+ImportError: cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)
+[0m
+[ 06:57:17.7891AM | [1mINFO    [0m] [1mRunner supervisor shutting down[0m
+[ 06:57:17.7895AM | [1mINFO    [0m] [1mRunner process successfully terminated: 1[0m
+[ 06:57:17.8653AM | [1mINFO    [0m] [1mWorker plan: Shutdown[0m
+[ 06:57:17.8656AM | [1mINFO    [0m] [1mStarting task Shutdown(task_id='dfb54e3a-635a-4381-8deb-ff90de61fba3' task_status=<TaskStatus.Pending: 'Pending'> instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08' runner_id='3faaa083-a42f-4e99-b1f9-1e41475af977')[0m
+[ 06:57:17.8659AM | [33m[1mWARNING [0m] [33m[1mTask Shutdown(task_id='dfb54e3a-635a-4381-8deb-ff90de61fba3' task_status=<TaskStatus.Pending: 'Pending'> instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08' runner_id='3faaa083-a42f-4e99-b1f9-1e41475af977') dropped, runner closed communication.[0m
+[ 06:57:24.8171AM | [1mINFO    [0m] [1mWorker plan: CreateRunner[0m
+[ 06:57:25.2410AM | [1mINFO    [0m] [1mFast synch flag: 1[0m
+[ 06:57:25.7747AM | [33m[1mWARNING [0m] [33m[1mRunner 3faaa083-a42f-4e99-b1f9-1e41475af977 crashed with critical exception cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)[0m
+[33m[1mTraceback (most recent call last):[0m
+
+  File "<string>", line 1, in <module>
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mspawn.py[0m", line [33m122[0m, in [35mspawn_main[0m
+    [1mexitcode[0m [35m[1m=[0m [1m_main[0m[1m([0m[1mfd[0m[1m,[0m [1mparent_sentinel[0m[1m)[0m
+    [36m           │     │   └ [0m[36m[1m3[0m
+    [36m           │     └ [0m[36m[1m142[0m
+    [36m           └ [0m[36m[1m<function _main at 0x1098dc4a0>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mspawn.py[0m", line [33m135[0m, in [35m_main[0m
+    [35m[1mreturn[0m [1mself[0m[35m[1m.[0m[1m_bootstrap[0m[1m([0m[1mparent_sentinel[0m[1m)[0m
+    [36m       │    │          └ [0m[36m[1m3[0m
+    [36m       │    └ [0m[36m[1m<function BaseProcess._bootstrap at 0x10481d580>[0m
+    [36m       └ [0m[36m[1m<Process name='Process-5' parent=9423 started daemon>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mprocess.py[0m", line [33m313[0m, in [35m_bootstrap[0m
+    [1mself[0m[35m[1m.[0m[1mrun[0m[1m([0m[1m)[0m
+    [36m│    └ [0m[36m[1m<function BaseProcess.run at 0x10481cae0>[0m
+    [36m└ [0m[36m[1m<Process name='Process-5' parent=9423 started daemon>[0m
+
+  File "[32m/opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/[0m[32m[1mprocess.py[0m", line [33m108[0m, in [35mrun[0m
+    [1mself[0m[35m[1m.[0m[1m_target[0m[1m([0m[35m[1m*[0m[1mself[0m[35m[1m.[0m[1m_args[0m[1m,[0m [35m[1m**[0m[1mself[0m[35m[1m.[0m[1m_kwargs[0m[1m)[0m
+    [36m│    │        │    │        │    └ [0m[36m[1m{}[0m
+    [36m│    │        │    │        └ [0m[36m[1m<Process name='Process-5' parent=9423 started daemon>[0m
+    [36m│    │        │    └ [0m[36m[1m(<multiprocessing.resource_sharer.DupFd object at 0x1099582f0>, <multiprocessing.resource_sharer.DupFd object at 0x10d696210>...[0m
+    [36m│    │        └ [0m[36m[1m<Process name='Process-5' parent=9423 started daemon>[0m
+    [36m│    └ [0m[36m[1m<function _run_with_captured_stdio at 0x10d71a2a0>[0m
+    [36m└ [0m[36m[1m<Process name='Process-5' parent=9423 started daemon>[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/utils/[0m[32m[1masync_process.py[0m", line [33m268[0m, in [35m_run_with_captured_stdio[0m
+    [1mtarget[0m[1m([0m[35m[1m*[0m[1mtarget_args[0m[1m,[0m [35m[1m**[0m[1mtarget_kwargs[0m[1m)[0m
+    [36m│       │              └ [0m[36m[1m{}[0m
+    [36m│       └ [0m[36m[1m(BoundInstance(instance=MlxJacclInstance(instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08', shard_assignments=ShardAssignmen...[0m
+    [36m└ [0m[36m[1m<function entrypoint at 0x10d65cf40>[0m
+
+> File "[32m/Users/jeweled/exo/src/exo/worker/runner/[0m[32m[1mbootstrap.py[0m", line [33m75[0m, in [35mentrypoint[0m
+    [35m[1mfrom[0m [1mexo[0m[35m[1m.[0m[1mworker[0m[35m[1m.[0m[1mengines[0m[35m[1m.[0m[1mmlx[0m[35m[1m.[0m[1mpatches[0m [35m[1mimport[0m [1mapply_mlx_patches[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/[0m[32m[1m__init__.py[0m", line [33m1[0m, in [35m<module>[0m
+    [35m[1mfrom[0m [1mexo[0m[35m[1m.[0m[1mworker[0m[35m[1m.[0m[1mengines[0m[35m[1m.[0m[1mmlx[0m[35m[1m.[0m[1mpatches[0m[35m[1m.[0m[1mopt_batch_gen[0m [35m[1mimport[0m [1mapply_batch_gen_patch[0m
+
+  File "[32m/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/[0m[32m[1mopt_batch_gen.py[0m", line [33m5[0m, in [35m<module>[0m
+    [35m[1mfrom[0m [1mmlx_lm[0m[35m[1m.[0m[1mgenerate[0m [35m[1mimport[0m [1mGenerationBatch[0m
+
+[31m[1mImportError[0m:[1m cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)[0m
+[ 06:57:25.7764AM | [1mINFO    [0m] [1mbye from the runner[0m
+[ 06:57:25.7765AM | [1mINFO    [0m] [1mChecking runner's status[0m
+[ 06:57:25.7767AM | [1mINFO    [0m] [1mRunner was found to be alive, stopping process[0m
+[ 06:57:25.8568AM | [1mINFO    [0m] [1mRunner exited with exit code 1[0m
+[ 06:57:25.8570AM | [31m[1mERROR   [0m] [31m[1mRunner terminated with exitcode=1
+Runner error: ImportError: cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)
+Traceback (most recent call last):
+  File "/Users/jeweled/exo/src/exo/worker/runner/bootstrap.py", line 75, in entrypoint
+    from exo.worker.engines.mlx.patches import apply_mlx_patches
+  File "/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/__init__.py", line 1, in <module>
+    from exo.worker.engines.mlx.patches.opt_batch_gen import apply_batch_gen_patch
+  File "/Users/jeweled/exo/src/exo/worker/engines/mlx/patches/opt_batch_gen.py", line 5, in <module>
+    from mlx_lm.generate import GenerationBatch
+ImportError: cannot import name 'GenerationBatch' from 'mlx_lm.generate' (/Users/jeweled/exo/.venv/lib/python3.13/site-packages/mlx_lm/generate.py)
+[0m
+[ 06:57:25.8575AM | [1mINFO    [0m] [1mRunner supervisor shutting down[0m
+[ 06:57:25.8580AM | [1mINFO    [0m] [1mRunner process successfully terminated: 1[0m
+[ 06:57:25.9427AM | [1mINFO    [0m] [1mWorker plan: Shutdown[0m
+[ 06:57:25.9429AM | [1mINFO    [0m] [1mStarting task Shutdown(task_id='3e4d08b8-2801-4ecb-a9ec-d8ecd9538c36' task_status=<TaskStatus.Pending: 'Pending'> instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08' runner_id='3faaa083-a42f-4e99-b1f9-1e41475af977')[0m
+[ 06:57:25.9433AM | [33m[1mWARNING [0m] [33m[1mTask Shutdown(task_id='3e4d08b8-2801-4ecb-a9ec-d8ecd9538c36' task_status=<TaskStatus.Pending: 'Pending'> instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08' runner_id='3faaa083-a42f-4e99-b1f9-1e41475af977') dropped, runner closed communication.[0m
+[ 06:57:34.9285AM | [33m[1mWARNING [0m] [33m[1mInstance 415a34a4-a1e1-497b-8cf6-77f6aa467c08 exceeded 5 retries, requesting deletion[0m
+[ 06:57:34.9318AM | [1mINFO    [0m] [1mExecuting command: DeleteInstance(command_id='b4ceb4c1-7138-492a-a9fc-1b4f11f41314' instance_id='415a34a4-a1e1-497b-8cf6-77f6aa467c08')[0m
+[ 07:46:03.8655AM | [1mINFO    [0m] [1mRotated event log: /Users/jeweled/.exo/event_log/master/events.bin -> /Users/jeweled/.exo/event_log/master/events.2026-06-23_14-46-03_818679.bin.zst[0m
+[ 07:46:03.8895AM | [1mINFO    [0m] [1mRotated event log: /Users/jeweled/.exo/event_log/api/events.bin -> /Users/jeweled/.exo/event_log/api/events.2026-06-23_14-46-03_867529.bin.zst[0m
+[ 07:46:03.8901AM | [1mINFO    [0m] [1mStopping Worker[0m
+[ 07:46:04.8740AM | [1mINFO    [0m] [1mEXO Shutdown complete[0m
