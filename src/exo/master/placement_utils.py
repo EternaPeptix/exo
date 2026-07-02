@@ -11,6 +11,7 @@ from exo.shared.types.topology import Cycle, RDMAConnection, SocketConnection
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments
 from exo.shared.types.worker.shards import (
     CfgShardMetadata,
+    ExpertParallelShardMetadata,
     PipelineShardMetadata,
     Sharding,
     ShardMetadata,
@@ -296,6 +297,35 @@ def get_shard_assignments(
                 model_card=model_card,
                 cycle=cycle,
             )
+
+
+def get_shard_assignments_for_expert_parallel(
+    model_card: ModelCard,
+    cycle: Cycle,
+) -> ShardAssignments:
+    total_layers = model_card.n_layers
+    world_size = len(cycle)
+    runner_to_shard: dict[RunnerId, ShardMetadata] = {}
+    node_to_runner: dict[NodeId, RunnerId] = {}
+
+    for i, node_id in enumerate(cycle):
+        shard = ExpertParallelShardMetadata(
+            model_card=model_card,
+            device_rank=i,
+            world_size=world_size,
+            start_layer=0,
+            end_layer=total_layers,
+            n_layers=total_layers,
+        )
+        runner_id = RunnerId()
+        runner_to_shard[runner_id] = shard
+        node_to_runner[node_id] = runner_id
+
+    return ShardAssignments(
+        model_id=model_card.model_id,
+        runner_to_shard=runner_to_shard,
+        node_to_runner=node_to_runner,
+    )
 
 
 def get_mlx_jaccl_devices_matrix(
