@@ -1,3 +1,4 @@
+import os
 import atexit as _atexit
 import socket as _socket
 from abc import ABC, abstractmethod
@@ -746,12 +747,20 @@ def tensor_auto_parallel(
         if _use_expert_parallel:
             logger.info("Expert-parallel: attention replicated, MoE weight-sharded")
             tensor_parallel_sharding_strategy = DeepSeekExpertParallelShardingStrategy(
-            group,
-            all_to_sharded_linear,
-            sharded_to_all_linear,
-            all_to_sharded_linear_in_place,
-            sharded_to_all_linear_in_place,
-        )
+                group,
+                all_to_sharded_linear,
+                sharded_to_all_linear,
+                all_to_sharded_linear_in_place,
+                sharded_to_all_linear_in_place,
+            )
+        else:
+            tensor_parallel_sharding_strategy = DeepSeekShardingStrategy(
+                group,
+                all_to_sharded_linear,
+                sharded_to_all_linear,
+                all_to_sharded_linear_in_place,
+                sharded_to_all_linear_in_place,
+            )
     elif isinstance(model, DeepseekV4Model):
         tensor_parallel_sharding_strategy = DeepseekV4ShardingStrategy(
             group,

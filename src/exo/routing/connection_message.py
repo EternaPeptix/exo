@@ -1,4 +1,4 @@
-from exo_rs import PyFromSwarm as FromSwarm
+from exo_rs import FromSwarm
 
 from exo.utils.pydantic_ext import FrozenModel
 

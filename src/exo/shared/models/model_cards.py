@@ -160,7 +160,6 @@ class ModelCard(FrozenModel):
     n_layers: PositiveInt
     hidden_size: PositiveInt
     supports_tensor: bool
-    supports_expert_parallel: bool = False
     num_key_value_heads: PositiveInt | None = None
     tasks: list[ModelTask]
     components: list[ComponentInfo] | None = None
@@ -252,7 +251,6 @@ class ModelCard(FrozenModel):
             n_layers=num_layers,
             hidden_size=config_data.hidden_size or 0,
             supports_tensor=config_data.supports_tensor,
-            supports_expert_parallel=config_data.supports_expert_parallel,
             num_key_value_heads=config_data.num_key_value_heads,
             context_length=config_data.max_position_embeddings,
             tasks=[ModelTask.TextGeneration],
@@ -283,6 +281,7 @@ class ConfigData(BaseModel):
     )
     max_position_embeddings: int = 0
     vision: VisionCardConfig | None = None
+    supports_expert_parallel: bool = False
 
     @property
     def supports_tensor(self) -> bool:

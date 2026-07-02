@@ -28,7 +28,20 @@ pub fn cfg(identity: &str, listen_port: u16) -> Result<zenoh::Config> {
     // todo: cleanup
     cfg.insert_json5("id", &format!("\"{identity}\""))?;
     cfg.insert_json5("mode", "\"router\"")?;
-    cfg.insert_json5("listen/endpoints", &format!("[\"tcp/[::]:{listen_port}\"]"))?;
+    cfg.insert_json5(
+        "listen/endpoints",
+        &format!("[\"tcp/0.0.0.0:{listen_port}\"]"),
+    )?;
+    if let Ok(connect) = std::env::var("EXO_ZENOH_CONNECT") {
+        let endpoints: Vec<String> = connect
+            .split(',')
+            .map(|s| format!("\"{}\"", s.trim()))
+            .collect();
+        if !endpoints.is_empty() {
+            cfg.insert_json5("connect/endpoints", &format!("[{}]", endpoints.join(",")))?;
+            log::info!("EXO_ZENOH_CONNECT endpoints: {:?}", endpoints);
+        }
+    }
     cfg.insert_json5("scouting/multicast/enabled", "false")?;
     cfg.insert_json5("scouting/multicast/autoconnect", "[]")?;
     cfg.insert_json5("scouting/gossip/multihop", "true")?;

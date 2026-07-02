@@ -12,7 +12,7 @@ from anyio import (
     sleep_forever,
 )
 from exo_rs import (
-    PyFromSwarm as FromSwarm,
+    FromSwarm,
     NetworkingHandle,
 )
 from loguru import logger
