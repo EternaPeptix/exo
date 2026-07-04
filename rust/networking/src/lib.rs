@@ -30,7 +30,10 @@ pub fn cfg(identity: &str, listen_port: u16) -> Result<zenoh::Config> {
     cfg.insert_json5("mode", "\"router\"")?;
     cfg.insert_json5(
         "listen/endpoints",
-        &format!("[\"tcp/0.0.0.0:{listen_port}\"]"),
+        // Bind BOTH IPv4 and IPv6: discovery exchanges IPv6 link-local addresses,
+        // so peers will try to connect_peer over IPv6. Binding only 0.0.0.0 (IPv4)
+        // causes those connections to be refused (ECONNREFUSED) and peering fails.
+        &format!("[\"tcp/0.0.0.0:{listen_port}\", \"tcp/[::]:{listen_port}\"]"),
     )?;
     if let Ok(connect) = std::env::var("EXO_ZENOH_CONNECT") {
         let endpoints: Vec<String> = connect
