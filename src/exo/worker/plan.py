@@ -316,8 +316,15 @@ def _pending_tasks(
             if task.task_id in runner.completed or task.task_id in runner.in_progress:
                 continue
 
+            # Dispatch based on LOCAL runner status (reliable; set in-process by the
+            # supervisor) plus peer-runner existence. The previous gate also required
+            # every peer runner to be observed as Ready/Running, but peer status is not
+            # reliably propagated (see note in _init_distributed_backend), so only one
+            # rank would pass this gate and receive the TextGeneration task. The other
+            # rank never stepped, so the decode all-gather/send-recv collective in the
+            # sharded forward pass deadlocked and no tokens were produced.
             if isinstance(runner.status, (RunnerReady, RunnerRunning)) and all(
-                isinstance(all_runners[global_runner_id], (RunnerReady, RunnerRunning))
+                all_runners.get(global_runner_id) is not None
                 for global_runner_id in runner.bound_instance.instance.shard_assignments.runner_to_shard
             ):
                 return task
