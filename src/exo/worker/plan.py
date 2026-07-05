@@ -179,37 +179,30 @@ def _init_distributed_backend(
         if is_single_node_instance:
             continue
 
-        runner_is_idle = isinstance(runner.status, RunnerIdle)
-        all_runners_connecting = all(
-            isinstance(
-                all_runners.get(global_runner_id),
-                (RunnerConnecting, RunnerIdle),
-            )
-            for global_runner_id in shard_assignments.runner_to_shard
-        )
-
-        if not (runner_is_idle and all_runners_connecting):
+        # A runner fires ConnectToGroup as soon as its own runner is idle AND every
+        # peer runner in the group has been created (i.e. has any known status).
+        #
+        # Previously this required rank N-1 to wait until all peers had reached
+        # RunnerConnecting. That created a fragile inter-rank status dependency:
+        # the RunnerConnecting status update is emitted from inside the runner
+        # subprocess immediately before it enters the blocking generator.connect()
+        # call, and in practice it does not always propagate to peers before they
+        # evaluate plan(). The result was a deterministic deadlock: rank 0 entered
+        # connect() and blocked waiting for rank 1 to join the collective, while
+        # rank 1's plan() looped forever waiting for rank 0's RunnerConnecting.
+        #
+        # Rank coordination/ordering is handled inside generator.connect() (the
+        # JACCL/QP layer synchronises ranks via the coordinator regardless of the
+        # order in which ranks call connect), so the plan layer does not need to
+        # enforce it. We only require that all peers exist so connect() has someone
+        # to rendezvous with.
+        if not isinstance(runner.status, RunnerIdle):
             continue
 
-        runner_id = runner.bound_instance.bound_runner_id
-
-        shard = runner.bound_instance.bound_shard
-        device_rank = shard.device_rank
-        world_size = shard.world_size
-
-        assert device_rank < world_size
-        assert device_rank >= 0
-
-        accepting_ranks = device_rank < world_size - 1
-
-        # Rank = n-1
-        connecting_rank_ready = device_rank == world_size - 1 and all(
-            isinstance(all_runners.get(global_runner_id, None), RunnerConnecting)
+        if not all(
+            all_runners.get(global_runner_id) is not None
             for global_runner_id in shard_assignments.runner_to_shard
-            if global_runner_id != runner_id
-        )
-
-        if not (accepting_ranks or connecting_rank_ready):
+        ):
             continue
 
         return ConnectToGroup(instance_id=instance.instance_id)
@@ -242,17 +235,16 @@ def _load_model(
         if is_single_node_instance and isinstance(runner.status, RunnerIdle):
             return LoadModel(instance_id=instance.instance_id)
 
-        is_runner_waiting = isinstance(runner.status, RunnerConnected)
-
-        all_ready_for_model = all(
-            isinstance(
-                all_runners.get(global_runner_id, None),
-                (RunnerConnected, RunnerLoading, RunnerLoaded),
-            )
+        # Local status is reliable (set in-process by the supervisor); peer status is
+        # propagated through the master event log and is not reliably visible to us
+        # (see note in _init_distributed_backend). Once our runner is connected and
+        # every peer runner exists in the group, proceed to load — the JACCL group is
+        # already established by ConnectToGroup, and load() does not require peer
+        # coordination beyond the group existing.
+        if isinstance(runner.status, RunnerConnected) and all(
+            all_runners.get(global_runner_id) is not None
             for global_runner_id in shard_assignments.runner_to_shard
-        )
-
-        if is_runner_waiting and all_ready_for_model:
+        ):
             return LoadModel(instance_id=instance.instance_id)
 
     return None
@@ -270,28 +262,16 @@ def _ready_to_warmup(
         runner_id = runner.bound_instance.bound_runner_id
         world_size = shard.world_size
 
-        is_runner_loaded = isinstance(runner.status, RunnerLoaded)
-
-        assert device_rank < world_size
-        assert device_rank >= 0
-
-        # Rank != 0
-        accepting_ranks_ready = device_rank > 0 and all(
-            isinstance(
-                all_runners.get(global_runner_id, None),
-                (RunnerLoaded, RunnerWarmingUp),
-            )
+        # Warmup (prefill) is itself a distributed collective: the MLX/JACCL layer
+        # synchronises ranks internally regardless of who starts first. We therefore
+        # fire StartWarmup as soon as our runner is locally loaded and every peer
+        # runner exists. The previous rank-ordered gate depended on peer
+        # Loaded/WarmingUp status, which is not reliably propagated (see note in
+        # _init_distributed_backend) and deadlocked warmup.
+        if isinstance(runner.status, RunnerLoaded) and all(
+            all_runners.get(global_runner_id) is not None
             for global_runner_id in shard_assignments.runner_to_shard
-        )
-
-        # Rank = 0
-        connecting_rank_ready = device_rank == 0 and all(
-            isinstance(all_runners.get(global_runner_id, None), RunnerWarmingUp)
-            for global_runner_id in shard_assignments.runner_to_shard
-            if global_runner_id != runner_id
-        )
-
-        if is_runner_loaded and (accepting_ranks_ready or connecting_rank_ready):
+        ):
             return StartWarmup(instance_id=instance.instance_id)
 
     return None
