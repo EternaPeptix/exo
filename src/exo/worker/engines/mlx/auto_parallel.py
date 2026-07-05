@@ -153,13 +153,27 @@ class TcpRelay:
         else:
             self._cuda_peers = set()
 
-        # Dtype serialization maps (built once)
+        # Dtype serialization table. We map each MLX dtype to a stable wire
+        # code plus a numpy-native "transport dtype". bf16 cannot be held by
+        # numpy directly (np.bfloat16 does not exist in many numpy builds and
+        # np.array(mx_bf16) raises), so we transport bf16 as float32 (a
+        # lossless promotion: bf16 -> f32 is exact) and cast back on recv.
+        # Built without referencing np.bfloat16 so construction never crashes.
         import numpy as _np
-        self._DTYPE_TO_CODE = {
-            _np.float32: 0, _np.float16: 1, _np.int32: 2, _np.int64: 3,
-            _np.bool_: 4, _np.uint8: 5, _np.bfloat16: 6,
-        }
-        self._CODE_TO_DTYPE = {v: k for k, v in self._DTYPE_TO_CODE.items()}
+        self._DTYPE_TABLE = [
+            # (wire_code, mlx_dtype, transport_mlx_dtype, numpy_transport_dtype, needs_cast_back)
+            (0, mx.float32,  mx.float32,  _np.float32, False),
+            (1, mx.float16,  mx.float16,  _np.float16, False),
+            (2, mx.int32,    mx.int32,    _np.int32,   False),
+            (3, mx.int64,    mx.int64,    _np.int64,   False),
+            (4, mx.bool_,    mx.bool_,    _np.bool_,   False),
+            (5, mx.uint8,    mx.uint8,    _np.uint8,   False),
+            # bf16 cannot be held by numpy; transport as float32 (lossless) and
+            # cast back to bf16 on the receiver.
+            (6, mx.bfloat16, mx.float32,  _np.float32, True),
+        ]
+        self._MLX_TO_ENTRY = {e[1]: e for e in self._DTYPE_TABLE}
+        self._CODE_TO_ENTRY = {e[0]: e for e in self._DTYPE_TABLE}
 
         self._server_socket: _socket.socket | None = None
         self._connections: dict[int, _socket.socket] = {}
@@ -219,19 +233,32 @@ class TcpRelay:
         raise ConnectionError(f"Could not connect to rank {dst_rank} at {peer_ip}:{peer_port}") from last_err
 
     def send(self, x: mx.array, dst: int) -> mx.array:
-        """Send array to dst rank via TCP."""
+        """Send array to dst rank via TCP.
+
+        bf16 (and any mlx dtype numpy cannot hold directly) is promoted to a
+        lossless numpy-native transport dtype for the wire; the original mlx
+        dtype is carried in the header so the receiver can cast back exactly.
+        """
         import struct
 
         import numpy as np
 
-        x_np = np.array(x)
         mx.eval(x)
+        entry = self._MLX_TO_ENTRY.get(x.dtype)
+        if entry is None:
+            raise ValueError(f"TcpRelay.send: unsupported mlx dtype {x.dtype}")
+        wire_code, mlx_dtype, transport_mlx_dtype, np_transport, cast_back = entry
 
-        dtype_code = self._DTYPE_TO_CODE.get(x_np.dtype.type, 0)
-
+        # Promote to the numpy-native transport dtype, then materialise bytes.
+        x_transport = x.astype(transport_mlx_dtype)
+        x_np = np.array(x_transport)
         data = x_np.tobytes()
-        header = struct.pack("!IIIQ", len(x_np.shape), dtype_code, x_np.dtype.itemsize, len(data))
-        shape_data = struct.pack(f"!{len(x_np.shape)}I", *x_np.shape)
+
+        # Header: ndim, wire dtype code, itemsize of the TRANSPORT dtype, total
+        # bytes, and a 1-byte flag indicating whether the receiver must cast
+        # back to the original mlx dtype. ndim is upper-bounded to fit.
+        header = struct.pack("!IIIIQ", x_np.ndim, wire_code, x_np.dtype.itemsize, 1 if cast_back else 0, len(data))
+        shape_data = struct.pack(f"!{x_np.ndim}I", *x_np.shape)
 
         self._ensure_server()
         sock = self._connect_to(dst)
@@ -278,15 +305,32 @@ class TcpRelay:
             else:
                 raise ConnectionError(f"TcpRelay accept from rank {src} timed out after 20 attempts")
 
-        header = self._recv_exact(sock, 20)
-        ndim, dtype_code, itemsize, total = struct.unpack("!IIIQ", header)
+        # Header matches send(): ndim, wire dtype code, transport itemsize,
+        # cast_back flag, total bytes.
+        header = self._recv_exact(sock, 24)
+        ndim, dtype_code, itemsize, cast_back_flag, total = struct.unpack("!IIIIQ", header)
         shape_data = self._recv_exact(sock, ndim * 4)
         shape = struct.unpack(f"!{ndim}I", shape_data)
 
         data = self._recv_exact(sock, total)
-        np_dtype = self._CODE_TO_DTYPE.get(dtype_code, np.float32)
-        arr = np.frombuffer(data, dtype=np_dtype).reshape(shape)
-        return mx.array(arr)
+        entry = self._CODE_TO_ENTRY.get(dtype_code)
+        if entry is None:
+            raise ValueError(
+                f"TcpRelay.recv_like: unknown wire dtype code {dtype_code}; "
+                "sender/receiver protocol mismatch"
+            )
+        _wire_code, mlx_dtype, _transport_mlx_dtype, np_transport, _needs_cast = entry
+        arr = np.frombuffer(data, dtype=np_transport).reshape(shape)
+        # Build on the CPU stream so this is safe from any thread (the relay's
+        # recv_like can run in a worker thread that does not own the GPU stream;
+        # mx.array() otherwise raises "There is no Stream(gpu) in current thread").
+        # The caller's layer moves the result onto its device stream as needed.
+        with mx.stream(mx.default_stream(mx.Device(mx.cpu))):
+            result = mx.array(arr)
+            if cast_back_flag:
+                # Transport was promoted (e.g. bf16 -> f32); restore original dtype.
+                result = result.astype(mlx_dtype)
+        return result
 
     @staticmethod
     def _recv_exact(sock: _socket.socket, n: int) -> bytes:
