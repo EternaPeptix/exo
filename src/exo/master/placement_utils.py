@@ -1,3 +1,4 @@
+import os
 from collections.abc import Generator, Mapping
 
 from loguru import logger
@@ -371,6 +372,27 @@ def _find_connection_ip(
             yield connection.sink_multiaddr.ip_address
 
 
+def _ring_link_priority() -> dict[str, int]:
+    """Build the interface-type priority order for the ring (pipeline) backend.
+
+    Defaults to ethernet-first (lower latency for the ring's many small
+    send/recv ops). Operators with a faster direct link between a pair of nodes
+    (e.g. two Macs joined by Thunderbolt 5, which is ~4x faster than their
+    25G ethernet path) can override the order with the EXO_RING_LINK_PRIORITY
+    environment variable: a comma-separated list of interface types, most
+    preferred first, e.g. EXO_RING_LINK_PRIORITY=thunderbolt,ethernet,wifi,unknown.
+    """
+    default_order = ["ethernet", "maybe_ethernet", "thunderbolt", "wifi", "unknown"]
+    raw = os.environ.get("EXO_RING_LINK_PRIORITY", "")
+    order = [s.strip() for s in raw.split(",") if s.strip()] if raw else default_order
+    # Ensure every known type has a defined rank; unknown/unlisted types sort last.
+    priority = {iface_type: i for i, iface_type in enumerate(order)}
+    for fallback_type in default_order:
+        priority.setdefault(fallback_type, len(order))
+    priority.setdefault("unknown", len(order))
+    return priority
+
+
 def find_ip_prioritised(
     node_id: NodeId,
     other_node_id: NodeId,
@@ -380,7 +402,14 @@ def find_ip_prioritised(
 ) -> str | None:
     """Find an IP address between nodes with prioritization.
 
-    Priority: ethernet > wifi > unknown > thunderbolt
+    Ring (pipeline) backend: prefers ethernet by default, overridable via
+    EXO_RING_LINK_PRIORITY (e.g. to prefer a direct Thunderbolt 5 link between
+    two Macs over their shared 25G ethernet).
+
+    Non-ring (JACCL coordinator) backend: prefers thunderbolt first, because the
+    RDMA coordinator must be on the same fabric as the data path (rdma_en* over
+    TB), otherwise JACCL QP setup races across Ethernet and the TB fabric and
+    the cluster hangs or falls back to slow TCP.
     """
     ips = list(_find_connection_ip(node_id, other_node_id, cycle_digraph))
     if not ips:
@@ -391,17 +420,7 @@ def find_ip_prioritised(
     }
 
     if ring:
-        priority = {
-            "ethernet": 0,
-            "maybe_ethernet": 1,
-            "thunderbolt": 2,
-            "wifi": 3,
-            "unknown": 4,
-        }
-
-    # RDMA coordinator must be on the same fabric as the data path (rdma_en* over TB),
-    # otherwise JACCL QP setup races across Ethernet and the TB fabric and the cluster
-    # hangs or falls back to slow TCP. Thunderbolt first; ethernet last-resort.
+        priority = _ring_link_priority()
     else:
         priority = {
             "thunderbolt": 0,
@@ -410,7 +429,7 @@ def find_ip_prioritised(
             "wifi": 3,
             "unknown": 4,
         }
-    return min(ips, key=lambda ip: priority.get(ip_to_type.get(ip, "unknown"), 2))
+    return min(ips, key=lambda ip: priority.get(ip_to_type.get(ip, "unknown"), len(priority)))
 
 
 def get_mlx_ring_hosts_by_node(

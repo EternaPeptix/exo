@@ -107,65 +107,66 @@ def _rotate_metal_to_middle(
     cycle: Cycle,
     node_backends: Mapping[NodeId, list[Backend]],
 ) -> Cycle:
-    """Rotate a Pipeline cycle so Metal nodes are evenly spaced between CUDA nodes.
+    """Reorder a Pipeline cycle to minimise CUDA<->CUDA ring-neighbour pairs.
 
-    For 3 nodes: Metal in the middle rank (index 1).
-    For 5+ nodes: Metal nodes distributed to minimize consecutive CUDA↔CUDA links.
-    This avoids CUDA↔CUDA send/recv which hang in MLX 0.32.0 ring backend.
+    The MLX 0.32.0 ring backend hangs on any CUDA<->CUDA send/recv link. A ring
+    (which is what the pipeline backend builds: every rank talks to its left and
+    right neighbour, including the last->first wraparound) therefore must avoid
+    adjacent CUDA-only nodes wherever possible.
+
+    With M Metal nodes and C CUDA-only nodes, the Metal nodes can break the ring
+    into at most M CUDA-only runs. The minimum achievable maximum run length is
+    ceil(C / M), and the minimum achievable count of CUDA<->CUDA adjacencies is
+    max(0, C - M). This function reaches both optima by placing the Metal nodes
+    at evenly-spaced positions and distributing the CUDA nodes into the gaps
+    with sizes that differ by at most one.
+
+    This generalises the previous implementation, which only handled the 3-node
+    case correctly and produced extra CUDA<->CUDA links (hangs) for 4+ node
+    heterogeneous clusters such as 4x Spark (CUDA) + 2x Mac (Metal).
     """
-    n = len(cycle)
+    nids = list(cycle.node_ids)
+    n = len(nids)
     if n < 3:
         return cycle
 
-    metal_indices = [
-        i for i, nid in enumerate(cycle)
-        if Backend.MlxMetal in set(node_backends.get(nid, []))
-    ]
-    if not metal_indices:
+    def _has_metal(nid: NodeId) -> bool:
+        return Backend.MlxMetal in set(node_backends.get(nid, []))
+
+    def _is_cuda_only(nid: NodeId) -> bool:
+        bs = set(node_backends.get(nid, []))
+        return Backend.MlxCuda in bs and Backend.MlxMetal not in bs
+
+    metal_nodes = [nid for nid in nids if _has_metal(nid)]
+    cuda_nodes = [nid for nid in nids if _is_cuda_only(nid)]
+    m = len(metal_nodes)
+
+    # Nothing to optimise: no Metal nodes to break up CUDA runs, or no
+    # CUDA-only nodes to separate. Either way the ring is already in its only
+    # arrangement.
+    if m == 0 or len(cuda_nodes) == 0:
         return cycle
 
-    # Check if Metal nodes are already well-distributed
-    # (no two consecutive CUDA-only spans longer than 1)
-    nids = list(cycle.node_ids)
+    # Distribute the CUDA nodes into M gaps between Metal nodes as evenly as
+    # possible (gap sizes differ by at most 1). Build the cycle as:
+    #   M0, <gap0 CUDA>, M1, <gap1 CUDA>, ..., M_{m-1}, <gap_{m-1} CUDA>
+    c = len(cuda_nodes)
+    base = c // m
+    rem = c % m
+    gap_sizes = [base + (1 if i < rem else 0) for i in range(m)]
 
-    if n == 3:
-        target = 1  # middle
-        metal_idx = metal_indices[0]
-        if metal_idx == target:
-            return cycle
-        if metal_idx == 0:
-            rotated = [nids[2], nids[0], nids[1]]
-        else:
-            rotated = [nids[1], nids[2], nids[0]]
-        return Cycle(node_ids=rotated)
-
-    # General case: interleave Metal nodes evenly among CUDA nodes
-    metal_nodes = [nids[i] for i in metal_indices]
-    cuda_nodes = [nids[i] for i in range(n) if i not in metal_indices]
-
-    if not cuda_nodes:
-        return cycle  # all Metal, nothing to optimize
-
-    rotated = []
+    rotated: list[NodeId] = []
     cuda_idx = 0
-    metal_idx = 0
-    # Place CUDA nodes, inserting a Metal node between every pair
-    cuda_gap = len(cuda_nodes) / (len(metal_nodes) + 1)
-    next_metal_at = cuda_gap
-    while cuda_idx < len(cuda_nodes) or metal_idx < len(metal_nodes):
-        if metal_idx < len(metal_nodes) and cuda_idx >= round(next_metal_at):
-            rotated.append(metal_nodes[metal_idx])
-            metal_idx += 1
-            next_metal_at += cuda_gap
-        elif cuda_idx < len(cuda_nodes):
-            rotated.append(cuda_nodes[cuda_idx])
-            cuda_idx += 1
-        else:
-            rotated.append(metal_nodes[metal_idx])
-            metal_idx += 1
+    for i in range(m):
+        rotated.append(metal_nodes[i])
+        g = gap_sizes[i]
+        rotated.extend(cuda_nodes[cuda_idx:cuda_idx + g])
+        cuda_idx += g
 
-    if len(rotated) != n:
-        return cycle  # safety fallback
+    # Safety: the rebuild must preserve the node set exactly; otherwise leave
+    # the cycle untouched rather than emit a malformed one.
+    if len(rotated) != n or sorted(rotated) != sorted(nids):
+        return cycle
 
     return Cycle(node_ids=rotated)
 

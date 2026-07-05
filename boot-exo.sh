@@ -31,6 +31,10 @@ cd "$EXO_DIR"
 # Env shared across the cluster.
 export EXO_MEMORY_THRESHOLD="${EXO_MEMORY_THRESHOLD:-0.92}"
 export EXO_MACMON_PATH="${EXO_MACMON_PATH:-/opt/homebrew/bin/macmon}"
+# Prefer the direct Thunderbolt 5 link between the two Macs over the 25G ethernet
+# path through the switch for ring (pipeline) send/recv, since TB5 is ~4x faster.
+# Only affects pairs that have BOTH a thunderbolt and an ethernet socket path.
+export EXO_RING_LINK_PRIORITY="${EXO_RING_LINK_PRIORITY:-thunderbolt,maybe_ethernet,ethernet,wifi,unknown}"
 export HOME="${HOME:-/Users/jeweled}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
