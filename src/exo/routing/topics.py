@@ -44,7 +44,7 @@ ELECTION_MESSAGES = TypedTopic(
     "election_messages", PublishPolicy.Always, ElectionMessage
 )
 CONNECTION_MESSAGES = TypedTopic(
-    "connection_messages", PublishPolicy.Never, ConnectionMessage
+    "connection_messages", PublishPolicy.Always, ConnectionMessage
 )
 DOWNLOAD_COMMANDS = TypedTopic(
     "download_commands", PublishPolicy.Always, ForwarderDownloadCommand

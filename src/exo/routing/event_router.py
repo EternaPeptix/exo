@@ -117,9 +117,12 @@ class EventRouter:
         buf = OrderedBuffer[Event]()
         with self.external_inbound as events:
             async for event in events:
+                logger.debug('EXT_IN got event.origin=' + str(event.origin) + ' session=' + str(event.session) + ' self=' + str(self.session_id))
+                logger.trace('EXT_IN session=' + str(event.session) + ' self=' + str(self.session_id) + ' origin=' + str(event.origin))
                 if event.session != self.session_id:
                     continue
                 if event.origin != self.session_id.master_node_id:
+                    logger.trace('EXT_IN drop wrong_origin=' + str(event.origin) + ' master=' + str(self.session_id.master_node_id))
                     continue
 
                 buf.ingest(event.origin_idx, event.event)

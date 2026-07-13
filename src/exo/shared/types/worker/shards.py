@@ -90,5 +90,6 @@ class ExpertParallelShardMetadata(TensorShardMetadata):
     """
 
 
-ShardMetadata: TypeAlias = (    PipelineShardMetadata | CfgShardMetadata | TensorShardMetadata
+ShardMetadata: TypeAlias = (
+    PipelineShardMetadata | CfgShardMetadata | TensorShardMetadata | ExpertParallelShardMetadata
 )

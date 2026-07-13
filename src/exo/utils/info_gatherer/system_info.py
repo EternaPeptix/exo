@@ -102,8 +102,18 @@ async def _get_interface_types_from_networksetup() -> dict[str, InterfaceType]:
                 current_type = "unknown"
         elif line.startswith("Device:"):
             device = line.split(":", 1)[1].strip()
-            # enX is ethernet adapters or thunderbolt - these must be deprioritised
-            if device.startswith("en") and device not in ["en0", "en1"]:
+            # enX adapters are ambiguous (ethernet, thunderbolt-bridge members,
+            # TB-Ethernet adapters). Only downgrade to maybe_ethernet when the
+            # Hardware Port line did NOT already classify the port definitively
+            # (e.g. "Thunderbolt N" -> thunderbolt must be preserved, otherwise
+            # the RDMA coordinator IP selection picks the LAN IP over the TB
+            # fabric and JACCL QP setup times out). en0/en1 keep whatever the
+            # Hardware Port said.
+            if (
+                device.startswith("en")
+                and device not in ["en0", "en1"]
+                and current_type == "unknown"
+            ):
                 current_type = "maybe_ethernet"
             types[device] = current_type
 

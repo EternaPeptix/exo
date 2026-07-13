@@ -51,11 +51,17 @@ from exo.worker.engines.mlx.cache import (
 )
 from exo.worker.engines.mlx.constants import (
     DEFAULT_TOP_LOGPROBS,
+    EXO_MTP_SPECULATIVE,
+    EXO_NGRAM_SPECULATIVE,
     KV_BITS,
     KV_GROUP_SIZE,
     MAX_TOKENS,
+    MTP_NUM_DRAFT_TOKENS,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.generator.speculative_generate import (
+    speculative_generate,
+)
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -717,11 +723,25 @@ def mlx_generate(
     generated_text_parts: list[str] = []
     generation_start_time = time.perf_counter()
     usage: Usage | None = None
-    logger.info("Starting decode")
+
+    # Speculative decode: enabled when EXO_MTP_SPECULATIVE (MTP/NextN head) or
+    # EXO_NGRAM_SPECULATIVE (prompt-lookup) is set. speculative_generate falls
+    # back to stream_generate internally if no drafter can be built, so this
+    # branch is safe even when the MTP head isn't present (e.g. not grafted).
+    use_speculative = bool(EXO_MTP_SPECULATIVE) or bool(EXO_NGRAM_SPECULATIVE)
+
+    logger.info("Starting decode" + (" (speculative)" if use_speculative else ""))
     mx_barrier(group)
 
-    for completion_tokens, out in enumerate(
-        stream_generate(
+    # Full prompt id list for the n-gram speculator history. Convert whatever
+    # shape all_prompt_tokens has to a flat list[int].
+    try:
+        _all_prompt_ids = [int(t) for t in (all_prompt_tokens.tolist() if hasattr(all_prompt_tokens, "tolist") else all_prompt_tokens)]
+    except Exception:
+        _all_prompt_ids = []
+
+    if use_speculative:
+        token_stream = speculative_generate(
             model=model,
             tokenizer=tokenizer,
             prompt=last_token,
@@ -732,9 +752,24 @@ def mlx_generate(
             prefill_step_size=1,
             kv_group_size=KV_GROUP_SIZE,
             kv_bits=KV_BITS,
-        ),
-        start=1,
-    ):
+            num_draft_tokens=MTP_NUM_DRAFT_TOKENS,
+            prompt_tokens=_all_prompt_ids,
+        )
+    else:
+        token_stream = stream_generate(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=last_token,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            prompt_cache=caches,
+            prefill_step_size=1,
+            kv_group_size=KV_GROUP_SIZE,
+            kv_bits=KV_BITS,
+        )
+
+    for completion_tokens, out in enumerate(token_stream, start=1):
         generated_text_parts.append(out.text)
         accumulated_text += out.text
 

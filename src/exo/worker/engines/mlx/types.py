@@ -11,7 +11,10 @@ from mlx_lm.models.cache import (
     QuantizedKVCache,
     RotatingKVCache,
 )
-from mlx_lm.models.deepseek_v4 import DeepseekV4Cache
+try:
+    from mlx_lm.models.deepseek_v4 import DeepseekV4Cache
+except ImportError:
+    DeepseekV4Cache = None  # type: ignore
 
 # This list contains one cache entry per transformer layer
 KVCacheType = Sequence[

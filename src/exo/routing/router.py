@@ -197,7 +197,12 @@ class Router:
                             )
                             continue
                         router = self.topic_routers[topic]
-                        await router.publish_bytes(data)
+                        try:
+                            await router.publish_bytes(data)
+                        except Exception:
+                            logger.opt(exception=True).warning(
+                                "Gossipsub message deserialize/log failed; dropping message"
+                            )
                     case FromSwarm.Connection():
                         message = ConnectionMessage.from_update(from_swarm)
                         logger.trace(

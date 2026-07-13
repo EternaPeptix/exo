@@ -236,6 +236,19 @@ class Node:
                     )
                     await self.master.shutdown()
                     self.master = None
+                    if hasattr(self, 'event_router'):
+                        try:
+                            self.event_router.session_id = result.session_id
+                            logger.info('Updated event_router.session_id to ' + str(result.session_id))
+                        except Exception as e:
+                            logger.warning('Failed to update event_router.session_id: ' + str(e))
+                    # Sync event_router to new session so outbound master broadcasts are accepted
+                    if hasattr(self, 'event_router'):
+                        try:
+                            self.event_router.session_id = result.session_id
+                            logger.info('Updated event_router.session_id to ' + str(result.session_id))
+                        except Exception as e:
+                            logger.warning('Failed to update event_router.session_id: ' + str(e))
                 else:
                     logger.info(
                         f"Node {result.session_id.master_node_id} elected master"

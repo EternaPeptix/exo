@@ -428,19 +428,23 @@ class API:
             ) from e
 
     async def place_instance(self, payload: PlaceInstanceParams):
-        command = PlaceInstance(
-            model_card=await ModelCard.load(payload.model_id),
-            sharding=payload.sharding,
-            instance_meta=payload.instance_meta,
-            min_nodes=payload.min_nodes,
-        )
-        await self._send(command)
-
-        return CreateInstanceResponse(
-            message="Command received.",
-            command_id=command.command_id,
-            model_card=command.model_card,
-        )
+        import traceback, sys
+        try:
+            command = PlaceInstance(
+                model_card=await ModelCard.load(payload.model_id),
+                sharding=payload.sharding,
+                instance_meta=payload.instance_meta,
+                min_nodes=payload.min_nodes,
+            )
+            await self._send(command)
+            return CreateInstanceResponse(
+                message="Command received.",
+                command_id=command.command_id,
+                model_card=command.model_card,
+            )
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            raise HTTPException(status_code=500, detail=str(type(e).__name__)+" "+str(e)) from e
 
     async def create_instance(
         self, payload: CreateInstanceParams

@@ -12,7 +12,7 @@ class FrozenModel(BaseModel):
     model_config = ConfigDict(
         alias_generator=to_camel,
         validate_by_name=True,
-        extra="forbid",
+        extra="ignore",
         strict=True,
         frozen=True,
     )

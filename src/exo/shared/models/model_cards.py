@@ -228,7 +228,19 @@ class ModelCard(FrozenModel):
             await card_cache.refresh()
         if (mc := card_cache.get(model_id)) is not None:
             return mc
-
+        for model_dir in [d / model_id.normalize() for d in EXO_MODELS_DIRS]:
+            config_path = model_dir / 'config.json'
+            if config_path.exists():
+                try:
+                    import json, aiofiles
+                    async with aiofiles.open(config_path, 'r') as f:
+                        data = json.loads(await f.read())
+                    mc = ModelCard.model_validate(data)
+                    mc = mc.model_copy(update={'storage_size': Memory.from_bytes(sum(f.stat().st_size for f in model_dir.rglob('*') if f.is_file()))})
+                    await mc.save_to_custom_dir()
+                    return mc
+                except Exception:
+                    continue
         mc = await ModelCard.fetch_from_hf(model_id)
         await mc.save_to_custom_dir()
         return mc

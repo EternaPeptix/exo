@@ -377,6 +377,69 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
     return None
 
 
+# Layer-type values PreTrainedConfig.validate_layer_type accepts. Anything outside
+# this set makes transformers raise StrictDataclassClassValidationError during
+# AutoConfig/AutoTokenizer load. Mirror of transformers.configuration_utils.ALLOWED_LAYER_TYPES.
+_LAYER_TYPES_VALID_FOR_TRANSFORMERS = {
+    "full_attention",
+    "sliding_attention",
+    "chunked_attention",
+    "linear_attention",
+    "conv",
+    "mamba",
+    "attention",
+    "sparse",
+    "dense",
+    "hybrid",
+    "moe",
+}
+
+
+def _normalize_layer_types(model_path: Path) -> None:
+    """Rewrite config.json layer_types to values transformers accepts.
+
+    Upstream GLM/DeepSeek-DSA configs ship layer_types=['deepseek_sparse_attention', ...],
+    which this transformers version rejects. The mlx-lm arches ignore layer_types
+    (they use first_k_dense_replace/moe_layer_freq/indexer_types), so we rewrite the
+    field to valid, structurally-accurate values. Idempotent — a no-op once fixed.
+    """
+    import json
+
+    config_file = model_path / "config.json"
+    if not config_file.is_file():
+        return
+    try:
+        with config_file.open() as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        return
+
+    layer_types = config.get("layer_types")
+    if not isinstance(layer_types, list) or all(
+        lt in _LAYER_TYPES_VALID_FOR_TRANSFORMERS for lt in layer_types
+    ):
+        return  # already valid (or absent)
+
+    fkdr = config.get("first_k_dense_replace", 0)
+    freq = config.get("moe_layer_freq", 1)
+    num_layers = config.get("num_hidden_layers") or len(layer_types)
+    config["layer_types"] = [
+        "moe" if (i >= fkdr and i % freq == 0) else "dense"
+        for i in range(num_layers)
+    ]
+
+    tmp = config_file.with_suffix(".json.tmp")
+    with tmp.open("w") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    tmp.replace(config_file)
+    logger.info(
+        f"Normalized config.json layer_types for {model_path.name} "
+        f"({config['layer_types'].count('dense')} dense, "
+        f"{config['layer_types'].count('moe')} moe)"
+    )
+
+
 def load_tokenizer_for_model_id(
     model_id: ModelId, model_path: Path, *, trust_remote_code: bool = TRUST_REMOTE_CODE
 ) -> TokenizerWrapper:
@@ -395,6 +458,15 @@ def load_tokenizer_for_model_id(
     """
     model_id_lower = model_id.lower()
     eos_token_ids = get_eos_token_ids_for_model(model_id)
+
+    # Normalize config.json layer_types for GLM/DeepSeek-DSA models. The upstream
+    # config ships layer_types=['deepseek_sparse_attention', ...] which this
+    # transformers version's PreTrainedConfig.validate_layer_type rejects (not in
+    # ALLOWED_LAYER_TYPES). The mlx-lm arches don't consume layer_types (they use
+    # indexer_types / first_k_dense_replace / moe_layer_freq), so rewrite it to
+    # valid values derived from those fields. This runs at load time, after any
+    # download-integrity re-sync, so it survives re-placement.
+    _normalize_layer_types(model_path)
 
     # Kimi uses a custom TikTokenTokenizer that transformers 5.x can't load via AutoTokenizer
     if "kimi-k2" in model_id_lower:

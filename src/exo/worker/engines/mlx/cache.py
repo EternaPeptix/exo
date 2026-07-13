@@ -24,12 +24,16 @@ from mlx_lm.models.cache import (
     QuantizedKVCache,
     RotatingKVCache,
 )
-from mlx_lm.models.deepseek_v4 import (
-    DeepseekV4Cache,
-)
-from mlx_lm.models.deepseek_v4 import (
-    _CompressorBranch as CompressorBranch,  # type: ignore
-)
+try:
+    from mlx_lm.models.deepseek_v4 import (
+        DeepseekV4Cache,
+    )
+    from mlx_lm.models.deepseek_v4 import (
+        _CompressorBranch as CompressorBranch,  # type: ignore
+    )
+except ImportError:
+    DeepseekV4Cache = None  # type: ignore
+    CompressorBranch = None  # type: ignore
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.constants import EXO_CACHE_HOME

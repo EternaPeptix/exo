@@ -519,19 +519,26 @@ class Master:
                     self.state = apply(self.state, indexed)
 
                     self._event_log.append(event)
+                    logger.debug('APPEND idx=' + str(len(self._event_log)-1) + ' master=' + str(self.session_id.master_node_id) + ' event=' + str(event))
                     await self._send_indexed_event(indexed)
+                    logger.debug('SEND idx=' + str(indexed.idx) + ' master=' + str(self.session_id.master_node_id))
 
     # This function is re-entrant, take care!
     async def _send_indexed_event(self, event: IndexedEvent):
         # Convenience method since this line is ugly
-        await self.global_event_sender.send(
-            GlobalForwarderEvent(
-                origin=self.node_id,
-                origin_idx=event.idx,
-                session=self.session_id,
-                event=event.event,
+        try:
+            await self.global_event_sender.send(
+                GlobalForwarderEvent(
+                    origin=self.node_id,
+                    origin_idx=event.idx,
+                    session=self.session_id,
+                    event=event.event,
+                )
             )
-        )
+            logger.debug('SEND idx=' + str(event.idx) + ' ok')
+        except Exception as e:
+            logger.warning('SEND FAILED idx=' + str(event.idx) + ' err=' + str(e))
+            raise
 
     async def _handle_traces_collected(self, event: TracesCollected) -> None:
         task_id = event.task_id

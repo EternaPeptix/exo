@@ -35,6 +35,15 @@ export EXO_MACMON_PATH="${EXO_MACMON_PATH:-/opt/homebrew/bin/macmon}"
 # path through the switch for ring (pipeline) send/recv, since TB5 is ~4x faster.
 # Only affects pairs that have BOTH a thunderbolt and an ethernet socket path.
 export EXO_RING_LINK_PRIORITY="${EXO_RING_LINK_PRIORITY:-thunderbolt,maybe_ethernet,ethernet,wifi,unknown}"
+
+# Explicit zenoh peer over Thunderbolt 5. Each node sources a per-host
+# zenoh-peer.env declaring its peer TB IP as EXO_ZENOH_CONNECT, so peering
+# uses the fast/reliable TB link instead of falling back to flaky IPv6
+# link-local discovery. See rust/networking/src/lib.rs:cfg().
+if [[ -f "$EXO_DIR/zenoh-peer.env" ]]; then
+  source "$EXO_DIR/zenoh-peer.env"
+  export EXO_ZENOH_CONNECT
+fi
 export HOME="${HOME:-/Users/jeweled}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
