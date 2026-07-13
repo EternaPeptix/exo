@@ -36,13 +36,25 @@ export EXO_MACMON_PATH="${EXO_MACMON_PATH:-/opt/homebrew/bin/macmon}"
 # Only affects pairs that have BOTH a thunderbolt and an ethernet socket path.
 export EXO_RING_LINK_PRIORITY="${EXO_RING_LINK_PRIORITY:-thunderbolt,maybe_ethernet,ethernet,wifi,unknown}"
 
-# Explicit zenoh peer over Thunderbolt 5. Each node sources a per-host
-# zenoh-peer.env declaring its peer TB IP as EXO_ZENOH_CONNECT, so peering
-# uses the fast/reliable TB link instead of falling back to flaky IPv6
-# link-local discovery. See rust/networking/src/lib.rs:cfg().
-if [[ -f "$EXO_DIR/zenoh-peer.env" ]]; then
-  source "$EXO_DIR/zenoh-peer.env"
-  export EXO_ZENOH_CONNECT
+# Explicit zenoh peer over Thunderbolt 5. Link-local 169.254 TB IPs change
+# across reboots, so resolve the peer dynamically via arp on the TB bridge
+# (en5). Fall back to a static zenoh-peer.env if arp finds nothing. Peering
+# over TB avoids the flaky IPv6 link-local discovery path. See
+# rust/networking/src/lib.rs:cfg().
+if [[ -z "${EXO_ZENOH_CONNECT:-}" ]]; then
+  _tb_peer=""
+  # Try dynamic discovery first
+  if [[ -x /usr/sbin/arp ]]; then
+    _tb_peer=$(arp -an -i en5 2>/dev/null | awk -F'[ ()]' '/169\.254/{print $2; exit}')
+  fi
+  if [[ -n "$_tb_peer" ]]; then
+    export EXO_ZENOH_CONNECT="tcp/${_tb_peer}:52414"
+    log "zenoh peer resolved via arp: $EXO_ZENOH_CONNECT"
+  elif [[ -f "$EXO_DIR/zenoh-peer.env" ]]; then
+    source "$EXO_DIR/zenoh-peer.env"
+    export EXO_ZENOH_CONNECT
+    log "zenoh peer from static zenoh-peer.env: $EXO_ZENOH_CONNECT"
+  fi
 fi
 export HOME="${HOME:-/Users/jeweled}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
