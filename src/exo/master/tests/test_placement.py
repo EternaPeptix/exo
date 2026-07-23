@@ -6,6 +6,7 @@ from exo.master.placement import (
     get_transition_events,
     place_instance,
 )
+from exo.master.placement_utils import get_mlx_jaccl_devices_matrix
 from exo.master.tests.conftest import (
     create_node_memory,
     create_node_network,
@@ -35,7 +36,7 @@ from exo.shared.types.text_generation import (
     InputMessageContent,
     TextGenerationTaskParams,
 )
-from exo.shared.types.topology import Connection, SocketConnection
+from exo.shared.types.topology import Connection, RDMAConnection, SocketConnection
 from exo.shared.types.worker.downloads import (
     DownloadCompleted,
     DownloadFailed,
@@ -496,7 +497,7 @@ def test_tensor_rdma_backend_connectivity_matrix(
     matrix = instance.jaccl_devices
     assert len(matrix) == 3
     for i in range(3):
-        assert matrix[i][i] is None
+        assert matrix[i][i] == []
 
     assigned_nodes = list(instance.shard_assignments.node_to_runner.keys())
     node_to_idx = {node_id: idx for idx, node_id in enumerate(assigned_nodes)}
@@ -505,9 +506,9 @@ def test_tensor_rdma_backend_connectivity_matrix(
     idx_b = node_to_idx[node_b]
     idx_c = node_to_idx[node_c]
 
-    assert matrix[idx_a][idx_b] == "rdma_en3"
-    assert matrix[idx_b][idx_c] == "rdma_en4"
-    assert matrix[idx_c][idx_a] == "rdma_en5"
+    assert matrix[idx_a][idx_b] == ["rdma_en3"]
+    assert matrix[idx_b][idx_c] == ["rdma_en4"]
+    assert matrix[idx_c][idx_a] == ["rdma_en5"]
 
     # Verify coordinators are set for all nodes
     assert len(instance.jaccl_coordinators) == 3
@@ -521,6 +522,77 @@ def test_tensor_rdma_backend_connectivity_matrix(
         else:
             ip_part = coordinator.split(":")[0]
             assert len(ip_part.split(".")) == 4
+
+def test_jaccl_devices_matrix_two_cables_pairs_rails_correctly() -> None:
+    """Two TB cables between nodes A and B: rail k of [A][B] and [B][A]
+    must be opposite ends of the same cable."""
+    topology = Topology()
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+
+    # Cable 1: A end = en6, B end = en7
+    topology.add_connection(
+        Connection(
+            source=node_a,
+            sink=node_b,
+            edge=RDMAConnection(source_rdma_iface="rdma_en6", sink_rdma_iface="rdma_en7"),
+        )
+    )
+    topology.add_connection(
+        Connection(
+            source=node_b,
+            sink=node_a,
+            edge=RDMAConnection(source_rdma_iface="rdma_en7", sink_rdma_iface="rdma_en6"),
+        )
+    )
+    # Cable 2: A end = en7, B end = en6
+    topology.add_connection(
+        Connection(
+            source=node_a,
+            sink=node_b,
+            edge=RDMAConnection(source_rdma_iface="rdma_en7", sink_rdma_iface="rdma_en6"),
+        )
+    )
+    topology.add_connection(
+        Connection(
+            source=node_b,
+            sink=node_a,
+            edge=RDMAConnection(source_rdma_iface="rdma_en6", sink_rdma_iface="rdma_en7"),
+        )
+    )
+
+    matrix = get_mlx_jaccl_devices_matrix([node_a, node_b], topology)
+
+    assert matrix[0][0] == []
+    assert matrix[1][1] == []
+    assert len(matrix[0][1]) == 2
+    assert len(matrix[1][0]) == 2
+
+    # Each rail index must reference the two endpoints of one physical cable.
+    rails = list(zip(matrix[0][1], matrix[1][0], strict=True))
+    assert sorted(rails) == [("rdma_en6", "rdma_en7"), ("rdma_en7", "rdma_en6")]
+
+
+def test_jaccl_devices_matrix_single_link_remains_single_entry() -> None:
+    topology = Topology()
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(6))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(6))
+    )
+
+    matrix = get_mlx_jaccl_devices_matrix([node_a, node_b], topology)
+
+    assert matrix == [[[], ["rdma_en6"]], [["rdma_en6"], []]]
+
+
 
 
 def _build_three_node_rdma_topology() -> tuple[
