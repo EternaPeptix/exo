@@ -18,7 +18,7 @@ The implementation is deliberately narrow:
 | --- | --- |
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
-| EXO-compatible MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/k3/exo-support) commit `4f16fb2bccba39f6c0bbc528b8c2955fd754846f` |
+| EXO-compatible MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-tp2-optimizations) commit `adb00f6bc061dcfd66851c9078b05fa2ba123059` |
 | Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v1` |
 
@@ -28,7 +28,7 @@ at its immutable commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@4f16fb2bccba39f6c0bbc528b8c2955fd754846f"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@adb00f6bc061dcfd66851c9078b05fa2ba123059"
 ```
 
 ## License and trust boundary
@@ -109,6 +109,7 @@ Set the same loader path on both hosts and a rank-templated checkpoint path:
 export EXO_MLX_RANK_LOCAL_LOADER="$EXO_REPO/scripts/kimi_k3_tp2/rank_local_loader.py"
 export EXO_MLX_RANK_LOCAL_CHECKPOINT="/models/kimi-k3-tp2/rank{rank}"
 export EXO_MLX_RANK_LOCAL_VERIFY_HASHES=1
+export EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1
 ```
 
 The EXO MLX worker resolves `{rank}` from the distributed rank, verifies the
@@ -120,6 +121,13 @@ detection.
 
 The loader file is hash-pinned by EXO. `.gitattributes` forces LF line endings
 so a checkout cannot silently change that hash.
+
+The vocabulary-parallel option row-shards Kimi K3's untied output projection
+after the rank-local weights are loaded. Each tensor rank computes half of the
+vocabulary projection, then an all-gather reconstructs the standard full-logit
+result. It is opt-in because the full-logit gather scales with the number of
+prompt positions; measure representative long prompts before enabling it for
+a latency-sensitive production workload.
 
 ## Validate before the full model
 
@@ -139,6 +147,13 @@ python scripts/kimi_k3_tp2/tiny_mlx_tp_equivalence.py --help
 The tiny test compares distributed rank-local output with an unsharded
 reference before committing hours to full checkpoint conversion.
 
+The compatible MLX-LM branch also exercises dense and quantized output heads
+under two local ranks:
+
+```bash
+mlx.launch -n 2 tests/model_parallel_tests.py
+```
+
 ## Reference performance
 
 On two 512 GB M3 Ultra systems connected by a four-rail JACCL fabric, the
@@ -151,6 +166,19 @@ guarantees:
 | 8K | about 158 tok/s | about 11.7 tok/s |
 | 64K | about 130 tok/s | about 10.4 tok/s |
 | 128K | about 101 tok/s | about 9.2 tok/s |
+
+For the vocabulary-parallel output-head A/B, a deterministic 575-token prompt
+and 128-token greedy decode produced these three-repetition medians:
+
+| TP2 configuration | Prefill | Decode |
+| --- | ---: | ---: |
+| Four-rail JACCL mesh | 113.69 tok/s | 12.0382 tok/s |
+| Mesh + vocabulary-parallel head | 114.41 tok/s | 12.0866 tok/s |
+
+The completion digest was identical. The measured decode improvement was
+0.40% over the mesh baseline and 1.35% over the original ring baseline. This
+short-context result does not establish the cost of the full-logit gather at
+8K–1M prompt lengths.
 
 Preserving one compiled model and reusing a compatible prefix cache matters
 more at long context than converter changes. Benchmark cold prefill and cached
