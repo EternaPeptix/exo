@@ -18,15 +18,19 @@ The cluster work is published under the same branch name in all three forks:
 
 | Repository | Public branch | Scope |
 | --- | --- | --- |
-| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-exo-mlx-stack) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, prompt-lookup integration, reproducible benchmarks, and target-divergence diagnostics |
-| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-exo-mlx-stack) | Kimi K3 model support, deterministic generation control, vocabulary-parallel output head, exact expert path, opt-in segmented decode, and transactional prompt-lookup speculation |
-| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-exo-mlx-stack) | Exact Darwin/JACCL lineage used by the benchmarked Mac runtime, plus eval-walk and gather-index CPU-overhead reductions |
+| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-distributed-optimizations) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, prompt-lookup integration, reproducible benchmarks, and target-divergence diagnostics |
+| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-distributed-optimizations) | Kimi K3 model support, deterministic generation control, vocabulary-parallel output head, exact expert path, opt-in segmented decode, transactional prompt-lookup speculation, and eager asynchronous decode boundaries |
+| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-distributed-optimizations) | Exact Darwin/JACCL lineage used by the benchmarked Mac runtime, plus eval-walk and gather-index CPU-overhead reductions |
 
 This coordinated branch is experimental. Its exact path remains the reference
 configuration. The opt-in segmented decode experiment improved median short
 decode throughput from `12.1544` to `12.6206` tok/s on the two-Mac TP2 setup,
 but changed the deterministic completion digest. It is published for
 reproduction and further investigation, not enabled as a production default.
+The opt-in `laguna8` hidden-state asynchronous schedule improved a matched
+three-repetition exact run from `12.0465` to `12.9399` tok/s (`7.4%`) while
+retaining the canonical completion digest and approximately `414 GB` peak
+memory per rank.
 Earlier Spark CUDA/MoE experiments remain available on the separate
 [`experiment/exo-mlx-inference-optimizations`](https://github.com/EternaPeptix/mlx/tree/experiment/exo-mlx-inference-optimizations)
 branch; they were not replayed onto this newer JACCL base.
@@ -46,8 +50,8 @@ checkpoint, so they remain research evidence rather than production defaults.
 | --- | --- |
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
-| Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-exo-mlx-stack) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
-| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-exo-mlx-stack) exact-path base commit `52ecaae77f461d7ae8a5e3ac1260d23203e4ebba`; coordinated experimental runtime commit `d8e711bb4a97b2d520507ca43ab1d158dcf7720e` |
+| Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-distributed-optimizations) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
+| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-distributed-optimizations) exact-path base commit `52ecaae77f461d7ae8a5e3ac1260d23203e4ebba`; asynchronous runtime commit `14a8c6bfeccdfd64aac70596571eb6ac13fd940d` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v1` |
 
@@ -61,7 +65,7 @@ at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@d8e711bb4a97b2d520507ca43ab1d158dcf7720e"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@14a8c6bfeccdfd64aac70596571eb6ac13fd940d"
 ```
 
 ## License and trust boundary
