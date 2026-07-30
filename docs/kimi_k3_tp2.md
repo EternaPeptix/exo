@@ -18,9 +18,9 @@ The cluster work is published under the same branch name in all three forks:
 
 | Repository | Public branch | Scope |
 | --- | --- | --- |
-| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-distributed-optimizations) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, prompt-lookup integration, reproducible benchmarks, and target-divergence diagnostics |
-| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-distributed-optimizations) | Kimi K3 model support, deterministic generation control, vocabulary-parallel output head, exact expert path, opt-in segmented decode, transactional prompt-lookup speculation, and eager asynchronous decode boundaries |
-| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-distributed-optimizations) | Exact Darwin/JACCL lineage used by the benchmarked Mac runtime, plus eval-walk and gather-index CPU-overhead reductions |
+| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack-v3) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, prompt-lookup integration, reproducible benchmarks, and target-divergence diagnostics |
+| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v3) | Kimi K3 model support, deterministic generation control, vocabulary-parallel output head, exact expert/down/router/AttnRes/KDA paths, asynchronous decode, authoritative packing, and exact row-tiled KDA prefill |
+| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v3) | Exact Darwin/JACCL lineage used by the benchmarked Mac runtime, plus eval-walk and gather-index CPU-overhead reductions |
 
 This coordinated branch is experimental. Its exact path remains the reference
 configuration. The opt-in segmented decode experiment improved median short
@@ -31,6 +31,44 @@ The opt-in `laguna8` hidden-state asynchronous schedule improved a matched
 three-repetition exact run from `12.0465` to `12.9399` tok/s (`7.4%`) while
 retaining the canonical completion digest and approximately `414 GB` peak
 memory per rank.
+Adding the authoritative packed MoE front to that exact schedule produced
+`12.9576` tok/s versus its matched `12.8921` asynchronous control (`+0.51%`)
+over five repetitions, retained the canonical digest, and removed
+approximately `6.93 GiB` of persistent duplicate projection storage per rank.
+Adding the exact fused-expert path to the authoritative-pack/row-4 stack
+raised the canonical 575-prompt/128-decode median from `12.9824` to
+`13.2985` tok/s (`+2.44%`) over five candidate repetitions. All repetitions
+retained the canonical completion digest, and a separate 1,067-token coding
+prompt reached `13.2637` tok/s while retaining its own reference digest.
+Fusing the expert down projection, BF16 route multiplication, and exact
+top-16 reduction then raised the canonical median to `13.5835` tok/s
+(`+2.14%` versus fused experts alone, `+4.63%` cumulatively) while retaining
+the same canonical digest in all five repetitions. The coding prompt reached
+`13.5102` tok/s (`+1.86%` versus fused experts alone, `+4.50%`
+cumulatively) with its reference digest unchanged.
+
+The first fused-router prototype reached `13.7189` median decode tok/s, but
+used a SIMD denominator reduction and changed all five canonical completion
+digests from `c84d…` to `905f…`; that implementation was rejected. The
+corrected router preserves MLX's sequential FP32 denominator fold and raised
+the exact AttnRes stack from `13.6714` to `13.8160` tok/s (`+1.06%`).
+
+Adding the exact zero-copy KDA skinny-projection pack then produced the current
+best exact median: `14.0268` tok/s over five canonical repetitions (`+1.53%`
+over the corrected-router stack and `+3.26%` over fused down/reduction alone).
+The matched 1,067-token coding prompt reached `13.9971` tok/s (`+1.57%` over
+the corrected-router stack). Every measured completion retained its reference
+digest, and the latest change saved `1.088 ms/token`.
+
+The row-tiled KDA prefill kernel is bit-exact and now also has a matched
+full-model TP2 result. At 2K target context it reached `147.4168` prompt
+tok/s versus `146.3746` (`+0.71%`). At 8K it reached `154.9942` prompt tok/s
+versus a `153.2673` warmed control (`+1.13%`). Peak memory was effectively
+unchanged: approximately `419.74 GB` at 2K and `426.92 GB` at 8K.
+
+The sanitized run record, including per-repetition throughput, memory,
+configuration pins, and completion digests, is published in
+[`kimi_k3_tp2_benchmark_20260730.json`](kimi_k3_tp2_benchmark_20260730.json).
 Earlier Spark CUDA/MoE experiments remain available on the separate
 [`experiment/exo-mlx-inference-optimizations`](https://github.com/EternaPeptix/mlx/tree/experiment/exo-mlx-inference-optimizations)
 branch; they were not replayed onto this newer JACCL base.
@@ -50,8 +88,8 @@ checkpoint, so they remain research evidence rather than production defaults.
 | --- | --- |
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
-| Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-distributed-optimizations) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
-| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-distributed-optimizations) exact-path base commit `52ecaae77f461d7ae8a5e3ac1260d23203e4ebba`; asynchronous runtime commit `14a8c6bfeccdfd64aac70596571eb6ac13fd940d` |
+| Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v3) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
+| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v3) coordinated commit `2787e74691376dca045c0fd55bf503eb6499c05b`; live-tested code commit `5d20e13a73118642d1bb539c7a333ef60843af73` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v1` |
 
@@ -65,7 +103,7 @@ at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@14a8c6bfeccdfd64aac70596571eb6ac13fd940d"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@2787e74691376dca045c0fd55bf503eb6499c05b"
 ```
 
 ## License and trust boundary
@@ -147,6 +185,15 @@ export EXO_MLX_RANK_LOCAL_LOADER="$EXO_REPO/scripts/kimi_k3_tp2/rank_local_loade
 export EXO_MLX_RANK_LOCAL_CHECKPOINT="/models/kimi-k3-tp2/rank{rank}"
 export EXO_MLX_RANK_LOCAL_VERIFY_HASHES=1
 export EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1
+export MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES=laguna8
+export MLX_LM_KIMI_K3_ASYNC_DECODE_STATE=hidden
+export MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT=1
+export MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL=1
+export MLX_LM_KIMI_K3_FUSED_EXPERTS=1
+export MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE=1
+export MLX_LM_KIMI_K3_FUSED_ATTNRES_RMS=1
+export MLX_LM_KIMI_K3_FUSED_ROUTER=1
+export MLX_LM_KIMI_K3_PACKED_KDA_SKINNY=1
 ```
 
 The EXO MLX worker resolves `{rank}` from the distributed rank, verifies the
@@ -165,6 +212,15 @@ vocabulary projection, then an all-gather reconstructs the standard full-logit
 result. It is opt-in because the full-logit gather scales with the number of
 prompt positions; measure representative long prompts before enabling it for
 a latency-sensitive production workload.
+
+The asynchronous schedule, authoritative packed MoE-front, row-tiled KDA
+prefill, exact fused-expert/down/router, AttnRes/RMSNorm, and KDA skinny-pack
+paths are also opt-in. The authoritative paths repoint original parameters to
+zero-copy views instead of retaining unpacked duplicates. The row-tiled path
+activates only for supported Metal prefill shapes of at least 128 tokens. The
+decode fusions activate only for their released-checkpoint Metal geometry and
+quantization contracts. Unsupported shapes use the reference path. Keep the
+variables unset when reproducing a feature-off control.
 
 ### Prompt-lookup speculative decode
 

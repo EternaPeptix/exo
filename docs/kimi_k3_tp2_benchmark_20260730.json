@@ -1,0 +1,226 @@
+{
+  "schema": "k3-tp2-public-benchmark/v3",
+  "recorded_utc_date": "2026-07-30",
+  "model": {
+    "repository": "kernelpool/Kimi-K3-2bit-UVMAX",
+    "revision": "edb5113218df612f4a92f95145680f3f8eacd375"
+  },
+  "hardware": {
+    "ranks": 2,
+    "rank_device": "Apple M3 Ultra, 512 GB unified memory",
+    "parallelism": "tensor parallel 2",
+    "transport": "four-rail JACCL over Thunderbolt 5"
+  },
+  "runtime": {
+    "exo_live_execution_commit": "1bcb1b41eb337a3e38f66d18399dc36a0f6baf1d",
+    "exo_publication_base_commit": "2653972d3a43f434c853026a2d68f86a700d5abb",
+    "mlx_commit": "57b87fe47cfce34d6dc59d0e274d8ee36bfb9308",
+    "mlx_lm_live_execution_commit": "5d20e13a73118642d1bb539c7a333ef60843af73",
+    "mlx_lm_public_commit": "2787e74691376dca045c0fd55bf503eb6499c05b",
+    "rank_local_loader_live_sha256": "563eac6a0e2aaedac0c83e00c13be8f9b7c32f346f0827ca67f2cf6c05a7dd08",
+    "rank_local_loader_public_sha256": "e186afbb6b700cf553404b2acde501c297722903dda33f923de2a5237c02e668"
+  },
+  "common_configuration": {
+    "temperature": 0,
+    "prefix_cache": false,
+    "vocabulary_parallel_head": true,
+    "async_decode_boundaries": "laguna8",
+    "async_decode_state": "hidden",
+    "authoritative_packed_moe_front": true,
+    "row_tiled_kda_prefill": true,
+    "fused_experts": true,
+    "fused_down_reduce": true,
+    "fused_attnres_rms": true,
+    "fused_router_exact": true,
+    "packed_kda_skinny": true
+  },
+  "canonical_decode": {
+    "target_prompt_tokens": 512,
+    "actual_prompt_tokens": 575,
+    "decode_tokens": 128,
+    "completion_sha256": "c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71",
+    "control": {
+      "fused_experts": false,
+      "generation_tps": [
+        12.981574361996838,
+        12.989225522873706,
+        12.982364408833307
+      ],
+      "median_generation_tps": 12.982364408833307
+    },
+    "candidate": {
+      "fused_experts": true,
+      "generation_tps": [
+        13.330208428351954,
+        13.315106028079349,
+        13.298487659382511,
+        13.254648299687883,
+        13.2702084955228
+      ],
+      "peak_memory_bytes": [
+        414029987174,
+        413958896990,
+        413944806750,
+        414029987174,
+        413958896990
+      ],
+      "median_generation_tps": 13.298487659382511,
+      "improvement_percent": 2.435
+    },
+    "fused_down_candidate": {
+      "generation_tps": [
+        13.613178872859125,
+        13.583503079572177,
+        13.59280571778252,
+        13.46348520666856,
+        13.545266129888994
+      ],
+      "peak_memory_bytes": [
+        414029987174,
+        413958896990,
+        413944790366,
+        413944495450,
+        413958880606
+      ],
+      "median_generation_tps": 13.583503079572177,
+      "improvement_over_fused_expert_percent": 2.1432,
+      "cumulative_improvement_over_control_percent": 4.6304
+    },
+    "attnres_rms_candidate": {
+      "generation_tps": [
+        13.702709187419226,
+        13.691138949134901,
+        13.671356799941004,
+        13.658431752805065,
+        13.655384494402409
+      ],
+      "peak_memory_bytes": [
+        413958896994,
+        413944790370,
+        414029970794,
+        413958880610,
+        413958864226
+      ],
+      "median_generation_tps": 13.671356799941004,
+      "improvement_over_fused_down_percent": 0.6468
+    },
+    "exact_router_candidate": {
+      "generation_tps": [
+        13.849573980371682,
+        13.7280379611643,
+        13.805134283704797,
+        13.816006680251688,
+        13.841503778816898
+      ],
+      "peak_memory_bytes": [
+        413958895690,
+        413944789066,
+        414029969490,
+        413958879306,
+        413958862922
+      ],
+      "median_generation_tps": 13.816006680251688,
+      "improvement_over_attnres_percent": 1.0581
+    },
+    "packed_kda_skinny_candidate": {
+      "generation_tps": [
+        14.084577688316257,
+        13.933893834451258,
+        14.0258393022806,
+        14.026757537194648,
+        14.027212728242475
+      ],
+      "peak_memory_bytes": [
+        413959689290,
+        413945582666,
+        413959640138,
+        413959672906,
+        413959656522
+      ],
+      "median_generation_tps": 14.026757537194648,
+      "improvement_over_exact_router_percent": 1.5254,
+      "cumulative_improvement_over_fused_down_percent": 3.2632,
+      "milliseconds_saved_per_token_over_exact_router": 1.0875
+    }
+  },
+  "coding_decode": {
+    "target_prompt_tokens": 1132,
+    "actual_prompt_tokens": 1067,
+    "decode_tokens": 128,
+    "completion_sha256": "9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959",
+    "control_median_generation_tps": 12.928834543316887,
+    "fused_expert_generation_tps": [
+      13.263662148394186,
+      13.141393921449376,
+      13.270951566641257
+    ],
+    "fused_expert_median_generation_tps": 13.263662148394186,
+    "fused_down_generation_tps": [
+      13.493612145040336,
+      13.510163607694636,
+      13.51569198851176
+    ],
+    "fused_down_median_generation_tps": 13.510163607694636,
+    "fused_down_improvement_over_fused_expert_percent": 1.8585,
+    "cumulative_improvement_over_control_percent": 4.4979,
+    "attnres_rms_generation_tps": [
+      13.507751232644095,
+      13.635384681577113,
+      13.64328793245971
+    ],
+    "attnres_rms_median_generation_tps": 13.635384681577113,
+    "exact_router_generation_tps": [
+      13.780911993671788,
+      13.785346900020693,
+      13.676683382412424
+    ],
+    "exact_router_median_generation_tps": 13.780911993671788,
+    "packed_kda_skinny_generation_tps": [
+      13.996365400862116,
+      13.997115491068584,
+      14.01064884159369
+    ],
+    "packed_kda_skinny_median_generation_tps": 13.997115491068584,
+    "packed_kda_skinny_improvement_over_exact_router_percent": 1.5689,
+    "packed_kda_skinny_cumulative_improvement_over_fused_down_percent": 3.6043
+  },
+  "rejected_router_screen": {
+    "target_prompt_tokens": 512,
+    "actual_prompt_tokens": 575,
+    "decode_tokens": 128,
+    "expected_completion_sha256": "c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71",
+    "observed_completion_sha256": "905f41a15d7933fd33da36382e1766469fffbe17c9da03084c22e62376f77cfc",
+    "generation_tps": [
+      13.65218915898534,
+      13.755676545454499,
+      13.74178806220853,
+      13.718854399005338,
+      13.600628239701232
+    ],
+    "median_generation_tps": 13.718854399005338,
+    "accepted": false,
+    "rejection_reason": "deterministic completion digest changed in all five repetitions"
+  },
+  "prefill": {
+    "decode_tokens": 8,
+    "completion_sha256": "e929f1fd6e350d723ee540dee6e7641916c622c9deb56912b1e8fddb252b52c6",
+    "contexts": [
+      {
+        "target_prompt_tokens": 2048,
+        "actual_prompt_tokens": 2000,
+        "control_prompt_tps": 146.37459259445248,
+        "row4_prompt_tps": 147.4168373583617,
+        "improvement_percent": 0.712,
+        "row4_peak_memory_bytes": 419736322514
+      },
+      {
+        "target_prompt_tokens": 8192,
+        "actual_prompt_tokens": 7705,
+        "warmed_control_prompt_tps": 153.267326474365,
+        "row4_prompt_tps": 154.99419960792557,
+        "improvement_percent": 1.127,
+        "row4_peak_memory_bytes": 426921582962
+      }
+    ]
+  }
+}

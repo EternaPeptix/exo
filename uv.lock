@@ -522,7 +522,7 @@ requires-dist = [
     { name = "mlx-cuda-12", marker = "platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'mlx-cuda12'", url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_12-0.32.0-py3-none-manylinux_2_35_x86_64.whl" },
     { name = "mlx-cuda-13", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mlx-cuda13'", url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_13-0.32.0-py3-none-manylinux_2_35_aarch64.whl" },
     { name = "mlx-cuda-13", marker = "platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'mlx-cuda13'", url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_13-0.32.0-py3-none-manylinux_2_35_x86_64.whl" },
-    { name = "mlx-lm", marker = "extra == 'mlx'", git = "https://github.com/EternaPeptix/mlx-lm?rev=14a8c6bfeccdfd64aac70596571eb6ac13fd940d" },
+    { name = "mlx-lm", marker = "extra == 'mlx'", git = "https://github.com/EternaPeptix/mlx-lm?rev=2787e74691376dca045c0fd55bf503eb6499c05b" },
     { name = "mlx-vlm", marker = "extra == 'mlx'", specifier = ">=0.3.11" },
     { name = "msgspec", specifier = ">=0.19.0" },
     { name = "nanobind", marker = "extra == 'build'" },
@@ -1496,7 +1496,7 @@ requires-dist = [
 [[package]]
 name = "mlx-lm"
 version = "0.31.3"
-source = { git = "https://github.com/EternaPeptix/mlx-lm?rev=14a8c6bfeccdfd64aac70596571eb6ac13fd940d#14a8c6bfeccdfd64aac70596571eb6ac13fd940d" }
+source = { git = "https://github.com/EternaPeptix/mlx-lm?rev=2787e74691376dca045c0fd55bf503eb6499c05b#2787e74691376dca045c0fd55bf503eb6499c05b" }
 dependencies = [
     { name = "jinja2", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-cuda12') or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-cuda13') or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-none') or (extra == 'extra-3-exo-mlx-cuda12' and extra == 'extra-3-exo-mlx-cuda13') or (extra == 'extra-3-exo-mlx-cuda12' and extra == 'extra-3-exo-mlx-none') or (extra == 'extra-3-exo-mlx-cuda13' and extra == 'extra-3-exo-mlx-none')" },
     { name = "mlx", version = "0.32.0.dev20260730+57b87fe4", source = { git = "https://github.com/EternaPeptix/mlx.git?rev=57b87fe47cfce34d6dc59d0e274d8ee36bfb9308#57b87fe47cfce34d6dc59d0e274d8ee36bfb9308" }, marker = "sys_platform == 'darwin' or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-cuda12') or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-cuda13') or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-none') or (extra == 'extra-3-exo-mlx-cuda12' and extra == 'extra-3-exo-mlx-cuda13') or (extra == 'extra-3-exo-mlx-cuda12' and extra == 'extra-3-exo-mlx-none') or (extra == 'extra-3-exo-mlx-cuda13' and extra == 'extra-3-exo-mlx-none')" },
