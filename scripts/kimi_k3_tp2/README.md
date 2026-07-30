@@ -29,6 +29,12 @@ parallel checkpoints.
 - `launch_k3_target_diagnostic_current.sh` runs that width-2 diagnostic with
   the accepted fused stack and the same fail-closed mesh/ring attestation as
   the current target verifier.
+- `k3_kda_stage_localizer.py` compares real-checkpoint layer-0 KDA
+  intermediates and cache state between one width-2 call and two sequential
+  width-1 calls without weakening the target-verification gate.
+- `launch_k3_kda_stage_localizer_current.sh` runs that localizer on the pinned
+  accepted stack and independently attests both ranks and the selected JACCL
+  transport.
 - `transport-jaccl-tp2.example.json` documents the explicit topology contract
   that both ranks must receive; it contains placeholders, not deployment
   inventory.
