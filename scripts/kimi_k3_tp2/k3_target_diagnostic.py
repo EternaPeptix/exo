@@ -122,13 +122,13 @@ def capture_k3_forward(model: Any) -> Iterator[ForwardCapture]:
             capture.final_hidden_states.append(result)
         return result
 
-    setattr(layer_type, "__call__", captured_layer_call)
-    setattr(text_model_type, "__call__", captured_text_model_call)
+    setattr(layer_type, "__call__", captured_layer_call)  # noqa: B010
+    setattr(text_model_type, "__call__", captured_text_model_call)  # noqa: B010
     try:
         yield capture
     finally:
-        setattr(layer_type, "__call__", original_layer_call)
-        setattr(text_model_type, "__call__", original_text_model_call)
+        setattr(layer_type, "__call__", original_layer_call)  # noqa: B010
+        setattr(text_model_type, "__call__", original_text_model_call)  # noqa: B010
 
 
 def validate_capture(
