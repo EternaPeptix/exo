@@ -12,6 +12,20 @@ The implementation is deliberately narrow:
 - one pinned model revision and one reviewed MLX-LM Kimi K3 contract;
 - source-only tooling, with no host inventory or deployment credentials.
 
+## Coordinated public branches
+
+The cluster work is published under the same branch name in all three forks:
+
+| Repository | Public branch | Scope |
+| --- | --- | --- |
+| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/exo-mlx-inference-optimizations) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, and reproducible benchmarks |
+| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/exo-mlx-inference-optimizations) | Kimi K3 model support, deterministic generation control, and vocabulary-parallel output head |
+| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/exo-mlx-inference-optimizations) | Accepted CUDA/MoE experiments from the heterogeneous-cluster work; no Kimi K3 Metal-core patch is claimed yet |
+
+Lossy Kimi K3 requantization experiments are not enabled or included in the
+validated runtime. Their measured output digests differed from the exact
+checkpoint, so they remain research evidence rather than production defaults.
+
 ## Reproducibility pins
 
 | Component | Pin |
@@ -153,6 +167,40 @@ under two local ranks:
 ```bash
 mlx.launch -n 2 tests/model_parallel_tests.py
 ```
+
+## Benchmark target-verification widths
+
+Before integrating a speculative decoder, measure whether the unmodified
+target can verify multiple proposed tokens more cheaply than sequential
+one-token decode. The benchmark fixes widths to `1, 2, 3, 4, 7` and gives
+every timed call a fresh, fully materialized copy of the same post-prefill
+cache. It validates the Kimi K3 mixed cache layout (69 recurrent
+`ArraysCache` layers and 24 `KVCache` layers), preserves KV capacity and
+offsets, and fails closed unless both ranks agree on finite logits, top-1
+tokens, the known continuation, and numerical error limits.
+
+Stage `scripts/kimi_k3_tp2/` at the same absolute path on both ranks. Copy
+`transport-jaccl-tp2.example.json` to a private deployment file and replace
+its coordinator and rail placeholders. The benchmark independently checks the
+runtime JACCL state against this contract, so a stale or one-rail launch fails
+closed. Supply the contract, hostfile, and rank-local checkpoint roots
+explicitly, then launch from rank 0:
+
+```bash
+K3_TP_HOSTFILE=/path/to/hosts-jaccl-tp2.json \
+K3_TP_TRANSPORT_CONTRACT=/same/path/on/both/ranks/transport-jaccl-tp2.json \
+K3_TP_RANK0_ROOT=/path/on/rank0/to/checkpoint \
+K3_TP_RANK1_ROOT=/path/on/rank1/to/checkpoint \
+K3_TARGET_VERIFY_ROOT=/path/to/scripts/kimi_k3_tp2 \
+K3_TP_TOOLS_ROOT=/path/to/scripts/kimi_k3_tp2 \
+bash scripts/kimi_k3_tp2/launch_k3_target_verify.sh
+```
+
+The atomic JSON artifact reports critical-path target and sequential timing,
+verified tokens per second, memory, cache attestation, source/runtime hashes,
+transport identity, and a per-width PASS/FAIL equivalence record. This is a
+measurement harness, not a claim that speculative decoding is already
+implemented.
 
 ## Reference performance
 

@@ -8,11 +8,22 @@ parallel checkpoints.
 - `rank_local_loader.py` loads an already sliced checkpoint into the matching
   MLX-LM Kimi K3 model.
 - `tiny_mlx_tp_equivalence.py` provides a small two-rank equivalence check.
+- `tp2_benchmark.py` records a fail-closed, deterministic full-model TP2
+  baseline on the authenticated four-rail JACCL topology.
+- `launch_tp2_jaccl.sh` launches that baseline with explicit wired-memory and
+  asynchronous-lookahead controls.
+- `k3_target_verify.py` measures exact multi-token target-verification widths
+  before a speculative decoder is integrated.
+- `launch_k3_target_verify.sh` launches that benchmark with overridable,
+  environment-derived paths.
+- `transport-jaccl-tp2.example.json` documents the explicit topology contract
+  that both ranks must receive; it contains placeholders, not deployment
+  inventory.
 - `tests/` covers the converter and loader contracts without model weights.
 - `THIRD_PARTY_NOTICES.md` records upstream code and model-license boundaries.
 
 The full, sanitized procedure and exact dependency pins are in
 [`../../docs/kimi_k3_tp2.md`](../../docs/kimi_k3_tp2.md).
 
-This package intentionally excludes machine inventories, launch daemons,
-hostfiles, benchmark artifacts, and model weights.
+This package intentionally excludes credentials, machine inventories,
+hostfiles, generated benchmark artifacts, and model weights.

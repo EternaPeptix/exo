@@ -1,0 +1,24 @@
+{
+  "schema": "k3-jaccl-transport/v1",
+  "coordinator_host": "REPLACE_WITH_COORDINATOR_HOST",
+  "device_matrix": [
+    [
+      null,
+      [
+        "REPLACE_WITH_RANK0_RAIL_1",
+        "REPLACE_WITH_RANK0_RAIL_2",
+        "REPLACE_WITH_RANK0_RAIL_3",
+        "REPLACE_WITH_RANK0_RAIL_4"
+      ]
+    ],
+    [
+      [
+        "REPLACE_WITH_RANK1_RAIL_1",
+        "REPLACE_WITH_RANK1_RAIL_2",
+        "REPLACE_WITH_RANK1_RAIL_3",
+        "REPLACE_WITH_RANK1_RAIL_4"
+      ],
+      null
+    ]
+  ]
+}
