@@ -36,7 +36,7 @@ from typing import Any, Iterator, Sequence
 import k3_target_verify as target
 import tp2_benchmark as base
 
-DIAGNOSTIC_SCHEMA = "k3-tp2-target-divergence-diagnostic/v1"
+DIAGNOSTIC_SCHEMA = "k3-tp2-target-divergence-diagnostic/v2"
 DIAGNOSTIC_WIDTHS = tuple(width for width in target.VERIFY_WIDTHS if width > 1)
 COMPLETE_DIVERGENCE = "COMPLETE_DIVERGENCE"
 COMPLETE_NO_DIVERGENCE = "COMPLETE_NO_DIVERGENCE"
@@ -757,7 +757,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise DiagnosticError(f"expected JACCL TP2, got TP{world_size}")
     init_seconds = time.perf_counter() - init_started
 
-    transport = base.inspect_jaccl_ring_transport(rank=rank)
+    transport = base.inspect_jaccl_transport(rank=rank)
+    mode_attestation = target.attest_shared_transport_mode(mx, group, transport)
     matrix_digests = base.require_shared_digest(
         mx,
         group,
@@ -1050,7 +1051,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "platform": platform.platform(),
         },
         "distributed": {
-            "backend": "jaccl-ring",
+            "backend": mode_attestation["mode"],
+            "initialization_backend": "jaccl",
             "world_size": world_size,
             "strict_init_requested": True,
             "init_seconds_rank0": init_seconds,
@@ -1063,6 +1065,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 row[1] / 1e9 for row in load_rows
             ],
             "transport": {
+                "schema": transport["schema"],
+                "mode": mode_attestation["mode"],
+                "topology": transport["topology"],
+                "ring": transport["ring"],
+                "mesh": transport["mesh"],
+                "mlx_jaccl_ring": transport["mlx_jaccl_ring"],
+                "mode_sha256": mode_attestation["mode_sha256"],
+                "mode_sha256_by_rank": mode_attestation["mode_sha256_by_rank"],
                 "coordinator_sha256_by_rank": coordinator_digests,
                 "device_matrix": transport["device_matrix"],
                 "device_matrix_sha256_by_rank": matrix_digests,

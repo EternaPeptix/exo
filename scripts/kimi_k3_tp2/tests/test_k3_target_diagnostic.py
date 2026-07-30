@@ -16,7 +16,7 @@ import k3_target_verify as verification  # noqa: E402
 def test_diagnostic_is_separate_and_cannot_promote_v5():
     assert verification.ARTIFACT_SCHEMA == "k3-tp2-target-verification/v5"
     assert diagnostic.DIAGNOSTIC_SCHEMA == (
-        "k3-tp2-target-divergence-diagnostic/v1"
+        "k3-tp2-target-divergence-diagnostic/v2"
     )
     assert diagnostic.COMPLETE_DIVERGENCE not in {"PASS", "FAIL"}
     assert diagnostic.COMPLETE_NO_DIVERGENCE not in {"PASS", "FAIL"}
@@ -314,3 +314,45 @@ def test_launcher_pins_diagnostic_runtime_without_touching_v5():
     assert "MLX_LM_KIMI_K3_FUSED_EXPERTS=0" in launcher
     assert 'K3_TARGET_DIAGNOSTIC_PROMPT_TOKENS:-128' in launcher
     assert 'K3_TARGET_DIAGNOSTIC_WIDTH:-2' in launcher
+
+
+def test_current_diagnostic_uses_attested_transport_and_accepted_stack():
+    source = (TOOLS_ROOT / "k3_target_diagnostic.py").read_text()
+    assert "base.inspect_jaccl_transport(rank=rank)" in source
+    assert "target.attest_shared_transport_mode(mx, group, transport)" in source
+    assert '"backend": mode_attestation["mode"]' in source
+    assert '"mode_sha256": mode_attestation["mode_sha256"]' in source
+
+    launcher = (
+        TOOLS_ROOT / "launch_k3_target_diagnostic_current.sh"
+    ).read_text()
+    target_launcher = (
+        TOOLS_ROOT / "launch_k3_target_verify_current.sh"
+    ).read_text()
+    assert 'K3_TARGET_DIAGNOSTIC_TRANSPORT_MODE:-mesh' in launcher
+    assert 'launch_backend="jaccl"' in launcher
+    assert 'launch_backend="jaccl-ring"' in launcher
+    assert '--backend "${launch_backend}"' in launcher
+    assert 'K3_TARGET_DIAGNOSTIC_PROMPT_TOKENS:-128' in launcher
+    assert 'K3_TARGET_DIAGNOSTIC_WIDTH:-2' in launcher
+    for feature_state in (
+        "EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1",
+        "EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4=0",
+        "EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4=0",
+        "MLX_LM_KIMI_K3_FUSED_EXPERTS=1",
+        "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE=1",
+        "MLX_LM_KIMI_K3_FUSED_ROUTER=1",
+        "MLX_LM_KIMI_K3_FUSED_ATTNRES_RMS=1",
+        "MLX_LM_KIMI_K3_PACKED_KDA_SKINNY=1",
+        "MLX_LM_KIMI_K3_PACKED_KDA_WIDE=1",
+        "MLX_LM_KIMI_K3_FUSED_ROUTED_UP_ADD=1",
+        "MLX_LM_KIMI_K3_FUSED_POST_KDA_RMS_SIGMOID_GATE=0",
+        "MLX_LM_KIMI_K3_COMPILED_DECODE=0",
+        "MLX_LM_KIMI_K3_PACKED_MOE_FRONT=0",
+        "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT=1",
+        "MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL=1",
+        "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES=laguna8",
+        "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE=hidden",
+    ):
+        assert feature_state in launcher
+        assert feature_state in target_launcher

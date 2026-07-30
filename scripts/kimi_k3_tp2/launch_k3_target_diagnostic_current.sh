@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run on rank 0 only after EXO has been stopped deliberately. Every deployment
+# path is explicit; mlx.launch starts rank 1 from the authenticated four-rail
+# JACCL hostfile.
+
+die() {
+  echo "k3 current-stack target diagnostic: $*" >&2
+  exit 2
+}
+
+require_env() {
+  local name="$1"
+  [[ -n "${!name:-}" ]] || die "set ${name}"
+}
+
+require_absolute_path() {
+  local name="$1"
+  local value="${!name}"
+  [[ "${value}" == /* ]] || die "${name} must be an absolute path"
+  [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] ||
+    die "${name} must not contain a newline"
+}
+
+require_python_path() {
+  local name="$1"
+  require_absolute_path "${name}"
+  [[ "${!name}" != *:* ]] || die "${name} must not contain ':'"
+}
+
+required_paths=(
+  K3_TARGET_DIAGNOSTIC_ROOT
+  K3_TP_TOOLS_ROOT
+  K3_TP_RANK0_ROOT
+  K3_TP_RANK1_ROOT
+  K3_TP_HOSTFILE
+  K3_TP_TRANSPORT_CONTRACT
+  K3_TARGET_DIAGNOSTIC_ARTIFACT_ROOT
+  K3_TP_LAUNCHER
+  K3_MLX_LM_ROOT
+  K3_MLX_CORE_OVERRIDE
+)
+for required_path in "${required_paths[@]}"; do
+  require_env "${required_path}"
+  require_absolute_path "${required_path}"
+done
+for python_root in \
+  K3_TARGET_DIAGNOSTIC_ROOT \
+  K3_TP_TOOLS_ROOT \
+  K3_MLX_LM_ROOT \
+  K3_MLX_CORE_OVERRIDE; do
+  require_python_path "${python_root}"
+done
+
+diagnostic_root="${K3_TARGET_DIAGNOSTIC_ROOT}"
+tp_tools_root="${K3_TP_TOOLS_ROOT}"
+rank0_root="${K3_TP_RANK0_ROOT}"
+rank1_root="${K3_TP_RANK1_ROOT}"
+hostfile="${K3_TP_HOSTFILE}"
+transport_contract="${K3_TP_TRANSPORT_CONTRACT}"
+artifact_root="${K3_TARGET_DIAGNOSTIC_ARTIFACT_ROOT}"
+launcher="${K3_TP_LAUNCHER}"
+mlx_lm_root="${K3_MLX_LM_ROOT}"
+mlx_core_override="${K3_MLX_CORE_OVERRIDE}"
+
+[[ -d "${diagnostic_root}" ]] ||
+  die "K3_TARGET_DIAGNOSTIC_ROOT is not a directory"
+[[ -f "${diagnostic_root}/k3_target_diagnostic.py" ]] ||
+  die "K3_TARGET_DIAGNOSTIC_ROOT has no k3_target_diagnostic.py"
+[[ -d "${tp_tools_root}" ]] || die "K3_TP_TOOLS_ROOT is not a directory"
+[[ -f "${tp_tools_root}/tp2_benchmark.py" ]] ||
+  die "K3_TP_TOOLS_ROOT has no tp2_benchmark.py"
+[[ -f "${tp_tools_root}/rank_local_loader.py" ]] ||
+  die "K3_TP_TOOLS_ROOT has no rank_local_loader.py"
+[[ -d "${rank0_root}" ]] || die "rank-0 checkpoint is not a local directory"
+# Rank 1 validates its own checkpoint after distributed initialization.
+[[ -f "${hostfile}" ]] || die "K3_TP_HOSTFILE is not a local file"
+[[ -f "${transport_contract}" ]] ||
+  die "K3_TP_TRANSPORT_CONTRACT is not a local file"
+[[ -x "${launcher}" ]] || die "K3_TP_LAUNCHER is not executable"
+[[ -d "${mlx_lm_root}/mlx_lm" ]] ||
+  die "K3_MLX_LM_ROOT has no mlx_lm package"
+[[ -d "${mlx_core_override}/mlx" ]] ||
+  die "K3_MLX_CORE_OVERRIDE has no mlx package"
+
+prompt_tokens="${K3_TARGET_DIAGNOSTIC_PROMPT_TOKENS:-128}"
+width="${K3_TARGET_DIAGNOSTIC_WIDTH:-2}"
+wired_limit="${K3_TARGET_DIAGNOSTIC_WIRED_LIMIT:-1}"
+file_hashes="${K3_TARGET_DIAGNOSTIC_FILE_HASHES:-0}"
+transport_mode="${K3_TARGET_DIAGNOSTIC_TRANSPORT_MODE:-mesh}"
+
+[[ "${prompt_tokens}" =~ ^[1-9][0-9]*$ ]] ||
+  die "K3_TARGET_DIAGNOSTIC_PROMPT_TOKENS must be a positive integer"
+case "${width}" in
+  2 | 3 | 4 | 7 | 8) ;;
+  *) die "K3_TARGET_DIAGNOSTIC_WIDTH must be one of 2,3,4,7,8" ;;
+esac
+[[ "${wired_limit}" == "0" || "${wired_limit}" == "1" ]] ||
+  die "K3_TARGET_DIAGNOSTIC_WIRED_LIMIT must be 0 or 1"
+[[ "${file_hashes}" == "0" || "${file_hashes}" == "1" ]] ||
+  die "K3_TARGET_DIAGNOSTIC_FILE_HASHES must be 0 or 1"
+case "${transport_mode}" in
+  mesh)
+    launch_backend="jaccl"
+    force_mesh=1
+    [[ "${MLX_JACCL_RING+x}" != "x" ]] ||
+      die "MLX_JACCL_RING must be unset for mesh"
+    ;;
+  ring)
+    launch_backend="jaccl-ring"
+    force_mesh=0
+    ;;
+  *)
+    die "K3_TARGET_DIAGNOSTIC_TRANSPORT_MODE must be mesh or ring"
+    ;;
+esac
+unset MLX_JACCL_RING
+
+pythonpath="${mlx_core_override}:${mlx_lm_root}:${diagnostic_root}:${tp_tools_root}"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+artifact="${artifact_root}/k3-target-diagnostic-current-${prompt_tokens}p-w${width}-${stamp}-p$$-${transport_mode}.json"
+
+arguments=(
+  "${diagnostic_root}/k3_target_diagnostic.py"
+  --rank-checkpoint "${rank0_root}"
+  --rank-checkpoint "${rank1_root}"
+  --artifact "${artifact}"
+  --prompt-token-target "${prompt_tokens}"
+  --width "${width}"
+  --min-logit-cosine 0.999
+  --max-logit-abs-error 1.0
+)
+if [[ "${wired_limit}" == "1" ]]; then
+  arguments+=(--wired-limit)
+else
+  arguments+=(--no-wired-limit)
+fi
+if [[ "${file_hashes}" == "1" ]]; then
+  arguments+=(--verify-file-hashes)
+fi
+
+mkdir -p "${artifact_root}"
+[[ ! -e "${artifact}" ]] || die "refusing to overwrite ${artifact}"
+
+exec "${launcher}" \
+  --verbose \
+  --backend "${launch_backend}" \
+  --hostfile "${hostfile}" \
+  --env "PYTHONPATH=${pythonpath}" \
+  --env "K3_TP_TRANSPORT_CONTRACT=${transport_contract}" \
+  --env "K3_TP_TRANSPORT_MODE=${transport_mode}" \
+  --env MLX_METAL_FAST_SYNCH=1 \
+  --env "EXO_MLX_JACCL_FORCE_MESH=${force_mesh}" \
+  --env EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1 \
+  --env EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4=0 \
+  --env EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4=0 \
+  --env MLX_LM_KIMI_K3_FUSED_EXPERTS=1 \
+  --env MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE=1 \
+  --env MLX_LM_KIMI_K3_FUSED_ROUTER=1 \
+  --env MLX_LM_KIMI_K3_FUSED_ATTNRES_RMS=1 \
+  --env MLX_LM_KIMI_K3_PACKED_KDA_SKINNY=1 \
+  --env MLX_LM_KIMI_K3_PACKED_KDA_WIDE=1 \
+  --env MLX_LM_KIMI_K3_FUSED_ROUTED_UP_ADD=1 \
+  --env MLX_LM_KIMI_K3_FUSED_POST_KDA_RMS_SIGMOID_GATE=0 \
+  --env MLX_LM_KIMI_K3_COMPILED_DECODE=0 \
+  --env MLX_LM_KIMI_K3_PACKED_MOE_FRONT=0 \
+  --env MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT=1 \
+  --env MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL=1 \
+  --env MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES=laguna8 \
+  --env MLX_LM_KIMI_K3_ASYNC_DECODE_STATE=hidden \
+  -- \
+  "${arguments[@]}"

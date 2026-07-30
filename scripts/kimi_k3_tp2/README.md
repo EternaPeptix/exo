@@ -25,7 +25,10 @@ parallel checkpoints.
   hidden states, mixed cache state, and one subsequent T=1 rollout.
 - `launch_k3_target_diagnostic.sh` launches the diagnostic at a small
   128-token prompt and width 2 by default. It does not alter or replace the
-  target-verification v3 PASS/FAIL gate.
+  target-verification v5 PASS/FAIL gate.
+- `launch_k3_target_diagnostic_current.sh` runs that width-2 diagnostic with
+  the accepted fused stack and the same fail-closed mesh/ring attestation as
+  the current target verifier.
 - `transport-jaccl-tp2.example.json` documents the explicit topology contract
   that both ranks must receive; it contains placeholders, not deployment
   inventory.
