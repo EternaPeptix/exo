@@ -2067,12 +2067,6 @@ def pipeline_auto_parallel(
             )
 
     _set_layers(model, layers)
-    if is_kimi_k3:
-        from exo.worker.engines.mlx.kimi_k3_pipeline import (
-            configure_kimi_k3_local_cache_indices,
-        )
-
-        configure_kimi_k3_local_cache_indices(inner_model_instance, layers)
 
     assert isinstance(layers, list), (
         "Expected a list of layers after auto-parallel initialisation"
@@ -2351,9 +2345,10 @@ def _set_layers(model: nn.Module, layers: list[_LayerCallable]) -> None:
     inner_model_instance = get_inner_model(model)
     if hasattr(inner_model_instance, "layers"):
         inner_model_instance.layers = layers
+        is_kimi_k3 = type(model).__module__ == "mlx_lm.models.kimi_k3"
 
         # Update DeepSeek V3 specific parameters when layers are shrunk
-        if isinstance(
+        updates_layer_range = isinstance(
             model,
             (
                 DeepseekV3Model,
@@ -2362,13 +2357,40 @@ def _set_layers(model: nn.Module, layers: list[_LayerCallable]) -> None:
                 Glm4MoeModel,
                 KimiK25Model,
             ),
-        ) and hasattr(inner_model_instance, "num_layers"):
+        ) and hasattr(inner_model_instance, "num_layers")
+        if updates_layer_range or is_kimi_k3:
+            if not hasattr(inner_model_instance, "num_layers"):
+                raise ValueError(
+                    f"{type(model).__name__} must expose num_layers after "
+                    "pipeline layer replacement"
+                )
             logger.info(
                 f"Setting num_layers to {len(layers)} for model {model.model.__class__.__name__}"
             )
             inner_model_instance.start_idx = 0
             inner_model_instance.end_idx = len(layers)
             inner_model_instance.num_layers = len(layers)
+            if is_kimi_k3:
+                set_cache_indices = getattr(
+                    inner_model_instance,
+                    "_set_cache_indices",
+                    None,
+                )
+                if callable(set_cache_indices):
+                    # Upstream 43f5e87 exposes a no-argument refresh; the
+                    # final runtime also accepts an optional explicit list.
+                    # The no-argument form works with both contracts now that
+                    # layers/start/end describe the local interval.
+                    set_cache_indices()
+                else:
+                    from exo.worker.engines.mlx.kimi_k3_pipeline import (
+                        configure_kimi_k3_local_cache_indices,
+                    )
+
+                    configure_kimi_k3_local_cache_indices(
+                        inner_model_instance,
+                        layers,
+                    )
         elif isinstance(model, Qwen3MoeModel):
             logger.info(
                 f"Setting num_hidden_layers to {len(layers)} for model {model.model.__class__.__name__}"
