@@ -45,7 +45,7 @@ SUPPORTED_TP_CONTRACT_DIGEST = (
     "1b7fdf1b28433fb08fff7e0e26a7bccc2ca0fcd51f29498ab611892c9fc48da5"
 )
 SUPPORTED_LOADER_SHA256 = (
-    "1ba57a245e359e830dd04a8dda51946cfe28ceee4aeb05ac496917e0c59f1207"
+    "db782cb82e96b9e63ed1fe6bf6355938daaa62d79f736b32aa0fca96aa9ab6dd"
 )
 _ALLOWED_CHECKPOINT_TEMPLATE_FIELDS = frozenset({"rank", "world_size"})
 
