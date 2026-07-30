@@ -16,6 +16,12 @@ parallel checkpoints.
   before a speculative decoder is integrated.
 - `launch_k3_target_verify.sh` launches that benchmark with overridable,
   environment-derived paths.
+- `k3_target_diagnostic.py` is a separate, non-promotional companion that
+  localizes T>1 divergence across token positions, decoder layers, final
+  hidden states, mixed cache state, and one subsequent T=1 rollout.
+- `launch_k3_target_diagnostic.sh` launches the diagnostic at a small
+  128-token prompt and width 2 by default. It does not alter or replace the
+  target-verification v3 PASS/FAIL gate.
 - `transport-jaccl-tp2.example.json` documents the explicit topology contract
   that both ranks must receive; it contains placeholders, not deployment
   inventory.
