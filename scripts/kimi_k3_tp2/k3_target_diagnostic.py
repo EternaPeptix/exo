@@ -2,7 +2,7 @@
 """Localize Kimi K3 TP2 multi-token target-verification divergence.
 
 This is a companion diagnostic, not an alternative correctness gate.  It
-does not change the ``k3-tp2-target-verification/v3`` PASS/FAIL contract.
+does not change the ``k3-tp2-target-verification/v5`` PASS/FAIL contract.
 Instead, for one selected T>1 width it records:
 
 * target-versus-sequential logits at every token position;

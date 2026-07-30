@@ -91,6 +91,7 @@ warmups="${K3_TARGET_VERIFY_WARMUPS:-1}"
 widths_csv="${K3_TARGET_VERIFY_WIDTHS:-1,2}"
 wired_limit="${K3_TARGET_VERIFY_WIRED_LIMIT:-1}"
 file_hashes="${K3_TARGET_VERIFY_FILE_HASHES:-0}"
+transport_mode="${K3_TARGET_VERIFY_TRANSPORT_MODE:-mesh}"
 
 [[ "${prompt_tokens}" =~ ^[1-9][0-9]*$ ]] ||
   die "K3_TARGET_VERIFY_PROMPT_TOKENS must be a positive integer"
@@ -104,6 +105,24 @@ file_hashes="${K3_TARGET_VERIFY_FILE_HASHES:-0}"
   die "K3_TARGET_VERIFY_WIRED_LIMIT must be 0 or 1"
 [[ "${file_hashes}" == "0" || "${file_hashes}" == "1" ]] ||
   die "K3_TARGET_VERIFY_FILE_HASHES must be 0 or 1"
+case "${transport_mode}" in
+  mesh)
+    launch_backend="jaccl"
+    force_mesh=1
+    [[ "${MLX_JACCL_RING+x}" != "x" ]] ||
+      die "MLX_JACCL_RING must be unset for mesh"
+    ;;
+  ring)
+    launch_backend="jaccl-ring"
+    force_mesh=0
+    ;;
+  *)
+    die "K3_TARGET_VERIFY_TRANSPORT_MODE must be mesh or ring"
+    ;;
+esac
+# Do not let local process state leak into mlx.launch. The jaccl-ring backend
+# sets MLX_JACCL_RING=1 on both remote ranks; the jaccl backend leaves it unset.
+unset MLX_JACCL_RING
 
 IFS=',' read -r -a requested_widths <<<"${widths_csv}"
 supported_widths=" 1 2 3 4 7 8 "
@@ -121,7 +140,7 @@ done
 pythonpath="${mlx_core_override}:${mlx_lm_root}:${verify_root}:${tp_tools_root}"
 width_slug="${widths_csv//,/-}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-artifact="${artifact_root}/k3-target-verify-current-${prompt_tokens}p-w${width_slug}-${stamp}-p$$.json"
+artifact="${artifact_root}/k3-target-verify-current-${prompt_tokens}p-w${width_slug}-${stamp}-p$$-${transport_mode}.json"
 
 arguments=(
   "${verify_root}/k3_target_verify.py"
@@ -149,12 +168,13 @@ mkdir -p "${artifact_root}"
 
 exec "${launcher}" \
   --verbose \
-  --backend jaccl-ring \
+  --backend "${launch_backend}" \
   --hostfile "${hostfile}" \
   --env "PYTHONPATH=${pythonpath}" \
   --env "K3_TP_TRANSPORT_CONTRACT=${transport_contract}" \
+  --env "K3_TP_TRANSPORT_MODE=${transport_mode}" \
   --env MLX_METAL_FAST_SYNCH=1 \
-  --env EXO_MLX_JACCL_FORCE_MESH=1 \
+  --env "EXO_MLX_JACCL_FORCE_MESH=${force_mesh}" \
   --env EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1 \
   --env EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4=0 \
   --env EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4=0 \

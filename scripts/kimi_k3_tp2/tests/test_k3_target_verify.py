@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -195,7 +197,7 @@ def test_equivalence_gate_is_fail_closed():
 
 
 def test_width_summary_and_artifact_status_require_exact_contract():
-    assert subject.ARTIFACT_SCHEMA == "k3-tp2-target-verification/v4"
+    assert subject.ARTIFACT_SCHEMA == "k3-tp2-target-verification/v5"
     assert subject.VERIFY_WIDTHS == (1, 2, 3, 4, 7, 8)
     records = []
     for width in subject.VERIFY_WIDTHS:
@@ -255,7 +257,11 @@ def test_runtime_contract_splits_converter_and_execution_provenance():
 
 def test_current_launcher_pins_current_exact_runtime_contract():
     launcher = (VERIFY_ROOT / "launch_k3_target_verify_current.sh").read_text()
-    assert "--backend jaccl-ring" in launcher
+    assert 'K3_TARGET_VERIFY_TRANSPORT_MODE:-mesh' in launcher
+    assert 'launch_backend="jaccl"' in launcher
+    assert 'launch_backend="jaccl-ring"' in launcher
+    assert '--backend "${launch_backend}"' in launcher
+    assert "K3_TP_TRANSPORT_MODE" in launcher
     for required in (
         "K3_TARGET_VERIFY_ROOT",
         "K3_TP_TOOLS_ROOT",
@@ -275,7 +281,7 @@ def test_current_launcher_pins_current_exact_runtime_contract():
         'pythonpath="${mlx_core_override}:${mlx_lm_root}:${verify_root}:'
         '${tp_tools_root}"'
     ) in launcher
-    assert "EXO_MLX_JACCL_FORCE_MESH=1" in launcher
+    assert 'EXO_MLX_JACCL_FORCE_MESH=${force_mesh}' in launcher
     assert "EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1" in launcher
     assert "EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4=0" in launcher
     assert "EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4=0" in launcher
@@ -295,6 +301,96 @@ def test_current_launcher_pins_current_exact_runtime_contract():
     assert "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE=hidden" in launcher
     assert 'K3_TARGET_VERIFY_PROMPT_TOKENS:-128' in launcher
     assert 'K3_TARGET_VERIFY_WIDTHS:-1,2' in launcher
+
+
+def _launcher_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    rank0 = tmp_path / "rank0"
+    mlx_lm_root = tmp_path / "mlx-lm"
+    mlx_core_root = tmp_path / "mlx-core"
+    artifact_root = tmp_path / "artifacts"
+    rank0.mkdir()
+    (mlx_lm_root / "mlx_lm").mkdir(parents=True)
+    (mlx_core_root / "mlx").mkdir(parents=True)
+    hostfile = tmp_path / "hostfile.json"
+    contract = tmp_path / "transport.json"
+    hostfile.write_text("{}")
+    contract.write_text("{}")
+    capture = tmp_path / "launcher-argv.txt"
+    ring_capture = tmp_path / "launcher-ring-env.txt"
+    fake_launcher = tmp_path / "mlx.launch"
+    fake_launcher.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$@" > "${K3_CAPTURE}"\n'
+        'if [ "${MLX_JACCL_RING+x}" = x ]; then\n'
+        '  printf "set:%s\\n" "${MLX_JACCL_RING}" > "${K3_RING_CAPTURE}"\n'
+        "else\n"
+        '  printf "unset\\n" > "${K3_RING_CAPTURE}"\n'
+        "fi\n"
+    )
+    fake_launcher.chmod(0o755)
+    environment = {
+        **os.environ,
+        "K3_TARGET_VERIFY_ROOT": str(VERIFY_ROOT),
+        "K3_TP_TOOLS_ROOT": str(TP_TOOLS),
+        "K3_TP_RANK0_ROOT": str(rank0),
+        "K3_TP_RANK1_ROOT": "/remote/rank1",
+        "K3_TP_HOSTFILE": str(hostfile),
+        "K3_TP_TRANSPORT_CONTRACT": str(contract),
+        "K3_TARGET_VERIFY_ARTIFACT_ROOT": str(artifact_root),
+        "K3_TP_LAUNCHER": str(fake_launcher),
+        "K3_MLX_LM_ROOT": str(mlx_lm_root),
+        "K3_MLX_CORE_OVERRIDE": str(mlx_core_root),
+        "K3_CAPTURE": str(capture),
+        "K3_RING_CAPTURE": str(ring_capture),
+    }
+    environment.pop("MLX_JACCL_RING", None)
+    return environment, capture, ring_capture
+
+
+@pytest.mark.parametrize(
+    ("requested_mode", "expected_backend", "expected_force_mesh"),
+    [
+        (None, "jaccl", "1"),
+        ("ring", "jaccl-ring", "0"),
+    ],
+)
+def test_current_launcher_selects_and_declares_transport(
+    tmp_path: Path,
+    requested_mode: str | None,
+    expected_backend: str,
+    expected_force_mesh: str,
+):
+    environment, capture, ring_capture = _launcher_environment(tmp_path)
+    if requested_mode is not None:
+        environment["K3_TARGET_VERIFY_TRANSPORT_MODE"] = requested_mode
+    subprocess.run(
+        ["/bin/bash", str(VERIFY_ROOT / "launch_k3_target_verify_current.sh")],
+        check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    argv = capture.read_text().splitlines()
+    backend_index = argv.index("--backend")
+    assert argv[backend_index + 1] == expected_backend
+    declared_mode = requested_mode or "mesh"
+    assert f"K3_TP_TRANSPORT_MODE={declared_mode}" in argv
+    assert f"EXO_MLX_JACCL_FORCE_MESH={expected_force_mesh}" in argv
+    assert ring_capture.read_text().strip() == "unset"
+
+
+def test_current_mesh_launcher_rejects_inherited_ring_marker(tmp_path: Path):
+    environment, _, _ = _launcher_environment(tmp_path)
+    environment["MLX_JACCL_RING"] = "0"
+    result = subprocess.run(
+        ["/bin/bash", str(VERIFY_ROOT / "launch_k3_target_verify_current.sh")],
+        check=False,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "MLX_JACCL_RING must be unset for mesh" in result.stderr
 
 
 def test_cli_default_clears_current_chat_template_overhead():

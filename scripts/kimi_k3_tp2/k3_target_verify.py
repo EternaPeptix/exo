@@ -42,7 +42,7 @@ from typing import Any, Iterable, Sequence
 
 import tp2_benchmark as base
 
-ARTIFACT_SCHEMA = "k3-tp2-target-verification/v4"
+ARTIFACT_SCHEMA = "k3-tp2-target-verification/v5"
 VERIFY_WIDTHS = (1, 2, 3, 4, 7, 8)
 EXPECTED_ARRAY_CACHE_COUNT = 69
 EXPECTED_KV_CACHE_COUNT = 24
@@ -743,7 +743,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise VerificationError(f"expected JACCL TP2, got TP{world_size}")
     init_seconds = time.perf_counter() - init_started
 
-    transport = base.inspect_jaccl_ring_transport(rank=rank)
+    transport = base.inspect_jaccl_transport(rank=rank)
+    mode_digests = base.require_shared_digest(
+        mx,
+        group,
+        transport["mode"],
+        "JACCL transport mode",
+    )
     matrix_digests = base.require_shared_digest(
         mx,
         group,
@@ -961,7 +967,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             attestation=runtime_attestation,
         ),
         "distributed": {
-            "backend": "jaccl-ring",
+            "backend": transport["mode"],
+            "initialization_backend": "jaccl",
             "world_size": world_size,
             "strict_init_requested": True,
             "init_seconds_rank0": init_seconds,
@@ -970,6 +977,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "load_seconds_by_rank": [row[0] for row in load_rows],
             "load_peak_memory_gb_by_rank": [row[1] / 1e9 for row in load_rows],
             "transport": {
+                "schema": transport["schema"],
+                "mode": transport["mode"],
+                "topology": transport["topology"],
+                "ring": transport["ring"],
+                "mesh": transport["mesh"],
+                "mlx_jaccl_ring": transport["mlx_jaccl_ring"],
+                "mode_sha256_by_rank": mode_digests,
                 "coordinator_sha256_by_rank": coordinator_digests,
                 "device_matrix": transport["device_matrix"],
                 "device_matrix_sha256_by_rank": matrix_digests,

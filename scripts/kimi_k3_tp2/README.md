@@ -18,7 +18,8 @@ parallel checkpoints.
   environment-derived paths.
 - `launch_k3_target_verify_current.sh` is the fail-closed launcher for the
   accepted routed-up-add stack. It requires every deployment path explicitly,
-  pins all accepted feature states, and initially checks widths 1 and 2.
+  pins all accepted feature states, defaults to the live JACCL mesh transport,
+  and initially checks widths 1 and 2.
 - `k3_target_diagnostic.py` is a separate, non-promotional companion that
   localizes T>1 divergence across token positions, decoder layers, final
   hidden states, mixed cache state, and one subsequent T=1 rollout.

@@ -175,8 +175,11 @@ def test_transport_environment_requires_exact_four_rail_ring(
         monkeypatch.setenv(name, value)
 
     result = benchmark.inspect_jaccl_ring_transport(rank=1)
+    assert result["schema"] == benchmark.TRANSPORT_ATTESTATION_SCHEMA
     assert result["mode"] == "jaccl-ring"
     assert result["ring"] is True
+    assert result["mesh"] is False
+    assert result["mlx_jaccl_ring"] == "1"
     assert result["device_matrix"] == expected_matrix
     assert result["transport_contract_path"] == str(contract_path.resolve())
 
@@ -194,6 +197,64 @@ def test_transport_environment_requires_exact_four_rail_ring(
         )
     )
     with pytest.raises(benchmark.BenchmarkError, match="four-rail transport contract"):
+        benchmark.inspect_jaccl_ring_transport(rank=1)
+
+
+def test_transport_environment_attests_exact_four_rail_mesh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    contract_path, expected_matrix = transport_contract(tmp_path)
+    matrix_path = tmp_path / "ibv-devices.json"
+    matrix_path.write_text(json.dumps(expected_matrix))
+    environment = {
+        benchmark.TRANSPORT_CONTRACT_ENV: str(contract_path),
+        benchmark.TRANSPORT_MODE_ENV: "mesh",
+        "MLX_RANK": "0",
+        "MLX_JACCL_COORDINATOR": "192.0.2.10:29337",
+        "MLX_IBV_DEVICES": str(matrix_path),
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("MLX_JACCL_RING", raising=False)
+
+    result = benchmark.inspect_jaccl_transport(rank=0)
+    assert result["schema"] == benchmark.TRANSPORT_ATTESTATION_SCHEMA
+    assert result["mode"] == "jaccl-mesh"
+    assert result["topology"] == "mesh"
+    assert result["mesh"] is True
+    assert result["ring"] is False
+    assert result["mlx_jaccl_ring"] == "unset"
+    assert result["device_matrix"] == expected_matrix
+
+    for marker in ("", "0", "1"):
+        monkeypatch.setenv("MLX_JACCL_RING", marker)
+        with pytest.raises(benchmark.BenchmarkError, match="must be unset"):
+            benchmark.inspect_jaccl_transport(rank=0)
+    monkeypatch.delenv("MLX_JACCL_RING")
+
+    monkeypatch.setenv(benchmark.TRANSPORT_MODE_ENV, "ring")
+    with pytest.raises(benchmark.BenchmarkError, match="MLX_JACCL_RING=1"):
+        benchmark.inspect_jaccl_transport(rank=0)
+
+
+def test_transport_mode_declaration_is_required_and_cannot_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    contract_path, expected_matrix = transport_contract(tmp_path)
+    matrix_path = tmp_path / "ibv-devices.json"
+    matrix_path.write_text(json.dumps(expected_matrix))
+    monkeypatch.setenv(benchmark.TRANSPORT_CONTRACT_ENV, str(contract_path))
+    monkeypatch.setenv("MLX_RANK", "1")
+    monkeypatch.setenv("MLX_JACCL_COORDINATOR", "192.0.2.10:29337")
+    monkeypatch.setenv("MLX_IBV_DEVICES", str(matrix_path))
+    monkeypatch.delenv("MLX_JACCL_RING", raising=False)
+    monkeypatch.delenv(benchmark.TRANSPORT_MODE_ENV, raising=False)
+
+    with pytest.raises(benchmark.BenchmarkError, match=benchmark.TRANSPORT_MODE_ENV):
+        benchmark.inspect_jaccl_transport(rank=1)
+
+    monkeypatch.setenv(benchmark.TRANSPORT_MODE_ENV, "mesh")
+    with pytest.raises(benchmark.BenchmarkError, match="conflicts"):
         benchmark.inspect_jaccl_ring_transport(rank=1)
 
 

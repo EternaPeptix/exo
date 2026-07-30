@@ -52,6 +52,9 @@ ARTIFACT_SCHEMA = "k3-rank-local-tp2-benchmark/v2"
 WORLD_SIZE = 2
 TRANSPORT_CONTRACT_SCHEMA = "k3-jaccl-transport/v1"
 TRANSPORT_CONTRACT_ENV = "K3_TP_TRANSPORT_CONTRACT"
+TRANSPORT_ATTESTATION_SCHEMA = "k3-jaccl-runtime-transport/v2"
+TRANSPORT_MODE_ENV = "K3_TP_TRANSPORT_MODE"
+TRANSPORT_MODES = ("mesh", "ring")
 EXPECTED_RAIL_COUNT = 4
 DEFAULT_PROMPT = (
     "You are inspecting a large software repository. Explain how to trace a "
@@ -170,23 +173,46 @@ def load_transport_contract(path: str | Path | None = None) -> dict[str, Any]:
     }
 
 
-def inspect_jaccl_ring_transport(
+def inspect_jaccl_transport(
     *,
     rank: int,
     contract_path: str | Path | None = None,
+    expected_mode: str | None = None,
 ) -> dict[str, Any]:
-    """Authenticate the exact two-Mac, four-rail JACCL ring environment.
+    """Authenticate an explicit two-Mac, four-rail JACCL runtime mode.
 
-    ``mlx.launch --backend jaccl-ring`` materializes the hostfile's RDMA matrix
-    into a per-rank JSON file and exports its path through ``MLX_IBV_DEVICES``.
-    The runtime values must match a separate explicit contract so the source
-    tree contains no deployment inventory.
+    ``mlx.launch --backend jaccl`` selects mesh by leaving ``MLX_JACCL_RING``
+    unset. ``--backend jaccl-ring`` selects ring by setting it to exactly
+    ``1``. The runtime values must match both an explicit mode declaration and
+    a separate topology contract so the source tree contains no deployment
+    inventory.
     """
 
     contract = load_transport_contract(contract_path)
-    if os.environ.get("MLX_JACCL_RING") != "1":
+    declared_mode = os.environ.get(TRANSPORT_MODE_ENV)
+    if expected_mode is None:
+        mode = declared_mode
+    else:
+        mode = expected_mode
+        if declared_mode is not None and declared_mode != expected_mode:
+            raise BenchmarkError(
+                f"{TRANSPORT_MODE_ENV}={declared_mode!r} conflicts with "
+                f"expected mode {expected_mode!r}"
+            )
+    if mode not in TRANSPORT_MODES:
+        raise BenchmarkError(
+            f"{TRANSPORT_MODE_ENV} must be one of {list(TRANSPORT_MODES)}"
+        )
+
+    ring_marker_present = "MLX_JACCL_RING" in os.environ
+    ring_marker = os.environ.get("MLX_JACCL_RING")
+    if mode == "ring" and ring_marker != "1":
         raise BenchmarkError(
             "MLX_JACCL_RING=1 is required; launch with --backend jaccl-ring"
+        )
+    if mode == "mesh" and ring_marker_present:
+        raise BenchmarkError(
+            "MLX_JACCL_RING must be unset for mesh; launch with --backend jaccl"
         )
     if os.environ.get("MLX_RANK") != str(rank):
         raise BenchmarkError(f"MLX_RANK does not match distributed rank {rank}")
@@ -231,9 +257,14 @@ def inspect_jaccl_ring_transport(
             "MLX_IBV_DEVICES does not match the explicit four-rail transport contract"
         )
 
+    runtime_mode = f"jaccl-{mode}"
     return {
-        "mode": "jaccl-ring",
-        "ring": True,
+        "schema": TRANSPORT_ATTESTATION_SCHEMA,
+        "mode": runtime_mode,
+        "topology": mode,
+        "ring": mode == "ring",
+        "mesh": mode == "mesh",
+        "mlx_jaccl_ring": "1" if mode == "ring" else "unset",
         "coordinator": coordinator,
         "coordinator_sha256": hashlib.sha256(coordinator.encode("utf-8")).hexdigest(),
         "device_matrix": matrix,
@@ -242,6 +273,20 @@ def inspect_jaccl_ring_transport(
         "transport_contract_path": contract["path"],
         "transport_contract_sha256": contract["sha256"],
     }
+
+
+def inspect_jaccl_ring_transport(
+    *,
+    rank: int,
+    contract_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Backward-compatible explicit ring attestation."""
+
+    return inspect_jaccl_transport(
+        rank=rank,
+        contract_path=contract_path,
+        expected_mode="ring",
+    )
 
 
 def token_digest(tokens: Iterable[int]) -> str:

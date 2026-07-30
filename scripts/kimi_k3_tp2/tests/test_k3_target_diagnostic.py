@@ -13,8 +13,8 @@ import k3_target_diagnostic as diagnostic  # noqa: E402
 import k3_target_verify as verification  # noqa: E402
 
 
-def test_diagnostic_is_separate_and_cannot_promote_v4():
-    assert verification.ARTIFACT_SCHEMA == "k3-tp2-target-verification/v4"
+def test_diagnostic_is_separate_and_cannot_promote_v5():
+    assert verification.ARTIFACT_SCHEMA == "k3-tp2-target-verification/v5"
     assert diagnostic.DIAGNOSTIC_SCHEMA == (
         "k3-tp2-target-divergence-diagnostic/v1"
     )
@@ -305,7 +305,7 @@ def test_cli_defaults_to_small_prompt_and_first_t_greater_than_one_width():
         )
 
 
-def test_launcher_pins_diagnostic_runtime_without_touching_v3():
+def test_launcher_pins_diagnostic_runtime_without_touching_v5():
     launcher = (TOOLS_ROOT / "launch_k3_target_diagnostic.sh").read_text()
     assert "k3_target_diagnostic.py" in launcher
     assert "--backend jaccl-ring" in launcher

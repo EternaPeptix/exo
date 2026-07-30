@@ -57,6 +57,7 @@ exec "${launcher}" \
   --hostfile "${hostfile}" \
   --env "PYTHONPATH=${pythonpath}" \
   --env "K3_TP_TRANSPORT_CONTRACT=${transport_contract}" \
+  --env K3_TP_TRANSPORT_MODE=ring \
   --env MLX_METAL_FAST_SYNCH=1 \
   --env EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1 \
   --env EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4=0 \
