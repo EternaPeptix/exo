@@ -32,7 +32,7 @@ checkpoint, so they remain research evidence rather than production defaults.
 | --- | --- |
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
-| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/exo-mlx-inference-optimizations) commit `bfd0924ea3a3b575a4a66007fe31eef8c3d64be8` |
+| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/exo-mlx-inference-optimizations) commit `52ecaae77f461d7ae8a5e3ac1260d23203e4ebba` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v1` |
 
@@ -46,7 +46,7 @@ at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@bfd0924ea3a3b575a4a66007fe31eef8c3d64be8"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@52ecaae77f461d7ae8a5e3ac1260d23203e4ebba"
 ```
 
 ## License and trust boundary
