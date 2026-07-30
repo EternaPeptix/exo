@@ -53,12 +53,14 @@ digests from `c84d…` to `905f…`; that implementation was rejected. The
 corrected router preserves MLX's sequential FP32 denominator fold and raised
 the exact AttnRes stack from `13.6714` to `13.8160` tok/s (`+1.06%`).
 
-Adding the exact zero-copy KDA skinny-projection pack then produced the current
-best exact median: `14.0268` tok/s over five canonical repetitions (`+1.53%`
-over the corrected-router stack and `+3.26%` over fused down/reduction alone).
-The matched 1,067-token coding prompt reached `13.9971` tok/s (`+1.57%` over
-the corrected-router stack). Every measured completion retained its reference
-digest, and the latest change saved `1.088 ms/token`.
+Adding the exact zero-copy KDA skinny-projection pack raised the canonical
+median to `14.0268` tok/s. Packing the remaining wide QKV/gate pair then
+produced the current best exact median: `14.1097` tok/s over five repetitions
+(`+0.59%` over skinny-only and `+3.87%` over fused down/reduction alone).
+The matched 1,067-token coding prompt reached `14.0764` tok/s (`+0.57%` over
+skinny-only). Every measured completion retained its reference digest, and
+the wide pack saved another `0.419 ms/token` with zero persistent allocation
+growth.
 
 The row-tiled KDA prefill kernel is bit-exact and now also has a matched
 full-model TP2 result. At 2K target context it reached `147.4168` prompt
@@ -89,7 +91,7 @@ checkpoint, so they remain research evidence rather than production defaults.
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
 | Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v3) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
-| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v3) coordinated commit `2787e74691376dca045c0fd55bf503eb6499c05b`; live-tested code commit `5d20e13a73118642d1bb539c7a333ef60843af73` |
+| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v3) coordinated commit `fefa7588ce0e84e9905da198fd2899693c45d0bd`; live-tested code commit `f6262cc9ccfa440a26b80870d368df7a3c1ff9c6` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v1` |
 
@@ -103,7 +105,7 @@ at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@2787e74691376dca045c0fd55bf503eb6499c05b"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@fefa7588ce0e84e9905da198fd2899693c45d0bd"
 ```
 
 ## License and trust boundary
@@ -194,6 +196,7 @@ export MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE=1
 export MLX_LM_KIMI_K3_FUSED_ATTNRES_RMS=1
 export MLX_LM_KIMI_K3_FUSED_ROUTER=1
 export MLX_LM_KIMI_K3_PACKED_KDA_SKINNY=1
+export MLX_LM_KIMI_K3_PACKED_KDA_WIDE=1
 ```
 
 The EXO MLX worker resolves `{rank}` from the distributed rank, verifies the
@@ -214,10 +217,11 @@ prompt positions; measure representative long prompts before enabling it for
 a latency-sensitive production workload.
 
 The asynchronous schedule, authoritative packed MoE-front, row-tiled KDA
-prefill, exact fused-expert/down/router, AttnRes/RMSNorm, and KDA skinny-pack
-paths are also opt-in. The authoritative paths repoint original parameters to
-zero-copy views instead of retaining unpacked duplicates. The row-tiled path
-activates only for supported Metal prefill shapes of at least 128 tokens. The
+prefill, exact fused-expert/down/router, AttnRes/RMSNorm, and KDA skinny/wide
+pack paths are also opt-in. The authoritative paths repoint original
+parameters to zero-copy views instead of retaining unpacked duplicates. The
+row-tiled path activates only for supported Metal prefill shapes of at least
+128 tokens. The
 decode fusions activate only for their released-checkpoint Metal geometry and
 quantization contracts. Unsupported shapes use the reference path. Keep the
 variables unset when reproducing a feature-off control.
