@@ -276,7 +276,6 @@ class TestSeedServerHTTP:
             assert path.read_bytes() == weights
         finally:
             await server.stop()
-
     async def test_missing_file_raises(self, seed_dir, unused_tcp_port) -> None:
         server = SeedServer(port=unused_tcp_port)
         await server.start()
@@ -294,4 +293,3 @@ class TestSeedServerHTTP:
                 )
         finally:
             await server.stop()
-

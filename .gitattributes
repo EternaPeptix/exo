@@ -1,0 +1,3 @@
+# The EXO worker verifies this loader by SHA-256; checkout conversion must not
+# alter its bytes.
+scripts/kimi_k3_tp2/rank_local_loader.py text eol=lf
