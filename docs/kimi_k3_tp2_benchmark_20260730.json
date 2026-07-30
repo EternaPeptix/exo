@@ -12,13 +12,13 @@
     "transport": "four-rail JACCL over Thunderbolt 5"
   },
   "runtime": {
-    "exo_live_execution_commit": "1bcb1b41eb337a3e38f66d18399dc36a0f6baf1d",
+    "exo_live_execution_commit": "96a319f01263f316d49b645b55d3a50a92746010",
     "exo_publication_base_commit": "2653972d3a43f434c853026a2d68f86a700d5abb",
     "mlx_commit": "57b87fe47cfce34d6dc59d0e274d8ee36bfb9308",
-    "mlx_lm_live_execution_commit": "5d20e13a73118642d1bb539c7a333ef60843af73",
-    "mlx_lm_public_commit": "2787e74691376dca045c0fd55bf503eb6499c05b",
-    "rank_local_loader_live_sha256": "563eac6a0e2aaedac0c83e00c13be8f9b7c32f346f0827ca67f2cf6c05a7dd08",
-    "rank_local_loader_public_sha256": "e186afbb6b700cf553404b2acde501c297722903dda33f923de2a5237c02e668"
+    "mlx_lm_live_execution_commit": "f6262cc9ccfa440a26b80870d368df7a3c1ff9c6",
+    "mlx_lm_public_commit": "fefa7588ce0e84e9905da198fd2899693c45d0bd",
+    "rank_local_loader_live_sha256": "1ba57a245e359e830dd04a8dda51946cfe28ceee4aeb05ac496917e0c59f1207",
+    "rank_local_loader_public_sha256": "51423d33ac44d760fd11724dc2a357cbbe9862f20218efd70829b62b44416baa"
   },
   "common_configuration": {
     "temperature": 0,
@@ -32,7 +32,8 @@
     "fused_down_reduce": true,
     "fused_attnres_rms": true,
     "fused_router_exact": true,
-    "packed_kda_skinny": true
+    "packed_kda_skinny": true,
+    "packed_kda_wide": true
   },
   "canonical_decode": {
     "target_prompt_tokens": 512,
@@ -141,6 +142,26 @@
       "improvement_over_exact_router_percent": 1.5254,
       "cumulative_improvement_over_fused_down_percent": 3.2632,
       "milliseconds_saved_per_token_over_exact_router": 1.0875
+    },
+    "packed_kda_wide_candidate": {
+      "generation_tps": [
+        14.151463462959153,
+        13.985668303664944,
+        14.101713095044278,
+        14.109713716669487,
+        14.117290234441969
+      ],
+      "peak_memory_bytes": [
+        413959689290,
+        413945582666,
+        414030763090,
+        413959672906,
+        413959656522
+      ],
+      "median_generation_tps": 14.109713716669487,
+      "improvement_over_skinny_only_percent": 0.5914,
+      "cumulative_improvement_over_fused_down_percent": 3.8739,
+      "milliseconds_saved_per_token_over_skinny_only": 0.4192
     }
   },
   "coding_decode": {
@@ -182,7 +203,15 @@
     ],
     "packed_kda_skinny_median_generation_tps": 13.997115491068584,
     "packed_kda_skinny_improvement_over_exact_router_percent": 1.5689,
-    "packed_kda_skinny_cumulative_improvement_over_fused_down_percent": 3.6043
+    "packed_kda_skinny_cumulative_improvement_over_fused_down_percent": 3.6043,
+    "packed_kda_wide_generation_tps": [
+      14.073465174641758,
+      14.076389717412951,
+      14.085250787863664
+    ],
+    "packed_kda_wide_median_generation_tps": 14.076389717412951,
+    "packed_kda_wide_improvement_over_skinny_only_percent": 0.5664,
+    "packed_kda_wide_cumulative_improvement_over_fused_down_percent": 4.1911
   },
   "rejected_router_screen": {
     "target_prompt_tokens": 512,
