@@ -107,10 +107,18 @@ EXO_MAX_CONCURRENT_REQUESTS = int(os.getenv("EXO_MAX_CONCURRENT_REQUESTS", "8"))
 
 EXO_MAX_INSTANCE_RETRIES = 5
 
-# Port for the per-node weight seed server. Every node serves its local model
-# files to peers over plain HTTP so that weights can be seeded across the LAN
-# instead of downloaded from HuggingFace on every node.
+# Peer weight seeding uses unauthenticated HTTP and is therefore an explicit
+# opt-in. Bind loopback by default; operators enabling it across hosts should
+# select an address on a dedicated trusted-cluster interface.
+EXO_ENABLE_PEER_SEEDING = (
+    os.getenv("EXO_ENABLE_PEER_SEEDING", "false").lower() == "true"
+)
 EXO_SEED_PORT = int(os.getenv("EXO_SEED_PORT", "52416"))
+EXO_SEED_BIND_HOST = os.getenv("EXO_SEED_BIND_HOST", "127.0.0.1")
 
-# Disable peer weight seeding (both serving and fetching) when set to true.
-EXO_DISABLE_PEER_SEEDING = os.getenv("EXO_DISABLE_PEER_SEEDING", "false").lower() == "true"
+# Keep the original emergency-off flag, but require the affirmative enable
+# flag as well. This preserves a fail-closed kill switch for existing setups.
+EXO_DISABLE_PEER_SEEDING = (
+    not EXO_ENABLE_PEER_SEEDING
+    or os.getenv("EXO_DISABLE_PEER_SEEDING", "false").lower() == "true"
+)

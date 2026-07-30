@@ -18,10 +18,18 @@ from exo.download.download_utils import (
 )
 from exo.download.peer_source import (
     PeerDownloadError,
+    _parse_peer_file_list,
     download_file_from_peer,
     fetch_peer_file_list,
 )
-from exo.download.seed_server import SeedServer, _scan_files
+from exo.download.seed_server import (
+    MAX_PEER_FILE_BYTES,
+    PeerProtocolError,
+    SeedServer,
+    _scan_files,
+    validate_normalized_model_id,
+    validate_relative_file_path,
+)
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.types.backends import Backend
 from exo.shared.types.memory import Memory
@@ -222,6 +230,7 @@ class TestResolveExistingModelForShard:
             )
             assert resolve_existing_model_for_shard(MODEL_ID, _shard(0, 2)) is None
 
+
 # ---------------------------------------------------------------------------
 # Seed server
 # ---------------------------------------------------------------------------
@@ -251,9 +260,69 @@ class TestSeedServerScan:
         weights = _make_minimal_safetensors()
         assert files["weights.safetensors"][0] == len(weights)
 
+    def test_scan_rejects_model_traversal(self, seed_dir) -> None:
+        with pytest.raises(PeerProtocolError, match="model identifier"):
+            _scan_files("..")
+
+    def test_scan_rejects_file_and_directory_symlinks(self, seed_dir: Path) -> None:
+        model_dir = seed_dir / NORMALIZED
+        outside_file = seed_dir.parent / "outside-secret.txt"
+        outside_file.write_text("secret")
+        (model_dir / "leak.txt").symlink_to(outside_file)
+        outside_dir = seed_dir.parent / "outside-directory"
+        outside_dir.mkdir()
+        (outside_dir / "nested-secret.txt").write_text("secret")
+        (model_dir / "linked-directory").symlink_to(
+            outside_dir, target_is_directory=True
+        )
+
+        files = _scan_files(NORMALIZED)
+
+        assert "leak.txt" not in files
+        assert "linked-directory/nested-secret.txt" not in files
+
+
+class TestPeerProtocolValidation:
+    @pytest.mark.parametrize(
+        "value",
+        ("", ".", "..", "/absolute", "../escape", "a/../b", "a//b", "a\\b"),
+    )
+    def test_rejects_unsafe_relative_paths(self, value: str) -> None:
+        with pytest.raises(PeerProtocolError):
+            validate_relative_file_path(value)
+
+    @pytest.mark.parametrize("value", ("", ".", "..", "../model", "org/model"))
+    def test_rejects_unsafe_normalized_model_ids(self, value: str) -> None:
+        with pytest.raises(PeerProtocolError):
+            validate_normalized_model_id(value)
+
+    @pytest.mark.parametrize("size", (-1, True, MAX_PEER_FILE_BYTES + 1))
+    def test_peer_file_list_rejects_invalid_sizes(self, size: object) -> None:
+        with pytest.raises(PeerDownloadError, match="size"):
+            _parse_peer_file_list({"files": [{"path": "weights.bin", "size": size}]})
+
+    def test_peer_file_list_rejects_traversal_and_duplicates(self) -> None:
+        with pytest.raises(PeerDownloadError, match="relative"):
+            _parse_peer_file_list({"files": [{"path": "../../escape", "size": 1}]})
+        with pytest.raises(PeerDownloadError, match="duplicate"):
+            _parse_peer_file_list(
+                {
+                    "files": [
+                        {"path": "weights.bin", "size": 1},
+                        {"path": "weights.bin", "size": 1},
+                    ]
+                }
+            )
+
 
 @pytest.mark.asyncio
 class TestSeedServerHTTP:
+    async def test_defaults_to_loopback_binding(
+        self, seed_dir, unused_tcp_port
+    ) -> None:
+        server = SeedServer(port=unused_tcp_port)
+        assert server.host == "127.0.0.1"
+
     async def test_serves_file_list_and_file(self, seed_dir, unused_tcp_port) -> None:
         server = SeedServer(port=unused_tcp_port)
         await server.start()
@@ -276,6 +345,104 @@ class TestSeedServerHTTP:
             assert path.read_bytes() == weights
         finally:
             await server.stop()
+
+    async def test_quotes_model_file_url_components(
+        self, seed_dir: Path, unused_tcp_port: int
+    ) -> None:
+        relative = "nested/name with # and ?.bin"
+        source = seed_dir / NORMALIZED / relative
+        source.parent.mkdir()
+        source.write_bytes(b"quoted path")
+        server = SeedServer(port=unused_tcp_port)
+        await server.start()
+        try:
+            base = f"http://127.0.0.1:{unused_tcp_port}"
+            target = seed_dir.parent / "quoted-download"
+            target.mkdir()
+            result = await download_file_from_peer(
+                base,
+                NORMALIZED,
+                relative,
+                target,
+                expected_size=len(b"quoted path"),
+            )
+            assert result.read_bytes() == b"quoted path"
+        finally:
+            await server.stop()
+
+    async def test_rejects_traversal_before_network_or_disk_io(
+        self, seed_dir: Path, unused_tcp_port: int
+    ) -> None:
+        target = seed_dir.parent / "traversal-target"
+        target.mkdir()
+        with pytest.raises(PeerDownloadError, match="relative"):
+            await download_file_from_peer(
+                f"http://127.0.0.1:{unused_tcp_port}",
+                NORMALIZED,
+                "../../escape.bin",
+                target,
+                expected_size=1,
+            )
+        assert not (seed_dir.parent / "escape.bin").exists()
+
+    async def test_rejects_parent_symlink_escape(
+        self, seed_dir: Path, unused_tcp_port: int
+    ) -> None:
+        target = seed_dir.parent / "symlink-target"
+        outside = seed_dir.parent / "symlink-outside"
+        target.mkdir()
+        outside.mkdir()
+        (target / "nested").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(PeerDownloadError, match="escapes"):
+            await download_file_from_peer(
+                f"http://127.0.0.1:{unused_tcp_port}",
+                NORMALIZED,
+                "nested/payload.bin",
+                target,
+                expected_size=1,
+            )
+        assert not (outside / "payload.bin").exists()
+
+    async def test_rejects_response_larger_than_expected_size(
+        self, seed_dir: Path, unused_tcp_port: int
+    ) -> None:
+        server = SeedServer(port=unused_tcp_port)
+        await server.start()
+        try:
+            target = seed_dir.parent / "bounded-download"
+            target.mkdir()
+            with pytest.raises(PeerDownloadError, match="exceeds"):
+                await download_file_from_peer(
+                    f"http://127.0.0.1:{unused_tcp_port}",
+                    NORMALIZED,
+                    "config.json",
+                    target,
+                    expected_size=1,
+                )
+            assert not (target / "config.json").exists()
+        finally:
+            await server.stop()
+
+    async def test_downloads_zero_length_file(
+        self, seed_dir: Path, unused_tcp_port: int
+    ) -> None:
+        (seed_dir / NORMALIZED / "empty.bin").write_bytes(b"")
+        server = SeedServer(port=unused_tcp_port)
+        await server.start()
+        try:
+            target = seed_dir.parent / "empty-download"
+            target.mkdir()
+            path = await download_file_from_peer(
+                f"http://127.0.0.1:{unused_tcp_port}",
+                NORMALIZED,
+                "empty.bin",
+                target,
+                expected_size=0,
+            )
+            assert path.read_bytes() == b""
+        finally:
+            await server.stop()
+
     async def test_missing_file_raises(self, seed_dir, unused_tcp_port) -> None:
         server = SeedServer(port=unused_tcp_port)
         await server.start()

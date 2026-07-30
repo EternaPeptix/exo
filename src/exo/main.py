@@ -28,6 +28,7 @@ from exo.shared.constants import (
     EXO_DISABLE_PEER_SEEDING,
     EXO_LOG,
     EXO_PID_FILE,
+    EXO_SEED_BIND_HOST,
     EXO_SEED_PORT,
 )
 from exo.shared.election import Election, ElectionResult
@@ -101,7 +102,7 @@ class Node:
         seed_server = (
             None
             if args.no_downloads or EXO_DISABLE_PEER_SEEDING
-            else SeedServer(port=EXO_SEED_PORT)
+            else SeedServer(port=EXO_SEED_PORT, host=EXO_SEED_BIND_HOST)
         )
 
         if args.spawn_api:

@@ -312,6 +312,10 @@ exo supports several environment variables for configuration:
 | `EXO_MODELS_READ_ONLY_DIRS` | Colon-separated read-only directories to search for pre-downloaded models (e.g., NFS mounts, shared storage). Models here cannot be deleted. | None |
 | `EXO_OFFLINE` | Run without internet connection (uses only local models) | `false` |
 | `EXO_ENABLE_IMAGE_MODELS` | Enable image model support | `false` |
+| `EXO_ENABLE_PEER_SEEDING` | Opt in to unauthenticated model-file seeding on a trusted cluster network | `false` |
+| `EXO_DISABLE_PEER_SEEDING` | Emergency kill switch for peer serving and fetching, even when enabled | `false` |
+| `EXO_SEED_BIND_HOST` | Local address used by the peer seed server; select a dedicated cluster interface for cross-host seeding | `127.0.0.1` |
+| `EXO_SEED_PORT` | TCP port used by the peer seed server | `52416` |
 | `EXO_LIBP2P_NAMESPACE` | Custom namespace for cluster isolation | None |
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
@@ -330,6 +334,9 @@ EXO_OFFLINE=true uv run exo
 
 # Enable image models
 EXO_ENABLE_IMAGE_MODELS=true uv run exo
+
+# Enable unauthenticated peer seeding only on an isolated, trusted interface
+EXO_ENABLE_PEER_SEEDING=true EXO_SEED_BIND_HOST=169.254.10.2 uv run exo
 
 # Use custom namespace for cluster isolation
 EXO_LIBP2P_NAMESPACE=my-dev-cluster uv run exo
