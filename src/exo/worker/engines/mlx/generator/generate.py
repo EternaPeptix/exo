@@ -1,9 +1,10 @@
 import contextlib
 import functools
 import math
+import os
 import time
 import uuid
-from typing import Callable, Generator, cast, get_args
+from typing import Callable, Generator, Literal, cast, get_args
 
 import mlx.core as mx
 from mlx_lm.generate import (
@@ -35,9 +36,13 @@ from exo.worker.engines.mlx.auto_parallel import (
     PipelineFirstLayer,
     PipelineLastLayer,
     clear_prefill_sends,
+    discard_unsent_prefill_sends_after_agreed_cancel,
     flush_prefill_sends,
+    get_active_relay_context,
+    relay_sampled_tokens,
     set_pipeline_prefill,
     set_pipeline_queue_sends,
+    set_pipeline_token_relay,
 )
 from exo.worker.engines.mlx.cache import (
     CacheSnapshot,
@@ -78,6 +83,83 @@ REMOTE_PREFILL_MIN_TOKENS = 1000
 generation_stream = mx.new_stream(mx.default_device())
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
+
+
+def _prefill_step_size(
+    num_tokens: int,
+    *,
+    is_pipeline: bool,
+    pipeline_divisor: int = 1,
+) -> int:
+    """Choose the nominal MLX-LM prefill step.
+
+    Pipeline prefill divides this value by ``pipeline_divisor`` before building
+    real chunks; tensor prefill uses it directly. Keeping the public override
+    nominal preserves MLX-LM's existing ``prefill_step_size`` semantics while
+    the attention-cell budget bounds the effective per-rank
+    ``query_chunk * context_length`` workspace.
+    """
+    base_step = int(os.environ.get("EXO_MLX_PREFILL_STEP_SIZE", "4096"))
+    if base_step < 4:
+        raise ValueError("EXO_MLX_PREFILL_STEP_SIZE must be at least 4")
+    long_context_min = int(
+        os.environ.get("EXO_MLX_PIPELINE_LONG_CONTEXT_MIN_TOKENS", "4096")
+    )
+    long_context_step = int(
+        os.environ.get(
+            "EXO_MLX_PIPELINE_LONG_CONTEXT_STEP_SIZE",
+            str(base_step),
+        )
+    )
+    if long_context_min < 1:
+        raise ValueError(
+            "EXO_MLX_PIPELINE_LONG_CONTEXT_MIN_TOKENS must be positive"
+        )
+    if long_context_step < 4:
+        raise ValueError(
+            "EXO_MLX_PIPELINE_LONG_CONTEXT_STEP_SIZE must be at least 4"
+        )
+    if num_tokens < long_context_min:
+        return base_step
+
+    max_attention_cells = int(
+        os.environ.get(
+            "EXO_MLX_MAX_ATTENTION_CELLS_PER_CHUNK",
+            os.environ.get(
+                "EXO_MLX_PIPELINE_MAX_ATTENTION_CELLS_PER_CHUNK",
+                "0",
+            ),
+        )
+    )
+    if max_attention_cells < 0:
+        raise ValueError(
+            "EXO_MLX_MAX_ATTENTION_CELLS_PER_CHUNK cannot be negative"
+        )
+    if max_attention_cells == 0:
+        return long_context_step
+
+    pipeline_divisor = max(1, pipeline_divisor if is_pipeline else 1)
+    max_query_chunk = max(1, max_attention_cells // num_tokens)
+    # Power-of-two chunks give stable Metal kernel shapes and make benchmark
+    # comparisons reproducible as the context crosses a budget boundary.
+    query_chunk = 1 << (max_query_chunk.bit_length() - 1)
+    bounded_step = max(4, query_chunk * pipeline_divisor)
+    return min(long_context_step, bounded_step)
+
+
+def _prefill_memory_log_interval() -> int:
+    """Return the optional chunk interval for synchronized MLX memory traces."""
+    interval = int(os.environ.get("EXO_MLX_PREFILL_MEMORY_LOG_INTERVAL", "0"))
+    if interval < 0:
+        raise ValueError(
+            "EXO_MLX_PREFILL_MEMORY_LOG_INTERVAL cannot be negative"
+        )
+    return interval
+
+
+def _memory_from_mlx_decimal_gb(value: float) -> Memory:
+    """Convert MLX-LM's decimal-gigabyte metric back to exact bytes."""
+    return Memory.from_bytes(round(value * 1e9))
 
 
 @contextlib.contextmanager
@@ -162,6 +244,26 @@ def _has_pipeline_communication_layer(model: Model):
     return False
 
 
+def _is_kimi_k3_model(model: Model) -> bool:
+    """Identify the upstream Kimi K3 model without widening other MLX paths."""
+    return type(model).__module__ == "mlx_lm.models.kimi_k3"
+
+
+@contextlib.contextmanager
+def _pipeline_token_relay_scope(
+    model: Model,
+    enabled: bool,
+) -> Generator[None]:
+    """Restore token-relay state on every exit, including generator close."""
+    try:
+        if enabled:
+            set_pipeline_token_relay(model, True)
+        yield
+    finally:
+        if enabled:
+            set_pipeline_token_relay(model, False)
+
+
 def pipeline_parallel_prefill(
     model: Model,
     prompt: mx.array,
@@ -221,6 +323,7 @@ def pipeline_parallel_prefill(
     n_trailing = world_size - 1 - rank
     n_total = n_leading + n_real + n_trailing
 
+    memory_log_interval = _prefill_memory_log_interval()
     t_start = time.perf_counter()
     processed = 0
     logger.info(
@@ -252,24 +355,47 @@ def pipeline_parallel_prefill(
                 flush_prefill_sends()
 
                 prompt_progress_callback(processed, total)
+                if memory_log_interval and (
+                    (i + 1) % memory_log_interval == 0 or i + 1 == n_real
+                ):
+                    mx.synchronize()
+                    logger.info(
+                        f"[R{rank}] Prefill memory after chunk {i + 1}/{n_real}: "
+                        f"processed={processed}, chunk_size={chunk_size}, "
+                        f"active_bytes={mx.get_active_memory()}, "
+                        f"cache_bytes={mx.get_cache_memory()}, "
+                        f"peak_bytes={mx.get_peak_memory()}"
+                    )
 
             for _ in range(n_trailing):
                 if distributed_prompt_progress_callback is not None:
                     distributed_prompt_progress_callback()
 
+        if not _is_kimi_k3_model(model):
+            # Legacy pipeline prefill generates two disposable cache entries,
+            # which prefill() rolls back before decode. K3's non-trimmable
+            # ArraysCache makes that rollback require detached host snapshots.
+            # Its real loop already leaves the cache at this function's
+            # prompt[:-1] (the full prompt[:-2]), exactly where
+            # stream_generate(prompt=full_prompt[-2:]) expects it.
+            for _ in range(2):
+                with mx.stream(generation_stream):
+                    model(prompt[-1:][None], cache=_prompt_cache)
+                    quantize_cache_fn(_prompt_cache)
+                flush_prefill_sends()
+
+        assert _prompt_cache is not None
+        with mx.stream(generation_stream):
+            mx.eval([c.state for c in _prompt_cache])  # type: ignore
+    except PrefillCancelled:
+        # Cancellation is agreed by every rank before the receiver posts the
+        # next prefill receive. The queued frame is therefore still wholly
+        # local and can be discarded without invalidating transport sequence
+        # numbers. Unknown failures continue through the poisoning cleanup.
+        discard_unsent_prefill_sends_after_agreed_cancel()
+        raise
     finally:
         clear_prefill_sends()
-
-    # Post-loop: process remaining 1 token + add +1 entry to match stream_generate.
-    for _ in range(2):
-        with mx.stream(generation_stream):
-            model(prompt[-1:][None], cache=_prompt_cache)
-            quantize_cache_fn(_prompt_cache)
-        flush_prefill_sends()
-
-    assert _prompt_cache is not None
-    with mx.stream(generation_stream):
-        mx.eval([c.state for c in _prompt_cache])  # type: ignore
 
     # Final callback matching generate_step
     prompt_progress_callback(total, total)
@@ -278,6 +404,66 @@ def pipeline_parallel_prefill(
         f"[R{rank}] Prefill: {n_real} real + {n_leading}+{n_trailing} dummy iterations, "
         f"Processed {processed} tokens in {(time.perf_counter() - t_start) * 1000:.1f}ms"
     )
+
+
+def kimi_k3_exact_prefill(
+    model: Model,
+    prompt: mx.array,
+    prompt_cache: KVCacheType,
+    prefill_step_size: int,
+    kv_group_size: int | None,
+    kv_bits: int | None,
+    prompt_progress_callback: Callable[[int, int], None],
+) -> None:
+    """Fill a non-pipeline K3 cache exactly to the decode boundary.
+
+    ``prefill()`` receives the remaining full prompt without its final token.
+    Decode subsequently starts from that argument's final two tokens, so K3
+    must cache exactly ``prompt[:-1]``.  Calling ``stream_generate`` would
+    process the disposable final token and require hundreds of MiB of detached
+    KDA state per rollback checkpoint.  This direct loop reaches the same
+    boundary without sampling, trimming, restoring, or retaining snapshots.
+    """
+    quantize_cache_fn: Callable[..., None] = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=0,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+    total = len(prompt)
+    processed = 0
+    memory_log_interval = _prefill_memory_log_interval()
+    prompt_progress_callback(0, total)
+
+    with mx.stream(generation_stream):
+        while total - processed > 1:
+            remaining = (total - processed) - 1
+            chunk_size = min(prefill_step_size, remaining)
+            model(
+                prompt[processed : processed + chunk_size][None],
+                cache=prompt_cache,
+            )
+            quantize_cache_fn(prompt_cache)
+            mx.eval([c.state for c in prompt_cache])  # type: ignore
+            processed += chunk_size
+            prompt_progress_callback(processed, total)
+            mx.clear_cache()
+
+            chunk_index = math.ceil(processed / prefill_step_size)
+            if memory_log_interval and (
+                chunk_index % memory_log_interval == 0 or total - processed <= 1
+            ):
+                mx.synchronize()
+                logger.info(
+                    f"Kimi K3 exact-prefill memory after chunk {chunk_index}: "
+                    f"processed={processed}/{total - 1}, "
+                    f"chunk_size={chunk_size}, "
+                    f"active_bytes={mx.get_active_memory()}, "
+                    f"cache_bytes={mx.get_cache_memory()}, "
+                    f"peak_bytes={mx.get_peak_memory()}"
+                )
+
+    prompt_progress_callback(total, total)
 
 
 def prefill(
@@ -292,8 +478,9 @@ def prefill(
 ) -> tuple[float, int, list[CacheSnapshot]]:
     """Prefill the KV cache with prompt tokens.
 
-    This runs the model over the prompt tokens to populate the cache,
-    then trims off the extra generated token.
+    This runs the model over the prompt tokens to populate the cache, then
+    trims off the extra generated token. Kimi K3 prefill stops at the decode
+    boundary directly and therefore needs neither snapshots nor trim.
 
     Returns:
         (tokens_per_sec, num_tokens, snapshots)
@@ -304,6 +491,8 @@ def prefill(
 
     logger.debug(f"Prefilling {num_tokens} tokens...")
     start_time = time.perf_counter()
+    is_pipeline = _has_pipeline_communication_layer(model)
+    rollback_free_k3 = _is_kimi_k3_model(model)
     has_ssm = has_non_kv_caches(cache)
     snapshots: list[CacheSnapshot] = []
 
@@ -314,7 +503,7 @@ def prefill(
         logger.debug(
             f"Prefill progress: {processed}/{total} tokens ({tok_per_sec:.1f} tok/s)"
         )
-        if has_ssm:
+        if has_ssm and not rollback_free_k3:
             snapshots.append(snapshot_ssm_states(cache))
 
         if on_prefill_progress is not None:
@@ -326,16 +515,29 @@ def prefill(
         progress_callback(processed, total)
 
     set_pipeline_prefill(model, is_prefill=True)
-
-    mx_barrier(group)
-    logger.info("Starting prefill")
-
-    is_pipeline = _has_pipeline_communication_layer(model)
-
-    prefill_step_size = 4096
-
     try:
-        if is_pipeline and num_tokens >= prefill_step_size:
+        mx_barrier(group)
+        logger.info("Starting prefill")
+
+        pipeline_divisor = (
+            min(4, group.size()) if is_pipeline and group is not None else 1
+        )
+        prefill_step_size = _prefill_step_size(
+            num_tokens,
+            is_pipeline=is_pipeline,
+            pipeline_divisor=pipeline_divisor,
+        )
+        effective_chunk_size = (
+            prefill_step_size // pipeline_divisor
+            if is_pipeline
+            else prefill_step_size
+        )
+        logger.info(
+            f"Prefill step size: nominal={prefill_step_size}, "
+            f"effective_chunk_size={effective_chunk_size}, tokens={num_tokens}"
+        )
+
+        if is_pipeline:
             set_pipeline_queue_sends(model, queue_sends=True)
             assert group is not None, "Pipeline prefill requires a distributed group"
             pipeline_parallel_prefill(
@@ -348,6 +550,16 @@ def prefill(
                 prompt_progress_callback=progress_callback,
                 distributed_prompt_progress_callback=distributed_prompt_progress_callback,
                 group=group,
+            )
+        elif rollback_free_k3:
+            kimi_k3_exact_prefill(
+                model=model,
+                prompt=prompt_tokens,
+                prompt_cache=cache,
+                prefill_step_size=prefill_step_size,
+                kv_group_size=KV_GROUP_SIZE,
+                kv_bits=KV_BITS,
+                prompt_progress_callback=combined_progress_callback,
             )
         else:
             # Use max_tokens=1 because max_tokens=0 does not work.
@@ -365,27 +577,24 @@ def prefill(
                 prompt_progress_callback=combined_progress_callback,
             ):
                 break  # Stop after first iteration - cache is now filled
-    except PrefillCancelled:
+    finally:
         set_pipeline_queue_sends(model, queue_sends=False)
         set_pipeline_prefill(model, is_prefill=False)
-        raise
 
-    set_pipeline_queue_sends(model, queue_sends=False)
-    set_pipeline_prefill(model, is_prefill=False)
-
-    # stream_generate added 1 extra generated token to the cache, so we should trim it.
-    # Because of needing to roll back arrays cache, we will generate on 2 tokens so trim 1 more.
-    pre_gen = snapshots[-2] if has_ssm else None
-    for i, c in enumerate(cache):
-        non_trimmable = is_non_trimmable_cache_entry(c)
-        if has_ssm and non_trimmable:
-            assert pre_gen is not None
-            restored = copy_snapshot_entry(pre_gen.states[i])
-            if restored is not None:
-                cache[i] = restored  # type: ignore
-        else:
-            assert not non_trimmable
-            c.trim(2)
+    if not rollback_free_k3:
+        # stream_generate added 1 extra generated token to the cache, so we should trim it.
+        # Because of needing to roll back arrays cache, we will generate on 2 tokens so trim 1 more.
+        pre_gen = snapshots[-2] if has_ssm else None
+        for i, c in enumerate(cache):
+            non_trimmable = is_non_trimmable_cache_entry(c)
+            if has_ssm and non_trimmable:
+                assert pre_gen is not None
+                restored = copy_snapshot_entry(pre_gen.states[i])
+                if restored is not None:
+                    cache[i] = restored  # type: ignore
+            else:
+                assert not non_trimmable
+                c.trim(2)
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = num_tokens / elapsed if elapsed > 0 else 0.0
@@ -409,10 +618,25 @@ def warmup_inference(
         "Prompt to warm up the inference engine. Repeat this."
     )
 
+    default_warmup_tokens = (
+        4 if model_id == ModelId("kernelpool/Kimi-K3-2bit-UVMAX") else 50
+    )
+    try:
+        warmup_tokens = int(
+            os.environ.get(
+                "EXO_MLX_WARMUP_OUTPUT_TOKENS",
+                str(default_warmup_tokens),
+            )
+        )
+    except ValueError as error:
+        raise ValueError("EXO_MLX_WARMUP_OUTPUT_TOKENS must be an integer") from error
+    if not 1 <= warmup_tokens <= 256:
+        raise ValueError("EXO_MLX_WARMUP_OUTPUT_TOKENS must be between 1 and 256")
+
     warmup_task_params = TextGenerationTaskParams(
         model=model_id,
         input=[InputMessage(role="user", content=content)],
-        max_output_tokens=50,
+        max_output_tokens=warmup_tokens,
         temperature=0.0,
     )
 
@@ -544,6 +768,7 @@ def mlx_generate(
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
+    is_pipeline = _has_pipeline_communication_layer(model)
     # TODO: Randomise task seed and set in taskparams, instead of hard coding as 42.
     seed = task.seed or 42
     mx.random.seed(seed)
@@ -691,7 +916,13 @@ def mlx_generate(
     if kv_prefix_cache is not None and matched_index is not None and is_exact_hit:
         prefill_tps = kv_prefix_cache.prefill_tps[matched_index]
 
-    if kv_prefix_cache is not None:
+    skip_kimi_k3_exact_rewrite = (
+        kv_prefix_cache is not None
+        and matched_index is not None
+        and is_exact_hit
+        and _is_kimi_k3_model(model)
+    )
+    if kv_prefix_cache is not None and not skip_kimi_k3_exact_rewrite:
         hit_ratio = (
             prefix_hit_length / len(all_prompt_tokens)
             if len(all_prompt_tokens) > 0
@@ -723,118 +954,148 @@ def mlx_generate(
     last_token = prompt_tokens[-2:]
 
     max_tokens = task.max_output_tokens or MAX_TOKENS
-    accumulated_text = ""
-    generated_text_parts: list[str] = []
-    generation_start_time = time.perf_counter()
-    usage: Usage | None = None
-    logger.info("Starting decode")
-    mx_barrier(group)
+    relay_enabled = is_pipeline and not task.logprobs
+    with _pipeline_token_relay_scope(model, relay_enabled):
+        if relay_enabled:
+            relay_context = get_active_relay_context(model)
+            if relay_context is None:
+                raise RuntimeError("pipeline token relay failed to initialize")
+            base_sampler = sampler
 
-    for completion_tokens, out in enumerate(
-        stream_generate(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=last_token,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=logits_processors,
-            prompt_cache=caches,
-            prefill_step_size=1,
-            kv_group_size=KV_GROUP_SIZE,
-            kv_bits=KV_BITS,
-        ),
-        start=1,
-    ):
-        generated_text_parts.append(out.text)
-        accumulated_text += out.text
+            def sampler(logprobs: mx.array) -> mx.array:
+                return relay_sampled_tokens(base_sampler(logprobs), relay_context)
 
-        # Check for stop sequences
-        text = out.text
-        finish_reason: FinishReason | None = cast(
-            FinishReason | None, out.finish_reason
-        )
-        stop_matched = False
-
-        if stop_sequences:
-            for stop_seq in stop_sequences:
-                if stop_seq in accumulated_text:
-                    # Trim text to just before the stop sequence
-                    stop_index = accumulated_text.find(stop_seq)
-                    text_before_stop = accumulated_text[:stop_index]
-                    chunk_start = len(accumulated_text) - len(out.text)
-                    text = text_before_stop[chunk_start:]
-                    finish_reason = "stop"
-                    stop_matched = True
-                    break
-
-        is_done = finish_reason is not None
-
-        stats: GenerationStats | None = None
-        if is_done:
-            stats = GenerationStats(
-                prompt_tps=float(prefill_tps or out.prompt_tps),
-                generation_tps=float(out.generation_tps),
-                prompt_tokens=int(prefill_tokens + out.prompt_tokens),
-                generation_tokens=int(out.generation_tokens),
-                peak_memory_usage=Memory.from_gb(out.peak_memory),
-            )
-            if not stop_matched and out.finish_reason not in get_args(FinishReason):
-                logger.warning(
-                    f"Model generated unexpected finish_reason: {out.finish_reason}"
-                )
-
-            total_prompt_tokens = len(all_prompt_tokens)
-            usage = Usage(
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_prompt_tokens + completion_tokens,
-                prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=prefix_hit_length
-                ),
-                completion_tokens_details=CompletionTokensDetails(reasoning_tokens=0),
-            )
-
-        # Extract logprobs from the full vocabulary logprobs array
-        logprob: float | None = None
-        top_logprobs: list[TopLogprobItem] | None = None
-        if task.logprobs:
-            with mx.stream(generation_stream):
-                logprob, top_logprobs = extract_top_logprobs(
-                    logprobs=out.logprobs,
-                    tokenizer=tokenizer,
-                    top_logprobs=task.top_logprobs or DEFAULT_TOP_LOGPROBS,
-                    selected_token=out.token,
-                )
-
-        if is_done:
-            # Log generation stats
-            generation_elapsed = time.perf_counter() - generation_start_time
-            generated_tokens = len(generated_text_parts)
-            generation_tps = (
-                generated_tokens / generation_elapsed if generation_elapsed > 0 else 0.0
-            )
-            logger.debug(
-                f"Generation complete: prefill {prompt_tokens} tokens @ "
-                f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
-                f"{generation_tps:.1f} tok/s"
-            )
-        if on_generation_token is not None:
-            on_generation_token()
-
-        yield GenerationResponse(
-            text=text,
-            token=out.token,
-            logprob=logprob,
-            top_logprobs=top_logprobs,
-            finish_reason=finish_reason,
-            stats=stats,
-            usage=usage,
-        )
-
-        if is_done:
+        accumulated_text = ""
+        generated_text_parts: list[str] = []
+        generation_start_time = time.perf_counter()
+        usage: Usage | None = None
+        logger.info("Starting decode")
+        # Pipeline prefill and decode share one ordered P2P stream. A collective
+        # here can race a sender whose final prefill frame was already received but
+        # has not reported local completion. The first decode P2P operation safely
+        # drains that tail without changing JACCL operation classes.
+        if not is_pipeline:
             mx_barrier(group)
-            break
 
-        # Limit accumulated_text to what's needed for stop sequence detection
-        if max_stop_len > 0 and len(accumulated_text) > max_stop_len:
-            accumulated_text = accumulated_text[-max_stop_len:]
+        for completion_tokens, out in enumerate(
+            stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=last_token,
+                max_tokens=max_tokens,
+                # MLX-LM normally launches token N+1 before yielding token N.
+                # If token N is EOS (or EXO matches a stop sequence), abandoning
+                # that lookahead leaves pipeline rank zero in an unmatched send
+                # while the final rank enters the completion barrier.
+                async_lookahead=not is_pipeline,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                prompt_cache=caches,
+                prefill_step_size=1,
+                kv_group_size=KV_GROUP_SIZE,
+                kv_bits=KV_BITS,
+            ),
+            start=1,
+        ):
+            generated_text_parts.append(out.text)
+            accumulated_text += out.text
+
+            # Check for stop sequences
+            text = out.text
+            finish_reason: FinishReason | None = cast(
+                FinishReason | None, out.finish_reason
+            )
+            stop_matched = False
+
+            if stop_sequences:
+                for stop_seq in stop_sequences:
+                    if stop_seq in accumulated_text:
+                        # Trim text to just before the stop sequence
+                        stop_index = accumulated_text.find(stop_seq)
+                        text_before_stop = accumulated_text[:stop_index]
+                        chunk_start = len(accumulated_text) - len(out.text)
+                        text = text_before_stop[chunk_start:]
+                        finish_reason = "stop"
+                        stop_matched = True
+                        break
+
+            is_done = finish_reason is not None
+
+            stats: GenerationStats | None = None
+            if is_done:
+                prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
+                if prefix_hit_length > 0:
+                    prefix_cache_hit = "exact" if is_exact_hit else "partial"
+                stats = GenerationStats(
+                    prompt_tps=float(prefill_tps or out.prompt_tps),
+                    generation_tps=float(out.generation_tps),
+                    prompt_tokens=int(prefill_tokens + out.prompt_tokens),
+                    generation_tokens=int(out.generation_tokens),
+                    peak_memory_usage=_memory_from_mlx_decimal_gb(out.peak_memory),
+                    prefix_cache_hit=prefix_cache_hit,
+                )
+                if not stop_matched and out.finish_reason not in get_args(FinishReason):
+                    logger.warning(
+                        f"Model generated unexpected finish_reason: {out.finish_reason}"
+                    )
+
+                total_prompt_tokens = len(all_prompt_tokens)
+                usage = Usage(
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_prompt_tokens + completion_tokens,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=prefix_hit_length
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=0
+                    ),
+                )
+
+            # Extract logprobs from the full vocabulary logprobs array
+            logprob: float | None = None
+            top_logprobs: list[TopLogprobItem] | None = None
+            if task.logprobs:
+                with mx.stream(generation_stream):
+                    logprob, top_logprobs = extract_top_logprobs(
+                        logprobs=out.logprobs,
+                        tokenizer=tokenizer,
+                        top_logprobs=task.top_logprobs or DEFAULT_TOP_LOGPROBS,
+                        selected_token=out.token,
+                    )
+
+            if is_done:
+                # Log generation stats
+                generation_elapsed = time.perf_counter() - generation_start_time
+                generated_tokens = len(generated_text_parts)
+                generation_tps = (
+                    generated_tokens / generation_elapsed
+                    if generation_elapsed > 0
+                    else 0.0
+                )
+                logger.debug(
+                    f"Generation complete: prefill {prompt_tokens} tokens @ "
+                    f"{prefill_tps:.1f} tok/s, generated {generated_tokens} "
+                    f"tokens @ {generation_tps:.1f} tok/s"
+                )
+            if on_generation_token is not None:
+                on_generation_token()
+
+            yield GenerationResponse(
+                text=text,
+                token=out.token,
+                logprob=logprob,
+                top_logprobs=top_logprobs,
+                finish_reason=finish_reason,
+                stats=stats,
+                usage=usage,
+            )
+
+            if is_done:
+                if not is_pipeline:
+                    mx_barrier(group)
+                break
+
+            # Limit accumulated_text to what's needed for stop sequence detection
+            if max_stop_len > 0 and len(accumulated_text) > max_stop_len:
+                accumulated_text = accumulated_text[-max_stop_len:]

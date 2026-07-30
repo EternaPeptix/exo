@@ -229,6 +229,11 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
     return any(is_non_trimmable_cache_entry(c) for c in cache)
 
 
+def _is_kimi_k3_model(model: Model) -> bool:
+    """Return whether ``model`` uses Kimi K3's hybrid KDA/MLA cache."""
+    return type(model).__module__ == "mlx_lm.models.kimi_k3"
+
+
 class KVPrefixCache:
     def __init__(self, group: mx.distributed.Group | None):
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
@@ -248,6 +253,19 @@ class KVPrefixCache:
         self._media_regions.clear()
         self._last_used.clear()
         self.prefill_tps.clear()
+
+    def _clear_kimi_k3_terminal_entries(self, reason: str) -> None:
+        """Drop incompatible K3 terminal states before a cold prefill."""
+        if not self.caches:
+            return
+        count = len(self.caches)
+        logger.info(
+            f"Evicting {count} Kimi K3 terminal KV cache "
+            f"{'entry' if count == 1 else 'entries'}: {reason}"
+        )
+        self.clear()
+        gc.collect()
+        mx.clear_cache()
 
     def add_kv_cache(
         self,
@@ -358,6 +376,8 @@ class KVPrefixCache:
                 best_index, best_length = i, length
 
         if best_index is None:
+            if _is_kimi_k3_model(model):
+                self._clear_kimi_k3_terminal_entries("no full-prefix match")
             return make_kv_cache(model), prompt_tokens, None, False
 
         # For exact match: trim to max_length-1 so remaining has the last token
@@ -365,6 +385,49 @@ class KVPrefixCache:
         # This ensures stream_generate always has at least one token to start with
         has_ssm = has_non_kv_caches(self.caches[best_index])
         cached_length = cache_length(self.caches[best_index])
+        if has_ssm and _is_kimi_k3_model(model):
+            cached_prompt_length = len(self.prompts[best_index])
+            is_full_exact_match = (
+                max_length == cached_prompt_length
+                and best_length == max_length
+            )
+            is_strict_append = (
+                max_length > cached_prompt_length
+                and best_length == cached_prompt_length
+            )
+            boundary_is_valid = (
+                cached_prompt_length >= 2
+                and cached_length == cached_prompt_length - 2
+                and max_length - cached_length >= 2
+            )
+            if (
+                boundary_is_valid
+                and (is_full_exact_match or is_strict_append)
+            ):
+                self._access_counter += 1
+                self._last_used[best_index] = self._access_counter
+                remaining = prompt_tokens[cached_length:]
+                logger.info(
+                    "Kimi K3 terminal KV cache hit: "
+                    f"{cached_length}/{max_length} tokens cached "
+                    f"({'exact' if is_full_exact_match else 'append'})"
+                )
+                return (
+                    deepcopy(self.caches[best_index]),
+                    remaining,
+                    best_index,
+                    is_full_exact_match,
+                )
+
+            # KDA ArraysCache state cannot be rolled back.  A shortened,
+            # edited, or boundary-mismatched prompt must start from a fresh
+            # cache. Evict first so a long cold prefill never overlaps an
+            # incompatible terminal allocation.
+            self._clear_kimi_k3_terminal_entries(
+                "prompt is edited, shortened, or has an invalid boundary"
+            )
+            return make_kv_cache(model), prompt_tokens, None, False
+
         if has_ssm:
             target = best_length
         else:

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.sample_utils import make_sampler
 
 from exo.shared.types.common import ModelId
@@ -104,6 +104,140 @@ class TestKVPrefix:
         cache = KVPrefixCache(None)
         cache.clear()
         assert len(cache.prompts) == 0
+
+
+class _FakeKimiK3Model:
+    __module__ = "mlx_lm.models.kimi_k3"
+
+    def __init__(self) -> None:
+        self.layers = [object(), object()]
+
+    def make_cache(self):
+        return [ArraysCache(size=2), KVCache()]
+
+
+def _terminal_kimi_k3_cache(token_count: int):
+    arrays = ArraysCache(size=2)
+    arrays[0] = mx.zeros((1, 1, 2, 2))
+    arrays[1] = mx.zeros((1, 1, 2, 2))
+    kv = KVCache()
+    values = mx.zeros((1, 1, token_count, 2))
+    kv.update_and_fetch(values, values)
+    mx.eval(arrays.state, kv.state)
+    return [arrays, kv]
+
+
+class TestKimiK3TerminalPrefixCache:
+    def test_exact_hit_reuses_terminal_cache_without_snapshots(self):
+        model = cast(Model, _FakeKimiK3Model())
+        prompt = mx.array([1, 2, 3, 4, 5, 6])
+        prefix_cache = KVPrefixCache(None)
+        prefix_cache.add_kv_cache(
+            prompt,
+            _terminal_kimi_k3_cache(len(prompt) - 2),
+            ssm_snapshots=None,
+        )
+
+        restored, remaining, matched_index, is_exact = (
+            prefix_cache.get_kv_cache(model, prompt)
+        )
+
+        assert matched_index == 0
+        assert is_exact
+        assert cache_length(restored) == len(prompt) - 2
+        assert mx.array_equal(remaining, prompt[-2:])
+
+    def test_append_hit_replays_old_tail_and_new_suffix(self):
+        model = cast(Model, _FakeKimiK3Model())
+        prompt = mx.array([1, 2, 3, 4, 5, 6])
+        appended = mx.array([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        prefix_cache = KVPrefixCache(None)
+        prefix_cache.add_kv_cache(
+            prompt,
+            _terminal_kimi_k3_cache(len(prompt) - 2),
+            ssm_snapshots=None,
+        )
+
+        restored, remaining, matched_index, is_exact = (
+            prefix_cache.get_kv_cache(model, appended)
+        )
+
+        assert matched_index == 0
+        assert not is_exact
+        assert cache_length(restored) == len(prompt) - 2
+        assert mx.array_equal(remaining, appended[len(prompt) - 2 :])
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            mx.array([1, 2, 3, 4]),
+            mx.array([1, 2, 3, 4, 5, 99]),
+            mx.array([1, 2, 3, 99, 5, 6, 7]),
+        ],
+    )
+    def test_shortened_or_edited_prompt_falls_back_fresh(self, query):
+        model = cast(Model, _FakeKimiK3Model())
+        prompt = mx.array([1, 2, 3, 4, 5, 6])
+        prefix_cache = KVPrefixCache(None)
+        prefix_cache.add_kv_cache(
+            prompt,
+            _terminal_kimi_k3_cache(len(prompt) - 2),
+            ssm_snapshots=None,
+        )
+
+        restored, remaining, matched_index, is_exact = (
+            prefix_cache.get_kv_cache(model, query)
+        )
+
+        assert matched_index is None
+        assert not is_exact
+        assert cache_length(restored) == 0
+        assert mx.array_equal(remaining, query)
+        assert len(prefix_cache.caches) == 0
+        assert len(prefix_cache.prompts) == 0
+
+    def test_boundary_mismatch_falls_back_fresh(self):
+        model = cast(Model, _FakeKimiK3Model())
+        prompt = mx.array([1, 2, 3, 4, 5, 6])
+        prefix_cache = KVPrefixCache(None)
+        prefix_cache.add_kv_cache(
+            prompt,
+            _terminal_kimi_k3_cache(len(prompt) - 3),
+            ssm_snapshots=None,
+        )
+
+        restored, remaining, matched_index, is_exact = (
+            prefix_cache.get_kv_cache(model, prompt)
+        )
+
+        assert matched_index is None
+        assert not is_exact
+        assert cache_length(restored) == 0
+        assert mx.array_equal(remaining, prompt)
+        assert len(prefix_cache.caches) == 0
+        assert len(prefix_cache.prompts) == 0
+
+    def test_unrelated_prompt_evicts_terminal_before_fresh_prefill(self):
+        model = cast(Model, _FakeKimiK3Model())
+        prompt = mx.array([1, 2, 3, 4, 5, 6])
+        unrelated = mx.array([99, 98, 97, 96, 95, 94])
+        prefix_cache = KVPrefixCache(None)
+        prefix_cache.add_kv_cache(
+            prompt,
+            _terminal_kimi_k3_cache(len(prompt) - 2),
+            ssm_snapshots=None,
+        )
+
+        restored, remaining, matched_index, is_exact = (
+            prefix_cache.get_kv_cache(model, unrelated)
+        )
+
+        assert matched_index is None
+        assert not is_exact
+        assert cache_length(restored) == 0
+        assert mx.array_equal(remaining, unrelated)
+        assert len(prefix_cache.caches) == 0
+        assert len(prefix_cache.prompts) == 0
 
 
 def _load_gpt_oss() -> tuple[Model, object]:
