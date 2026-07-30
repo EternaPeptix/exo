@@ -13,21 +13,23 @@ from mlx_lm.models.cache import (
     QuantizedKVCache,
     RotatingKVCache,
 )
-from mlx_lm.models.deepseek_v4 import (
-    DeepseekV4Cache,
-)
-from mlx_lm.models.deepseek_v4 import (
-    _CompressorBranch as CompressorBranch,  # type: ignore
-)
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.memory import Memory
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
+from exo.worker.engines.mlx.deepseek_v4_compat import (
+    DEEPSEEK_V4_AVAILABLE,
+    CompressorBranch,
+    DeepseekV4Cache,
+)
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import MediaRegion
+
+
+DEEPSEEK_V4_CACHE_AVAILABLE = DEEPSEEK_V4_AVAILABLE
 
 
 # Fraction of device memory above which LRU eviction kicks in.
@@ -388,8 +390,7 @@ class KVPrefixCache:
         if has_ssm and _is_kimi_k3_model(model):
             cached_prompt_length = len(self.prompts[best_index])
             is_full_exact_match = (
-                max_length == cached_prompt_length
-                and best_length == max_length
+                max_length == cached_prompt_length and best_length == max_length
             )
             is_strict_append = (
                 max_length > cached_prompt_length
@@ -400,10 +401,7 @@ class KVPrefixCache:
                 and cached_length == cached_prompt_length - 2
                 and max_length - cached_length >= 2
             )
-            if (
-                boundary_is_valid
-                and (is_full_exact_match or is_strict_append)
-            ):
+            if boundary_is_valid and (is_full_exact_match or is_strict_append):
                 self._access_counter += 1
                 self._last_used[best_index] = self._access_counter
                 remaining = prompt_tokens[cached_length:]

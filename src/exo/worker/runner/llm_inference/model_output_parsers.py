@@ -2,7 +2,6 @@ from collections.abc import Callable, Generator, Iterator
 from functools import cache
 from typing import Any
 
-from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gpt_oss import Model as GptOssModel
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -23,6 +22,7 @@ from exo.shared.types.chunks import (
 )
 from exo.shared.types.common import ModelId
 from exo.shared.types.worker.runner_response import GenerationResponse, ToolCallResponse
+from exo.worker.engines.mlx.deepseek_v4_compat import DeepseekV4Model
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
     detect_thinking_prompt_suffix,

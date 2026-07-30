@@ -9,7 +9,6 @@ from mlx_lm.models.cache import (
     QuantizedKVCache,
     RotatingKVCache,
 )
-from mlx_lm.models.deepseek_v4 import DeepseekV4Cache
 
 from exo.worker.disaggregated.protocol import (
     DType,
@@ -21,6 +20,7 @@ from exo.worker.disaggregated.protocol import (
     write_header,
     write_kv_chunk,
 )
+from exo.worker.engines.mlx.deepseek_v4_compat import DeepseekV4Cache
 from exo.worker.engines.mlx.types import KVCacheType
 from exo.worker.runner.bootstrap import logger
 

@@ -28,8 +28,6 @@ from mlx_lm.models.base import (
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3MLP
 from mlx_lm.models.deepseek_v3 import Model as DeepseekV3Model
-from mlx_lm.models.deepseek_v4 import DeepseekV4MoE, V4Attention
-from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
 from mlx_lm.models.deepseek_v32 import DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gemma4 import Model as Gemma4Model
@@ -74,6 +72,12 @@ from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
 
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.shared.types.worker.shards import PipelineShardMetadata
+from exo.worker.engines.mlx.deepseek_v4_compat import (
+    DEEPSEEK_V4_AVAILABLE,
+    DeepseekV4Model,
+    DeepseekV4MoE,
+    V4Attention,
+)
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -2202,7 +2206,7 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
         )
-    elif isinstance(model, DeepseekV4Model):
+    elif DEEPSEEK_V4_AVAILABLE and isinstance(model, DeepseekV4Model):
         tensor_parallel_sharding_strategy = DeepseekV4ShardingStrategy(
             group,
             all_to_sharded_linear,
