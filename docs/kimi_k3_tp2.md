@@ -35,9 +35,21 @@ Adding the authoritative packed MoE front to that exact schedule produced
 `12.9576` tok/s versus its matched `12.8921` asynchronous control (`+0.51%`)
 over five repetitions, retained the canonical digest, and removed
 approximately `6.93 GiB` of persistent duplicate projection storage per rank.
-The row-tiled KDA prefill kernel is bit-exact and substantially faster in
-isolated KDA measurements, but a matched full-model TP2 prefill result is not
-yet claimed.
+Adding the exact fused-expert path to the authoritative-pack/row-4 stack
+raised the canonical 575-prompt/128-decode median from `12.9824` to
+`13.2985` tok/s (`+2.44%`) over five candidate repetitions. All repetitions
+retained the canonical completion digest, and a separate 1,067-token coding
+prompt reached `13.2637` tok/s while retaining its own reference digest.
+
+The row-tiled KDA prefill kernel is bit-exact and now also has a matched
+full-model TP2 result. At 2K target context it reached `147.4168` prompt
+tok/s versus `146.3746` (`+0.71%`). At 8K it reached `154.9942` prompt tok/s
+versus a `153.2673` warmed control (`+1.13%`). Peak memory was effectively
+unchanged: approximately `419.74 GB` at 2K and `426.92 GB` at 8K.
+
+The sanitized run record, including per-repetition throughput, memory,
+configuration pins, and completion digests, is published in
+[`kimi_k3_tp2_benchmark_20260730.json`](kimi_k3_tp2_benchmark_20260730.json).
 Earlier Spark CUDA/MoE experiments remain available on the separate
 [`experiment/exo-mlx-inference-optimizations`](https://github.com/EternaPeptix/mlx/tree/experiment/exo-mlx-inference-optimizations)
 branch; they were not replayed onto this newer JACCL base.
@@ -154,8 +166,11 @@ export EXO_MLX_RANK_LOCAL_LOADER="$EXO_REPO/scripts/kimi_k3_tp2/rank_local_loade
 export EXO_MLX_RANK_LOCAL_CHECKPOINT="/models/kimi-k3-tp2/rank{rank}"
 export EXO_MLX_RANK_LOCAL_VERIFY_HASHES=1
 export EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1
+export MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES=laguna8
+export MLX_LM_KIMI_K3_ASYNC_DECODE_STATE=hidden
 export MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT=1
 export MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL=1
+export MLX_LM_KIMI_K3_FUSED_EXPERTS=1
 ```
 
 The EXO MLX worker resolves `{rank}` from the distributed rank, verifies the
@@ -175,11 +190,13 @@ result. It is opt-in because the full-logit gather scales with the number of
 prompt positions; measure representative long prompts before enabling it for
 a latency-sensitive production workload.
 
-The authoritative packed MoE-front and row-tiled KDA prefill paths are also
-opt-in. The former avoids keeping unpacked copies of the four packed
-projections; the latter activates only for supported Metal prefill shapes of
-at least 128 tokens. Unsupported shapes use the reference path. Keep the
-variables unset when reproducing a feature-off control.
+The asynchronous schedule, authoritative packed MoE-front, row-tiled KDA
+prefill, and exact fused-expert paths are also opt-in. The authoritative path
+avoids keeping unpacked copies of the four packed projections. The row-tiled
+path activates only for supported Metal prefill shapes of at least 128 tokens.
+The fused-expert path activates only for supported affine 2-bit decode shapes.
+Unsupported shapes use the reference path. Keep the variables unset when
+reproducing a feature-off control.
 
 ### Prompt-lookup speculative decode
 

@@ -1,0 +1,99 @@
+{
+  "schema": "k3-tp2-public-benchmark/v1",
+  "recorded_utc_date": "2026-07-30",
+  "model": {
+    "repository": "kernelpool/Kimi-K3-2bit-UVMAX",
+    "revision": "edb5113218df612f4a92f95145680f3f8eacd375"
+  },
+  "hardware": {
+    "ranks": 2,
+    "rank_device": "Apple M3 Ultra, 512 GB unified memory",
+    "parallelism": "tensor parallel 2",
+    "transport": "four-rail JACCL over Thunderbolt 5"
+  },
+  "runtime": {
+    "exo_execution_commit": "0b17ae3c4141141d3eee71413301bac0d5388035",
+    "exo_coordinated_branch_head_before_result_docs": "93e6897dc6095159fe54263e24ce0868293ae6b4",
+    "mlx_commit": "57b87fe47cfce34d6dc59d0e274d8ee36bfb9308",
+    "mlx_lm_execution_commit": "c7b1c3b77e91cd47e91885f186fa33ba274d8bf8",
+    "rank_local_loader_sha256": "b8294c0e3eb42cb6f95652962c2579d68d02b5d0bcad4f5ce571969830f3c3a7"
+  },
+  "common_configuration": {
+    "temperature": 0,
+    "prefix_cache": false,
+    "vocabulary_parallel_head": true,
+    "async_decode_boundaries": "laguna8",
+    "async_decode_state": "hidden",
+    "authoritative_packed_moe_front": true
+  },
+  "canonical_decode": {
+    "target_prompt_tokens": 512,
+    "actual_prompt_tokens": 575,
+    "decode_tokens": 128,
+    "completion_sha256": "c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71",
+    "control": {
+      "fused_experts": false,
+      "generation_tps": [
+        12.981574361996838,
+        12.989225522873706,
+        12.982364408833307
+      ],
+      "median_generation_tps": 12.982364408833307
+    },
+    "candidate": {
+      "fused_experts": true,
+      "generation_tps": [
+        13.330208428351954,
+        13.315106028079349,
+        13.298487659382511,
+        13.254648299687883,
+        13.2702084955228
+      ],
+      "peak_memory_bytes": [
+        414029987174,
+        413958896990,
+        413944806750,
+        414029987174,
+        413958896990
+      ],
+      "median_generation_tps": 13.298487659382511,
+      "improvement_percent": 2.435
+    }
+  },
+  "coding_decode": {
+    "target_prompt_tokens": 1132,
+    "actual_prompt_tokens": 1067,
+    "decode_tokens": 128,
+    "completion_sha256": "9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959",
+    "control_median_generation_tps": 12.928834543316887,
+    "fused_expert_generation_tps": [
+      13.263662148394186,
+      13.141393921449376,
+      13.270951566641257
+    ],
+    "fused_expert_median_generation_tps": 13.263662148394186,
+    "improvement_percent": 2.59
+  },
+  "prefill": {
+    "decode_tokens": 8,
+    "completion_sha256": "e929f1fd6e350d723ee540dee6e7641916c622c9deb56912b1e8fddb252b52c6",
+    "contexts": [
+      {
+        "target_prompt_tokens": 2048,
+        "actual_prompt_tokens": 2000,
+        "control_prompt_tps": 146.37459259445248,
+        "row4_prompt_tps": 147.4168373583617,
+        "improvement_percent": 0.712,
+        "row4_peak_memory_bytes": 419736322514
+      },
+      {
+        "target_prompt_tokens": 8192,
+        "actual_prompt_tokens": 7705,
+        "warmed_control_prompt_tps": 153.267326474365,
+        "row4_prompt_tps": 154.99419960792557,
+        "improvement_percent": 1.127,
+        "row4_peak_memory_bytes": 426921582962
+      }
+    ]
+  }
+}
