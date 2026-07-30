@@ -1,5 +1,5 @@
 {
-  "schema": "k3-tp2-public-benchmark/v3",
+  "schema": "k3-tp2-public-benchmark/v4",
   "recorded_utc_date": "2026-07-30",
   "model": {
     "repository": "kernelpool/Kimi-K3-2bit-UVMAX",
@@ -12,13 +12,13 @@
     "transport": "four-rail JACCL over Thunderbolt 5"
   },
   "runtime": {
-    "exo_live_execution_commit": "96a319f01263f316d49b645b55d3a50a92746010",
-    "exo_publication_base_commit": "2653972d3a43f434c853026a2d68f86a700d5abb",
+    "exo_live_execution_commit": "76a75fd200219984b5648389ec785765828f088d",
+    "exo_publication_base_commit": "76a75fd200219984b5648389ec785765828f088d",
     "mlx_commit": "57b87fe47cfce34d6dc59d0e274d8ee36bfb9308",
-    "mlx_lm_live_execution_commit": "f6262cc9ccfa440a26b80870d368df7a3c1ff9c6",
-    "mlx_lm_public_commit": "fefa7588ce0e84e9905da198fd2899693c45d0bd",
-    "rank_local_loader_live_sha256": "1ba57a245e359e830dd04a8dda51946cfe28ceee4aeb05ac496917e0c59f1207",
-    "rank_local_loader_public_sha256": "51423d33ac44d760fd11724dc2a357cbbe9862f20218efd70829b62b44416baa"
+    "mlx_lm_live_execution_commit": "95fc8ad485e8d2568eda4e468c4169f6a556919a",
+    "mlx_lm_public_commit": "7dd55bb3f3be0a5451ed968c7fe60b1e47d6f064",
+    "rank_local_loader_live_sha256": "5c68ce225796f02f1d63fb18235da6ec932bcd9acb594b8a52f90865d514521c",
+    "rank_local_loader_public_sha256": "50326a93241d4bed43e7e41cfbcf8adc964bbf743ea505c31a415ae0011062b8"
   },
   "common_configuration": {
     "temperature": 0,
@@ -33,7 +33,8 @@
     "fused_attnres_rms": true,
     "fused_router_exact": true,
     "packed_kda_skinny": true,
-    "packed_kda_wide": true
+    "packed_kda_wide": true,
+    "fused_routed_up_add": true
   },
   "canonical_decode": {
     "target_prompt_tokens": 512,
@@ -162,6 +163,26 @@
       "improvement_over_skinny_only_percent": 0.5914,
       "cumulative_improvement_over_fused_down_percent": 3.8739,
       "milliseconds_saved_per_token_over_skinny_only": 0.4192
+    },
+    "fused_routed_up_add_candidate": {
+      "generation_tps": [
+        14.164318096389529,
+        14.276201598543638,
+        14.237514301210444,
+        14.246180142219087,
+        14.121977431244076
+      ],
+      "peak_memory_bytes": [
+        413959672906,
+        414030763090,
+        414030763090,
+        413959672906,
+        413945582666
+      ],
+      "median_generation_tps": 14.237514301210444,
+      "improvement_over_wide_kda_percent": 0.9058,
+      "cumulative_improvement_over_fused_down_percent": 4.8147,
+      "milliseconds_saved_per_token_over_wide_kda": 0.6362
     }
   },
   "coding_decode": {
@@ -211,7 +232,20 @@
     ],
     "packed_kda_wide_median_generation_tps": 14.076389717412951,
     "packed_kda_wide_improvement_over_skinny_only_percent": 0.5664,
-    "packed_kda_wide_cumulative_improvement_over_fused_down_percent": 4.1911
+    "packed_kda_wide_cumulative_improvement_over_fused_down_percent": 4.1911,
+    "fused_routed_up_add_generation_tps": [
+      14.215545259589785,
+      14.208225014632168,
+      14.224020046805103
+    ],
+    "fused_routed_up_add_peak_memory_bytes": [
+      416015625562,
+      416015609178,
+      416015609178
+    ],
+    "fused_routed_up_add_median_generation_tps": 14.215545259589785,
+    "fused_routed_up_add_improvement_over_wide_kda_percent": 0.9886,
+    "fused_routed_up_add_cumulative_improvement_over_fused_down_percent": 5.2211
   },
   "rejected_router_screen": {
     "target_prompt_tokens": 512,
