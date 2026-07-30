@@ -17,29 +17,26 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Mapping, Optional
-
 
 SOURCE_REPO = "kernelpool/Kimi-K3-2bit-UVMAX"
 SOURCE_REVISION = "edb5113218df612f4a92f95145680f3f8eacd375"
 EFFECTIVE_SOURCE_REVISION = "2f7de449f18498c47fd32485566a611e66ba80ae"
 MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
+RUNTIME_MLX_LM_COMMIT = "adb00f6bc061dcfd66851c9078b05fa2ba123059"
 MLX_LM_KIMI_K3_SHA256 = (
-    "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
+    "77c5621eebfc4afb57b42ad4c0612bed89571c71746ce7ac8d5b8d1b6f90c57a"
 )
 SOURCE_CONFIG_SHA256 = (
     "d041003554810a367bb600d18733976bdd21041bb46e75cc1e27c7b15fe034d0"
 )
-SOURCE_INDEX_SHA256 = (
-    "ac65bcb3cd9e07cab3e7942ff455dde33879a9e02211bae40938e22fc204ae09"
-)
+SOURCE_INDEX_SHA256 = "ac65bcb3cd9e07cab3e7942ff455dde33879a9e02211bae40938e22fc204ae09"
 SCHEMA = "k3-rank-local-tp/v1"
 CONTRACT_VERSION = "mlx-lm-kimi-k3-shard@7d505c2"
-CONTRACT_DIGEST = (
-    "1b7fdf1b28433fb08fff7e0e26a7bccc2ca0fcd51f29498ab611892c9fc48da5"
-)
+CONTRACT_DIGEST = "1b7fdf1b28433fb08fff7e0e26a7bccc2ca0fcd51f29498ab611892c9fc48da5"
 DTYPE_FIX_CONTRACT = "kernelpool-k3-fp32-norm-conv-to-bf16/v1"
 DTYPE_FIX_TENSOR_COUNT = 138
 DTYPE_FIX_KDA_LAYER_COUNT = 69
@@ -50,6 +47,13 @@ class RankLocalLoadError(RuntimeError):
     pass
 
 
+def _strict_env_flag(name: str) -> bool:
+    raw = os.environ.get(name, "0")
+    if raw not in {"0", "1"}:
+        raise RankLocalLoadError(f"{name} must be 0 or 1")
+    return raw == "1"
+
+
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -57,9 +61,7 @@ def _safe_checkpoint_relative(value: Any) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise RankLocalLoadError(f"unsafe checkpoint filename {value!r}")
     path = Path(value)
-    if path.is_absolute() or any(
-        part in ("", ".", "..") for part in path.parts
-    ):
+    if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
         raise RankLocalLoadError(f"unsafe checkpoint filename {value!r}")
     return path.as_posix()
 
@@ -91,8 +93,8 @@ def _verify_runtime_source() -> None:
         raise RankLocalLoadError(
             "mlx_lm.models.kimi_k3.py does not match the converter contract: "
             f"expected {MLX_LM_KIMI_K3_SHA256}, got {actual} at {source}. "
-            f"Install mlx-lm commit {MLX_LM_COMMIT} or reconvert with a new "
-            "audited sharding contract."
+            f"Install mlx-lm commit {RUNTIME_MLX_LM_COMMIT} or update the "
+            "runtime pin with a new audited sharding contract."
         )
 
 
@@ -118,9 +120,7 @@ def _verify_manifest(
             "revision": SOURCE_REVISION,
         }
         if any(source.get(k) != v for k, v in expected.items()):
-            raise RankLocalLoadError(
-                "manifest source does not match pinned checkpoint"
-            )
+            raise RankLocalLoadError("manifest source does not match pinned checkpoint")
         if source.get("config_sha256") != SOURCE_CONFIG_SHA256:
             raise RankLocalLoadError("manifest config hash is not the pinned config")
         if source.get("index_sha256") != SOURCE_INDEX_SHA256:
@@ -139,9 +139,7 @@ def _verify_manifest(
         if tp.get("contract") != CONTRACT_VERSION:
             raise RankLocalLoadError("manifest uses a different sharding contract")
         if tp.get("contract_digest") != CONTRACT_DIGEST:
-            raise RankLocalLoadError(
-                "manifest sharding contract digest is not pinned"
-            )
+            raise RankLocalLoadError("manifest sharding contract digest is not pinned")
     config_path = model_dir / "config.json"
     index_path = model_dir / "model.safetensors.index.json"
     if config_path.is_symlink() or not config_path.is_file():
@@ -168,9 +166,7 @@ def _verify_manifest(
     ):
         raise RankLocalLoadError("rank-local weight_map must contain strings")
     if set(weight_map) != set(tensors):
-        raise RankLocalLoadError(
-            "rank-local index and manifest tensor sets differ"
-        )
+        raise RankLocalLoadError("rank-local index and manifest tensor sets differ")
 
     normalized_files: dict[str, Mapping[str, Any]] = {}
     for source_file, record in files.items():
@@ -206,9 +202,7 @@ def _verify_manifest(
         if (
             set(file_tensors) != expected_names
             or tensor_count != len(expected_names)
-            or any(
-                file_tensors[name] != tensors[name] for name in expected_names
-            )
+            or any(file_tensors[name] != tensors[name] for name in expected_names)
         ):
             raise RankLocalLoadError(
                 f"rank file tensor inventory mismatch for {source_file}"
@@ -219,9 +213,7 @@ def _verify_manifest(
         _safe_checkpoint_relative(filename) for filename in weight_map.values()
     }
     if index_files != set(normalized_files):
-        raise RankLocalLoadError(
-            "rank-local index and manifest file sets differ"
-        )
+        raise RankLocalLoadError("rank-local index and manifest file sets differ")
 
     rank_data_bytes = 0
     for tensor_name, record in tensors.items():
@@ -320,10 +312,7 @@ def _dtype_fix_tensor_names(config: Mapping[str, Any]) -> list[str]:
 
     names: list[str] = []
     for one_based_layer in sorted(kda_layers):
-        prefix = (
-            "language_model.model.layers."
-            f"{one_based_layer - 1}.self_attn"
-        )
+        prefix = f"language_model.model.layers.{one_based_layer - 1}.self_attn"
         names.extend(
             [
                 f"{prefix}.o_norm.weight",
@@ -356,16 +345,11 @@ def _apply_upstream_dtype_fix(
     names = _dtype_fix_tensor_names(config)
     missing = [name for name in names if name not in weights]
     if missing:
-        raise RankLocalLoadError(
-            f"K3 dtype fix tensors are missing: {missing[:5]}"
-        )
-    wrong_dtype = [
-        name for name in names if weights[name].dtype != float32_dtype
-    ]
+        raise RankLocalLoadError(f"K3 dtype fix tensors are missing: {missing[:5]}")
+    wrong_dtype = [name for name in names if weights[name].dtype != float32_dtype]
     if wrong_dtype:
         raise RankLocalLoadError(
-            "K3 dtype fix expected source tensors to be float32: "
-            f"{wrong_dtype[:5]}"
+            f"K3 dtype fix expected source tensors to be float32: {wrong_dtype[:5]}"
         )
 
     source_elements = 0
@@ -384,9 +368,7 @@ def _apply_upstream_dtype_fix(
             f"expected {DTYPE_FIX_TP2_RANK_ELEMENTS}, got {source_elements}"
         )
 
-    names_sha256 = hashlib.sha256(
-        ("\n".join(names) + "\n").encode("utf-8")
-    ).hexdigest()
+    names_sha256 = hashlib.sha256(("\n".join(names) + "\n").encode("utf-8")).hexdigest()
     return {
         "contract": DTYPE_FIX_CONTRACT,
         "source_revision": SOURCE_REVISION,
@@ -416,6 +398,8 @@ def load_rank_local_model(
     strict parameter names/shapes are always checked.
     """
 
+    vocab_parallel_head = _strict_env_flag("EXO_MLX_K3_VOCAB_PARALLEL_HEAD")
+
     import mlx.core as mx
     import mlx_lm.utils as mlx_lm_utils
     from mlx.utils import tree_flatten
@@ -426,8 +410,7 @@ def load_rank_local_model(
         get_model_classes = getattr(mlx_lm_utils, "_get_classes", None)
     if get_model_classes is None:
         raise RankLocalLoadError(
-            "installed mlx_lm.utils exposes neither get_model_classes nor "
-            "_get_classes"
+            "installed mlx_lm.utils exposes neither get_model_classes nor _get_classes"
         )
 
     model_dir = Path(model_dir).resolve()
@@ -498,6 +481,17 @@ def load_rank_local_model(
     model.load_weights(list(weights.items()), strict=True)
     model.eval()
     mx.eval(model.parameters())
+    if vocab_parallel_head:
+        shard_vocab_head = getattr(model, "shard_vocab_head", None)
+        if shard_vocab_head is None:
+            raise RankLocalLoadError("K3 runtime does not expose shard_vocab_head")
+        shard_vocab_head(group)
+        mx.eval(model.parameters())
+        mx.clear_cache()
+    config["_rank_local_vocab_parallel_head"] = {
+        "enabled": vocab_parallel_head,
+        "world_size": group.size(),
+    }
     config["_rank_local_compatibility_transform"] = dtype_fix_audit
     return model, config
 

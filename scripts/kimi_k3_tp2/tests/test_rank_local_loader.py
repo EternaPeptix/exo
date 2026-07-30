@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -37,6 +36,34 @@ class FakeArray:
 
     def astype(self, dtype: str):
         return FakeArray(dtype, self.shape)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    ((None, False), ("0", False), ("1", True)),
+)
+def test_strict_env_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str | None,
+    expected: bool,
+):
+    name = "EXO_MLX_K3_VOCAB_PARALLEL_HEAD"
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+    assert loader._strict_env_flag(name) is expected
+
+
+@pytest.mark.parametrize("raw", ("", "true", "2", " 1"))
+def test_strict_env_flag_rejects_ambiguous_values(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+):
+    name = "EXO_MLX_K3_VOCAB_PARALLEL_HEAD"
+    monkeypatch.setenv(name, raw)
+    with pytest.raises(loader.RankLocalLoadError, match="must be 0 or 1"):
+        loader._strict_env_flag(name)
 
 
 def _dtype_fix_config() -> dict:
@@ -147,9 +174,9 @@ def test_manifest_rejects_stale_index_mapping(
     root, _manifest = _checkpoint(tmp_path, monkeypatch)
     index_path = root / "model.safetensors.index.json"
     index = json.loads(index_path.read_text())
-    index["weight_map"][
-        "language_model.model.embed_tokens.weight"
-    ] = "model-00002-of-00185.safetensors"
+    index["weight_map"]["language_model.model.embed_tokens.weight"] = (
+        "model-00002-of-00185.safetensors"
+    )
     index_path.write_text(json.dumps(index))
     with pytest.raises(
         loader.RankLocalLoadError,
