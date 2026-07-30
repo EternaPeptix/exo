@@ -13,8 +13,8 @@ import k3_target_diagnostic as diagnostic  # noqa: E402
 import k3_target_verify as verification  # noqa: E402
 
 
-def test_diagnostic_is_separate_and_cannot_promote_v3():
-    assert verification.ARTIFACT_SCHEMA == "k3-tp2-target-verification/v3"
+def test_diagnostic_is_separate_and_cannot_promote_v4():
+    assert verification.ARTIFACT_SCHEMA == "k3-tp2-target-verification/v4"
     assert diagnostic.DIAGNOSTIC_SCHEMA == (
         "k3-tp2-target-divergence-diagnostic/v1"
     )

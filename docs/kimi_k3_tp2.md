@@ -225,9 +225,10 @@ mlx.launch -n 2 tests/model_parallel_tests.py
 
 Before integrating a speculative decoder, measure whether the unmodified
 target can verify multiple proposed tokens more cheaply than sequential
-one-token decode. The benchmark fixes widths to `1, 2, 3, 4, 7, 8` and gives
-every timed call a fresh, fully materialized copy of the same post-prefill
-cache. It validates the Kimi K3 mixed cache layout (69 recurrent
+one-token decode. The v4 benchmark accepts an ordered subset of the audited
+widths `1, 2, 3, 4, 7, 8` and gives every timed call a fresh, fully
+materialized copy of the same post-prefill cache. It validates the Kimi K3
+mixed cache layout (69 recurrent
 `ArraysCache` layers and 24 `KVCache` layers), preserves KV capacity and
 offsets, and fails closed unless both ranks agree on finite logits, top-1
 tokens, the known continuation, and numerical error limits.
@@ -254,6 +255,13 @@ verified tokens per second, memory, cache attestation, source/runtime hashes,
 transport identity, and a per-width PASS/FAIL equivalence record. This is a
 measurement harness, not a claim that speculative decoding is already
 implemented.
+
+For the accepted fused routed-up-add runtime, use
+`launch_k3_target_verify_current.sh`. It requires the launcher, source,
+MLX-LM, MLX core, checkpoint, transport, and artifact paths explicitly. Its
+focused default is a 128-token prompt at widths 1 and 2; set
+`K3_TARGET_VERIFY_WIDTHS=1,2,3,4,7,8` to run the full audited sequence after
+the focused gate passes.
 
 ## Reference performance
 

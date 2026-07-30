@@ -195,7 +195,7 @@ def test_equivalence_gate_is_fail_closed():
 
 
 def test_width_summary_and_artifact_status_require_exact_contract():
-    assert subject.ARTIFACT_SCHEMA == "k3-tp2-target-verification/v3"
+    assert subject.ARTIFACT_SCHEMA == "k3-tp2-target-verification/v4"
     assert subject.VERIFY_WIDTHS == (1, 2, 3, 4, 7, 8)
     records = []
     for width in subject.VERIFY_WIDTHS:
@@ -208,12 +208,23 @@ def test_width_summary_and_artifact_status_require_exact_contract():
         assert record["target_forward"]["median_critical_path_seconds"] == 0.055
         assert record["target_speedup_vs_sequential"] > 1.5
         records.append(record)
-    assert subject.artifact_status(records) == "PASS"
+    assert subject.artifact_status(records, subject.VERIFY_WIDTHS) == "PASS"
 
     records[-1]["equivalence"] = equivalence(False)
-    assert subject.artifact_status(records) == "FAIL"
+    assert subject.artifact_status(records, subject.VERIFY_WIDTHS) == "FAIL"
     with pytest.raises(subject.VerificationError, match="exactly"):
-        subject.artifact_status(records[:-1])
+        subject.artifact_status(records[:-1], subject.VERIFY_WIDTHS)
+
+    focused = records[:2]
+    focused[-1]["equivalence"] = equivalence()
+    assert subject.artifact_status(focused, (1, 2)) == "PASS"
+
+
+def test_width_selection_is_ordered_supported_and_fail_closed():
+    assert subject.normalize_verify_widths([1, 2]) == (1, 2)
+    for widths in ([], [2, 1], [1, 1], [1, 5]):
+        with pytest.raises(subject.VerificationError):
+            subject.normalize_verify_widths(widths)
 
 
 def test_runtime_contract_splits_converter_and_execution_provenance():
@@ -242,17 +253,48 @@ def test_runtime_contract_splits_converter_and_execution_provenance():
     )
 
 
-def test_launcher_pins_current_exact_runtime_contract():
-    launcher = (VERIFY_ROOT / "launch_k3_target_verify.sh").read_text()
+def test_current_launcher_pins_current_exact_runtime_contract():
+    launcher = (VERIFY_ROOT / "launch_k3_target_verify_current.sh").read_text()
     assert "--backend jaccl-ring" in launcher
+    for required in (
+        "K3_TARGET_VERIFY_ROOT",
+        "K3_TP_TOOLS_ROOT",
+        "K3_TP_RANK0_ROOT",
+        "K3_TP_RANK1_ROOT",
+        "K3_TP_HOSTFILE",
+        "K3_TP_TRANSPORT_CONTRACT",
+        "K3_TARGET_VERIFY_ARTIFACT_ROOT",
+        "K3_TP_LAUNCHER",
+        "K3_MLX_LM_ROOT",
+        "K3_MLX_CORE_OVERRIDE",
+    ):
+        assert required in launcher
     assert "K3_TP_TRANSPORT_CONTRACT" in launcher
     assert "K3_MLX_CORE_OVERRIDE" in launcher
-    assert 'pythonpath="${K3_MLX_CORE_OVERRIDE}:${pythonpath}"' in launcher
+    assert (
+        'pythonpath="${mlx_core_override}:${mlx_lm_root}:${verify_root}:'
+        '${tp_tools_root}"'
+    ) in launcher
+    assert "EXO_MLX_JACCL_FORCE_MESH=1" in launcher
     assert "EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1" in launcher
     assert "EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4=0" in launcher
     assert "EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4=0" in launcher
-    assert "MLX_LM_KIMI_K3_FUSED_EXPERTS=0" in launcher
+    assert "MLX_LM_KIMI_K3_FUSED_EXPERTS=1" in launcher
+    assert "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE=1" in launcher
+    assert "MLX_LM_KIMI_K3_FUSED_ROUTER=1" in launcher
+    assert "MLX_LM_KIMI_K3_FUSED_ATTNRES_RMS=1" in launcher
+    assert "MLX_LM_KIMI_K3_PACKED_KDA_SKINNY=1" in launcher
+    assert "MLX_LM_KIMI_K3_PACKED_KDA_WIDE=1" in launcher
+    assert "MLX_LM_KIMI_K3_FUSED_ROUTED_UP_ADD=1" in launcher
+    assert "MLX_LM_KIMI_K3_FUSED_POST_KDA_RMS_SIGMOID_GATE=0" in launcher
+    assert "MLX_LM_KIMI_K3_COMPILED_DECODE=0" in launcher
+    assert "MLX_LM_KIMI_K3_PACKED_MOE_FRONT=0" in launcher
+    assert "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT=1" in launcher
+    assert "MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL=1" in launcher
+    assert "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES=laguna8" in launcher
+    assert "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE=hidden" in launcher
     assert 'K3_TARGET_VERIFY_PROMPT_TOKENS:-128' in launcher
+    assert 'K3_TARGET_VERIFY_WIDTHS:-1,2' in launcher
 
 
 def test_cli_default_clears_current_chat_template_overhead():
@@ -267,3 +309,22 @@ def test_cli_default_clears_current_chat_template_overhead():
         ]
     )
     assert args.prompt_token_target == 128
+    assert args.widths == subject.VERIFY_WIDTHS
+
+
+def test_cli_accepts_focused_widths_one_and_two():
+    args = subject.parse_args(
+        [
+            "--rank-checkpoint",
+            "/rank0",
+            "--rank-checkpoint",
+            "/rank1",
+            "--artifact",
+            "/result.json",
+            "--width",
+            "1",
+            "--width",
+            "2",
+        ]
+    )
+    assert args.widths == (1, 2)

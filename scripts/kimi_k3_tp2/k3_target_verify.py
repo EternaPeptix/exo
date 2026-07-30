@@ -3,7 +3,7 @@
 
 The benchmark answers one narrow question needed before implementing
 speculative decoding: how long does the current target model take to verify
-1, 2, 3, 4, or 7 known continuation tokens in one forward pass?
+one or more selected known-continuation widths in one forward pass?
 
 Every timed call starts from a newly materialized copy of the same post-prefill
 cache.  Kimi K3's cache is heterogeneous: 69 KDA layers use ``ArraysCache``
@@ -42,7 +42,7 @@ from typing import Any, Iterable, Sequence
 
 import tp2_benchmark as base
 
-ARTIFACT_SCHEMA = "k3-tp2-target-verification/v3"
+ARTIFACT_SCHEMA = "k3-tp2-target-verification/v4"
 VERIFY_WIDTHS = (1, 2, 3, 4, 7, 8)
 EXPECTED_ARRAY_CACHE_COUNT = 69
 EXPECTED_KV_CACHE_COUNT = 24
@@ -613,10 +613,33 @@ def summarize_width(
     }
 
 
-def artifact_status(width_records: Sequence[dict[str, Any]]) -> str:
-    if [int(record["width"]) for record in width_records] != list(VERIFY_WIDTHS):
+def normalize_verify_widths(widths: Sequence[int]) -> tuple[int, ...]:
+    """Validate an ordered, nonempty subset of the audited target widths."""
+
+    normalized = tuple(int(width) for width in widths)
+    if not normalized:
+        raise VerificationError("at least one target-verification width is required")
+    if tuple(sorted(set(normalized))) != normalized:
         raise VerificationError(
-            f"artifact widths must be exactly {list(VERIFY_WIDTHS)}"
+            "target-verification widths must be unique and strictly increasing"
+        )
+    unsupported = [width for width in normalized if width not in VERIFY_WIDTHS]
+    if unsupported:
+        raise VerificationError(
+            f"unsupported target-verification widths {unsupported}; "
+            f"choose from {list(VERIFY_WIDTHS)}"
+        )
+    return normalized
+
+
+def artifact_status(
+    width_records: Sequence[dict[str, Any]],
+    expected_widths: Sequence[int],
+) -> str:
+    normalized = normalize_verify_widths(expected_widths)
+    if [int(record["width"]) for record in width_records] != list(normalized):
+        raise VerificationError(
+            f"artifact widths must be exactly {list(normalized)}"
         )
     return (
         "PASS"
@@ -711,6 +734,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     import mlx.core as mx
     from mlx_lm.generate import wired_limit
 
+    verify_widths = normalize_verify_widths(args.widths)
     init_started = time.perf_counter()
     group = base.init_distributed(mx, backend="jaccl")
     rank = int(group.rank())
@@ -829,7 +853,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             model=model,
             base_cache=base_cache,
             first_token=first_token,
-            count=max(VERIFY_WIDTHS) + 1,
+            count=max(verify_widths) + 1,
         )
         known_digest = base.token_digest(known_ids)
         known_digests = base.require_shared_digest(
@@ -851,7 +875,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             max_abs_error=args.max_logit_abs_error,
         )
         width_records = []
-        for width in VERIFY_WIDTHS:
+        for width in verify_widths:
             input_ids = known_ids[:width]
             expected_next = known_ids[1 : width + 1]
             base._event(rank, "target_verify_width_start", width=width)
@@ -919,7 +943,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         assert_cache_value_equivalent(immutable_guard, base_cache, mx)
 
-    status = artifact_status(width_records)
+    status = artifact_status(width_records, verify_widths)
     artifact = {
         "schema": ARTIFACT_SCHEMA,
         "status": status,
@@ -957,7 +981,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "critical-path TP2 cost of one-pass target verification from "
                 "an identical post-prefill Kimi K3 cache"
             ),
-            "widths": list(VERIFY_WIDTHS),
+            "widths": list(verify_widths),
             "runs": args.runs,
             "warmups": args.warmups,
             "prompt_mode": prompt_mode,
@@ -1038,6 +1062,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--prompt", default=base.DEFAULT_PROMPT)
     parser.add_argument("--prompt-token-target", default=128, type=int)
+    parser.add_argument(
+        "--width",
+        action="append",
+        dest="widths",
+        type=int,
+        help=(
+            "target-verification width; repeat for an ordered subset of "
+            f"{list(VERIFY_WIDTHS)} (default: all)"
+        ),
+    )
     parser.add_argument("--runs", default=3, type=int)
     parser.add_argument("--warmups", default=1, type=int)
     parser.add_argument("--min-logit-cosine", default=0.999, type=float)
@@ -1055,6 +1089,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     if args.prompt_token_target <= 0:
         parser.error("--prompt-token-target must be positive")
+    if args.widths is None:
+        args.widths = list(VERIFY_WIDTHS)
+    try:
+        args.widths = normalize_verify_widths(args.widths)
+    except VerificationError as exc:
+        parser.error(str(exc))
     if args.runs <= 0:
         parser.error("--runs must be positive")
     if args.warmups < 0:
