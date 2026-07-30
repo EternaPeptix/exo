@@ -23,7 +23,10 @@ pythonpath="${verify_root}:${tp_tools_root}"
 if [[ -n "${K3_MLX_LM_ROOT:-}" ]]; then
   pythonpath="${pythonpath}:${K3_MLX_LM_ROOT}"
 fi
-prompt_tokens="${K3_TARGET_VERIFY_PROMPT_TOKENS:-64}"
+if [[ -n "${K3_MLX_CORE_OVERRIDE:-}" ]]; then
+  pythonpath="${K3_MLX_CORE_OVERRIDE}:${pythonpath}"
+fi
+prompt_tokens="${K3_TARGET_VERIFY_PROMPT_TOKENS:-128}"
 runs="${K3_TARGET_VERIFY_RUNS:-3}"
 warmups="${K3_TARGET_VERIFY_WARMUPS:-1}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -58,5 +61,6 @@ exec "${launcher}" \
   --env EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1 \
   --env EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4=0 \
   --env EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4=0 \
+  --env MLX_LM_KIMI_K3_FUSED_EXPERTS=0 \
   -- \
   "${arguments[@]}"

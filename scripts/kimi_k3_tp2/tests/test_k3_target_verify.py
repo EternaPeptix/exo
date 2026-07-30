@@ -195,6 +195,8 @@ def test_equivalence_gate_is_fail_closed():
 
 
 def test_width_summary_and_artifact_status_require_exact_contract():
+    assert subject.ARTIFACT_SCHEMA == "k3-tp2-target-verification/v3"
+    assert subject.VERIFY_WIDTHS == (1, 2, 3, 4, 7, 8)
     records = []
     for width in subject.VERIFY_WIDTHS:
         record = subject.summarize_width(
@@ -244,6 +246,24 @@ def test_launcher_pins_current_exact_runtime_contract():
     launcher = (VERIFY_ROOT / "launch_k3_target_verify.sh").read_text()
     assert "--backend jaccl-ring" in launcher
     assert "K3_TP_TRANSPORT_CONTRACT" in launcher
+    assert "K3_MLX_CORE_OVERRIDE" in launcher
+    assert 'pythonpath="${K3_MLX_CORE_OVERRIDE}:${pythonpath}"' in launcher
     assert "EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1" in launcher
     assert "EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4=0" in launcher
     assert "EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4=0" in launcher
+    assert "MLX_LM_KIMI_K3_FUSED_EXPERTS=0" in launcher
+    assert 'K3_TARGET_VERIFY_PROMPT_TOKENS:-128' in launcher
+
+
+def test_cli_default_clears_current_chat_template_overhead():
+    args = subject.parse_args(
+        [
+            "--rank-checkpoint",
+            "/rank0",
+            "--rank-checkpoint",
+            "/rank1",
+            "--artifact",
+            "/result.json",
+        ]
+    )
+    assert args.prompt_token_target == 128

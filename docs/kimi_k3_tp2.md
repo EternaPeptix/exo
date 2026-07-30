@@ -176,7 +176,7 @@ mlx.launch -n 2 tests/model_parallel_tests.py
 
 Before integrating a speculative decoder, measure whether the unmodified
 target can verify multiple proposed tokens more cheaply than sequential
-one-token decode. The benchmark fixes widths to `1, 2, 3, 4, 7` and gives
+one-token decode. The benchmark fixes widths to `1, 2, 3, 4, 7, 8` and gives
 every timed call a fresh, fully materialized copy of the same post-prefill
 cache. It validates the Kimi K3 mixed cache layout (69 recurrent
 `ArraysCache` layers and 24 `KVCache` layers), preserves KV capacity and

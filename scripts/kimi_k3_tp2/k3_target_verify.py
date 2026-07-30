@@ -42,8 +42,8 @@ from typing import Any, Iterable, Sequence
 
 import tp2_benchmark as base
 
-ARTIFACT_SCHEMA = "k3-tp2-target-verification/v2"
-VERIFY_WIDTHS = (1, 2, 3, 4, 7)
+ARTIFACT_SCHEMA = "k3-tp2-target-verification/v3"
+VERIFY_WIDTHS = (1, 2, 3, 4, 7, 8)
 EXPECTED_ARRAY_CACHE_COUNT = 69
 EXPECTED_KV_CACHE_COUNT = 24
 EXPECTED_LAYER_COUNT = EXPECTED_ARRAY_CACHE_COUNT + EXPECTED_KV_CACHE_COUNT
@@ -1037,7 +1037,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--prompt", default=base.DEFAULT_PROMPT)
-    parser.add_argument("--prompt-token-target", default=64, type=int)
+    parser.add_argument("--prompt-token-target", default=128, type=int)
     parser.add_argument("--runs", default=3, type=int)
     parser.add_argument("--warmups", default=1, type=int)
     parser.add_argument("--min-logit-cosine", default=0.999, type=float)
