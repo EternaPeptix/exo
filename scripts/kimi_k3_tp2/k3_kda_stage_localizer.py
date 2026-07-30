@@ -686,10 +686,14 @@ def validate_endpoint_reproduction(
     return result
 
 
-def _hidden_sha256(value: Any) -> str:
+def _hidden_sha256(mx: Any, value: Any) -> str:
     import numpy as np
 
-    return hashlib.sha256(np.asarray(value).tobytes(order="C")).hexdigest()
+    raw = value.view(mx.uint8)
+    mx.eval(raw)
+    return hashlib.sha256(
+        np.asarray(raw, dtype=np.uint8).tobytes(order="C")
+    ).hexdigest()
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -811,7 +815,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         mx.eval(reconstructed)
         if not bool(mx.array_equal(shared_input, reconstructed).item()):
             raise LocalizerError("T=1 references do not share the exact T=2 input")
-        hidden_digest = _hidden_sha256(shared_input)
+        hidden_digest = _hidden_sha256(mx, shared_input)
         hidden_digests = base.gather_digests(mx, group, hidden_digest)
 
         target_initial = target.clone_k3_cache(base_cache, mx)
