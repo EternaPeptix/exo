@@ -19,10 +19,17 @@ from exo import __version__
 from exo.api.main import API
 from exo.download.coordinator import DownloadCoordinator
 from exo.download.impl_shard_downloader import exo_shard_downloader
+from exo.download.seed_server import SeedServer
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
 from exo.routing.router import Router, get_node_zid
-from exo.shared.constants import EXO_DEFAULT_MODELS_DIR, EXO_LOG, EXO_PID_FILE
+from exo.shared.constants import (
+    EXO_DEFAULT_MODELS_DIR,
+    EXO_DISABLE_PEER_SEEDING,
+    EXO_LOG,
+    EXO_PID_FILE,
+    EXO_SEED_PORT,
+)
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_setup
 from exo.shared.types.common import NodeId, SessionId
@@ -38,6 +45,7 @@ class Node:
     router: Router
     event_router: EventRouter
     download_coordinator: DownloadCoordinator | None
+    seed_server: SeedServer | None
     worker: Worker | None
     election: Election  # Every node participates in election, as we do want a node to become master even if it isn't a master candidate if no master candidates are present.
     election_result_receiver: Receiver[ElectionResult]
@@ -88,6 +96,13 @@ class Node:
             )
         else:
             download_coordinator = None
+
+        # Serve local model files to peers (weight seeding)
+        seed_server = (
+            None
+            if args.no_downloads or EXO_DISABLE_PEER_SEEDING
+            else SeedServer(port=EXO_SEED_PORT)
+        )
 
         if args.spawn_api:
             api = API(
@@ -142,6 +157,7 @@ class Node:
             router,
             event_router,
             download_coordinator,
+            seed_server,
             worker,
             election,
             er_recv,
@@ -159,6 +175,8 @@ class Node:
             tg.start_soon(self.router.run)
             tg.start_soon(self.event_router.run)
             tg.start_soon(self.election.run)
+            if self.seed_server:
+                await self.seed_server.start()
             if self.download_coordinator:
                 tg.start_soon(self.download_coordinator.run)
             if self.worker:

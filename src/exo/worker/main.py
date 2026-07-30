@@ -7,19 +7,29 @@ from anyio import fail_after, to_thread
 from loguru import logger
 
 from exo.api.types import ImageEditsTaskParams
-from exo.download.download_utils import is_read_only_model_dir, resolve_existing_model
+from exo.download.download_utils import (
+    is_read_only_model_dir,
+    resolve_existing_model,
+    resolve_existing_model_for_shard,
+)
+from exo.master.placement_utils import find_ip_prioritised
 from exo.routing.event_router import (
     EventRouterBrokenResourceError,
     EventRouterClosedResourceError,
 )
 from exo.shared.apply import apply
-from exo.shared.constants import EXO_MAX_INSTANCE_RETRIES
+from exo.shared.constants import (
+    EXO_DISABLE_PEER_SEEDING,
+    EXO_MAX_INSTANCE_RETRIES,
+    EXO_SEED_PORT,
+)
 from exo.shared.models.model_cards import ModelId, card_cache
 from exo.shared.types.chunks import InputImageChunk
 from exo.shared.types.commands import (
     DeleteInstance,
     ForwarderCommand,
     ForwarderDownloadCommand,
+    SeedSource,
     StartDownload,
 )
 from exo.shared.types.common import CommandId, NodeId, SystemId
@@ -50,9 +60,10 @@ from exo.shared.types.tasks import (
 )
 from exo.shared.types.text_generation import Base64Image, Base64ImageHash
 from exo.shared.types.topology import Connection, SocketConnection
-from exo.shared.types.worker.downloads import DownloadCompleted
+from exo.shared.types.worker.downloads import DownloadCompleted, DownloadOngoing
 from exo.shared.types.worker.instances import InstanceId
 from exo.shared.types.worker.runners import RunnerId
+from exo.shared.types.worker.shards import ShardMetadata
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.info_gatherer.info_gatherer import GatheredInfo, InfoGatherer
 from exo.utils.info_gatherer.net_profile import check_reachable
@@ -136,6 +147,61 @@ class Worker:
                         info=info,
                     )
                 )
+
+    def _build_seed_sources(self, shard: ShardMetadata) -> list[SeedSource]:
+        """Peers that can seed files for this model to us over HTTP.
+
+        Any node reporting download progress (complete or ongoing) for the
+        model may hold files we need; the downloader verifies per-file what a
+        peer actually has. URLs are ordered by link speed using the same
+        prioritisation as the MLX ring placement.
+        """
+        if EXO_DISABLE_PEER_SEEDING:
+            return []
+        model_id = shard.model_card.model_id
+        sources: list[SeedSource] = []
+        for node_id, progresses in self.state.downloads.items():
+            if node_id == self.node_id:
+                continue
+            has_model = any(
+                isinstance(dp, (DownloadCompleted, DownloadOngoing))
+                and dp.shard_metadata.model_card.model_id == model_id
+                for dp in progresses
+            )
+            if not has_model:
+                continue
+
+            base_urls: list[str] = []
+            best_ip = find_ip_prioritised(
+                self.node_id,
+                node_id,
+                self.state.topology,
+                self.state.node_network,
+                ring=True,
+            )
+            if best_ip is not None:
+                base_urls.append(f"http://{best_ip}:{EXO_SEED_PORT}")
+            # Fall back to all advertised interface IPs, fastest first.
+            network = self.state.node_network.get(node_id)
+            if network is not None:
+                remaining = sorted(
+                    (i for i in network.interfaces if i.ip_address != best_ip),
+                    key=lambda i: i.link_speed_megabits
+                    if i.link_speed_megabits is not None
+                    else 0,
+                    reverse=True,
+                )
+                base_urls.extend(
+                    f"http://{i.ip_address}:{EXO_SEED_PORT}" for i in remaining
+                )
+            if base_urls:
+                sources.append(SeedSource(node_id=node_id, base_urls=base_urls))
+        if sources:
+            logger.info(
+                f"Weight seeding: {len(sources)} peer(s) available for {model_id}: "
+                + ", ".join(str(s.node_id) for s in sources)
+            )
+        return sources
 
     async def _event_applier(self):
         with self.event_receiver as events:
@@ -243,6 +309,12 @@ class Worker:
                     found_path = await to_thread.run_sync(
                         resolve_existing_model, model_id, shard.model_card
                     )
+                    if found_path is None:
+                        # Accept shard-scoped (partial) directories recorded by
+                        # a shard marker from a previous download.
+                        found_path = await to_thread.run_sync(
+                            resolve_existing_model_for_shard, model_id, shard
+                        )
                     if found_path is not None:
                         logger.info(f"Model {model_id} found at {found_path}")
                         await self.event_sender.send(
@@ -263,12 +335,14 @@ class Worker:
                             )
                         )
                     else:
+                        seed_sources = self._build_seed_sources(shard)
                         await self.download_command_sender.send(
                             ForwarderDownloadCommand(
                                 origin=self._system_id,
                                 command=StartDownload(
                                     target_node_id=self.node_id,
                                     shard_metadata=shard,
+                                    seed_sources=seed_sources,
                                 ),
                             )
                         )

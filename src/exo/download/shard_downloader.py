@@ -8,6 +8,7 @@ from typing import AsyncIterator, Callable
 from exo.download.download_utils import RepoDownloadProgress
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.types.backends import Backend
+from exo.shared.types.commands import SeedSource
 from exo.shared.types.memory import Memory
 from exo.shared.types.worker.shards import (
     PipelineShardMetadata,
@@ -19,7 +20,10 @@ from exo.shared.types.worker.shards import (
 class ShardDownloader(ABC):
     @abstractmethod
     async def ensure_shard(
-        self, shard: ShardMetadata, config_only: bool = False
+        self,
+        shard: ShardMetadata,
+        config_only: bool = False,
+        seed_sources: list[SeedSource] | None = None,
     ) -> Path:
         """
         Ensures that the shard is downloaded.
@@ -29,6 +33,7 @@ class ShardDownloader(ABC):
 
         Args:
             shard (Shard): The shard to download.
+            seed_sources: Peers that can serve files for this model over HTTP.
         """
 
     @abstractmethod
@@ -57,7 +62,10 @@ class ShardDownloader(ABC):
 
 class NoopShardDownloader(ShardDownloader):
     async def ensure_shard(
-        self, shard: ShardMetadata, config_only: bool = False
+        self,
+        shard: ShardMetadata,
+        config_only: bool = False,
+        seed_sources: list[SeedSource] | None = None,
     ) -> Path:
         return Path("/tmp/noop_shard")
 

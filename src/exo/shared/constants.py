@@ -106,3 +106,11 @@ ENABLE_DISAGGREGATION = os.getenv("ENABLE_DISAGGREGATION", "false").lower() == "
 EXO_MAX_CONCURRENT_REQUESTS = int(os.getenv("EXO_MAX_CONCURRENT_REQUESTS", "8"))
 
 EXO_MAX_INSTANCE_RETRIES = 5
+
+# Port for the per-node weight seed server. Every node serves its local model
+# files to peers over plain HTTP so that weights can be seeded across the LAN
+# instead of downloaded from HuggingFace on every node.
+EXO_SEED_PORT = int(os.getenv("EXO_SEED_PORT", "52416"))
+
+# Disable peer weight seeding (both serving and fetching) when set to true.
+EXO_DISABLE_PEER_SEEDING = os.getenv("EXO_DISABLE_PEER_SEEDING", "false").lower() == "true"

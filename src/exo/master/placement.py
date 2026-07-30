@@ -50,7 +50,7 @@ from exo.shared.types.worker.instances import (
     MlxJacclInstance,
     MlxRingInstance,
 )
-from exo.shared.types.worker.shards import Sharding
+from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 from exo.utils.ports import random_ephemeral_port
 
 INSTANCE_META_BACKENDS: dict[InstanceMeta, list[Backend]] = {
@@ -80,6 +80,11 @@ def _get_node_download_fraction(
             continue
         match progress:
             case DownloadCompleted():
+                # Shard-scoped downloads only hold a layer range of the model;
+                # score their coverage fraction so full copies are preferred.
+                shard = progress.shard_metadata
+                if isinstance(shard, PipelineShardMetadata) and shard.n_layers > 0:
+                    return (shard.end_layer - shard.start_layer) / shard.n_layers
                 return 1.0
             case DownloadOngoing():
                 total = progress.download_progress.total.in_bytes

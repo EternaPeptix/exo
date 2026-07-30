@@ -25,6 +25,7 @@ from exo.shared.types.worker.downloads import (
     DownloadFailed,
     DownloadOngoing,
     DownloadProgress,
+    download_covers_shard,
 )
 from exo.shared.types.worker.instances import BoundInstance, Instance, InstanceId
 from exo.shared.types.worker.runners import (
@@ -39,6 +40,7 @@ from exo.shared.types.worker.runners import (
     RunnerRunning,
     RunnerStatus,
     RunnerWarmingUp,
+    ShardAssignments,
 )
 from exo.utils.keyed_backoff import KeyedBackoff
 from exo.worker.runner.supervisor import RunnerSupervisor
@@ -148,16 +150,21 @@ def _model_needs_download(
     }
 
     for runner in runners.values():
-        model_id = runner.bound_instance.bound_shard.model_card.model_id
+        bound_shard = runner.bound_instance.bound_shard
+        model_id = bound_shard.model_card.model_id
+        status = download_status.get(model_id)
+        # A DownloadCompleted only counts if it covers this runner's shard:
+        # the node may hold a different layer range from a previous placement.
+        needs_download = (
+            status is None
+            or not isinstance(
+                status, (DownloadOngoing, DownloadCompleted, DownloadFailed)
+            )
+            or (isinstance(status, DownloadCompleted) and not download_covers_shard(status, bound_shard))
+        )
         if (
             isinstance(runner.status, RunnerIdle)
-            and (
-                model_id not in download_status
-                or not isinstance(
-                    download_status[model_id],
-                    (DownloadOngoing, DownloadCompleted, DownloadFailed),
-                )
-            )
+            and needs_download
             and download_backoff.should_proceed(model_id)
         ):
             # We don't invalidate download_status randomly in case a file gets deleted on disk
@@ -226,14 +233,18 @@ def _load_model(
         instance = runner.bound_instance.instance
         shard_assignments = instance.shard_assignments
 
-        all_local_downloads_complete = all(
-            nid in global_download_status
-            and any(
-                isinstance(dp, DownloadCompleted)
-                and dp.shard_metadata.model_card.model_id == shard_assignments.model_id
+        def node_download_covers(
+            nid: NodeId, sa: ShardAssignments = shard_assignments
+        ) -> bool:
+            runner_id = sa.node_to_runner[nid]
+            required = sa.runner_to_shard[runner_id]
+            return nid in global_download_status and any(
+                download_covers_shard(dp, required)
                 for dp in global_download_status[nid]
             )
-            for nid in shard_assignments.node_to_runner
+
+        all_local_downloads_complete = all(
+            node_download_covers(nid) for nid in shard_assignments.node_to_runner
         )
         if not all_local_downloads_complete:
             continue

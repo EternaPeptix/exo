@@ -13,6 +13,7 @@ from exo.download.download_utils import (
     is_read_only_model_dir,
     map_repo_download_progress_to_download_progress_data,
     resolve_existing_model,
+    resolve_existing_model_for_shard,
 )
 from exo.download.shard_downloader import ShardDownloader
 from exo.routing.event_router import (
@@ -26,6 +27,7 @@ from exo.shared.types.commands import (
     CancelDownload,
     DeleteDownload,
     ForwarderDownloadCommand,
+    SeedSource,
     StartDownload,
 )
 from exo.shared.types.common import NodeId
@@ -40,6 +42,7 @@ from exo.shared.types.worker.downloads import (
     DownloadOngoing,
     DownloadPending,
     DownloadProgress,
+    download_covers_shard,
 )
 from exo.shared.types.worker.shards import PipelineShardMetadata, ShardMetadata
 from exo.utils.channels import Receiver, Sender
@@ -165,8 +168,8 @@ class DownloadCoordinator:
                     continue
 
                 match cmd.command:
-                    case StartDownload(shard_metadata=shard):
-                        await self._start_download(shard)
+                    case StartDownload(shard_metadata=shard, seed_sources=seed_sources):
+                        await self._start_download(shard, seed_sources)
                     case DeleteDownload(model_id=model_id):
                         await self._delete_download(model_id)
                     case CancelDownload(model_id=model_id):
@@ -194,13 +197,24 @@ class DownloadCoordinator:
                 NodeDownloadProgress(download_progress=pending)
             )
 
-    async def _start_download(self, shard: ShardMetadata) -> None:
+    async def _start_download(
+        self, shard: ShardMetadata, seed_sources: list[SeedSource] | None = None
+    ) -> None:
         model_id = shard.model_card.model_id
 
         # Check if already downloading, complete, or recently failed
         if model_id in self.download_status:
             status = self.download_status[model_id]
-            if isinstance(status, (DownloadOngoing, DownloadCompleted, DownloadFailed)):
+            if isinstance(status, DownloadCompleted) and not download_covers_shard(
+                status, shard
+            ):
+                # Complete for a previous (different) shard range only — fall
+                # through and fetch the additional files for this shard.
+                logger.info(
+                    f"Existing download of {model_id} does not cover "
+                    f"layers [{shard.start_layer}, {shard.end_layer}), topping up"
+                )
+            elif isinstance(status, (DownloadOngoing, DownloadCompleted, DownloadFailed)):
                 logger.debug(
                     f"Download for {model_id} already in progress, complete, or failed, skipping"
                 )
@@ -210,6 +224,11 @@ class DownloadCoordinator:
         found_path = await to_thread.run_sync(
             resolve_existing_model, model_id, shard.model_card
         )
+        if found_path is None:
+            # Accept shard-scoped (partial) directories that cover this shard.
+            found_path = await to_thread.run_sync(
+                resolve_existing_model_for_shard, model_id, shard
+            )
         if found_path is not None:
             logger.info(f"DownloadCoordinator: Model {model_id} found at {found_path}")
             completed = self._completed_from_path(
@@ -271,10 +290,13 @@ class DownloadCoordinator:
             return
 
         # Start actual download
-        self._start_download_task(shard, initial_progress)
+        self._start_download_task(shard, initial_progress, seed_sources)
 
     def _start_download_task(
-        self, shard: ShardMetadata, initial_progress: RepoDownloadProgress
+        self,
+        shard: ShardMetadata,
+        initial_progress: RepoDownloadProgress,
+        seed_sources: list[SeedSource] | None = None,
     ) -> None:
         model_id = shard.model_card.model_id
 
@@ -293,7 +315,9 @@ class DownloadCoordinator:
         async def download_wrapper(cancel_scope: anyio.CancelScope) -> None:
             try:
                 with cancel_scope:
-                    await self.shard_downloader.ensure_shard(shard)
+                    await self.shard_downloader.ensure_shard(
+                        shard, seed_sources=seed_sources
+                    )
             except Exception as e:
                 logger.error(f"Download failed for {model_id}: {e}")
                 failed = DownloadFailed(

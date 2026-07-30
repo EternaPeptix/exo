@@ -67,9 +67,23 @@ class RequestEventLog(BaseCommand):
     since_idx: int
 
 
+class SeedSource(FrozenModel):
+    """A peer node that can serve model weight files over HTTP.
+
+    ``base_urls`` are ordered by preference (fastest link first), e.g.
+    ``["http://169.254.1.2:52416", "http://192.168.0.3:52416"]``.
+    """
+
+    node_id: NodeId
+    base_urls: list[str] = []
+
+
 class StartDownload(BaseCommand):
     target_node_id: NodeId
     shard_metadata: ShardMetadata
+    # Peers that already hold (part of) this model and can seed files to us.
+    # When empty, the downloader falls back to HuggingFace for every file.
+    seed_sources: list[SeedSource] = []
 
 
 class DeleteDownload(BaseCommand):

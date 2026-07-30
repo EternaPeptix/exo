@@ -41,7 +41,7 @@ import mlx.nn as nn
 from mlx_lm.utils import load_model
 from pydantic import RootModel
 
-from exo.download.download_utils import build_model_path
+from exo.download.download_utils import build_model_path_for_shard
 from exo.shared.types.common import Host
 from exo.shared.types.memory import Memory
 from exo.shared.types.tasks import TaskId, TextGeneration
@@ -170,7 +170,10 @@ def load_mlx_items(
 
     if group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
-        model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
+        model_path = build_model_path_for_shard(
+            bound_instance.bound_shard.model_card.model_id,
+            bound_instance.bound_shard,
+        )
         start_time = time.perf_counter()
         model, _ = load_model(model_path, lazy=True, strict=False)
         # Eval layers one by one for progress reporting
@@ -233,7 +236,9 @@ def shard_and_load(
     shard_metadata: ShardMetadata,
     group: mx.distributed.Group,
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
-    model_path = build_model_path(shard_metadata.model_card.model_id)
+    model_path = build_model_path_for_shard(
+        shard_metadata.model_card.model_id, shard_metadata
+    )
 
     model, _ = load_model(model_path, lazy=True, strict=False)
     logger.debug(model)

@@ -79,6 +79,7 @@ class FakeShardDownloader(ShardDownloader):
         self,
         shard: ShardMetadata,
         config_only: bool = False,  # noqa: ARG002
+        seed_sources: list | None = None,  # noqa: ARG002
     ) -> Path:
         return MODEL_DIR  # pragma: no cover
 

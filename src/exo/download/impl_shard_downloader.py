@@ -17,6 +17,7 @@ from exo.shared.models.model_cards import (
     ModelId,
     ModelTask,
 )
+from exo.shared.types.commands import SeedSource
 from exo.shared.types.memory import Memory
 from exo.shared.types.worker.shards import (
     PipelineShardMetadata,
@@ -68,11 +69,14 @@ class SingletonShardDownloader(ShardDownloader):
         self.shard_downloader.on_progress(callback)
 
     async def ensure_shard(
-        self, shard: ShardMetadata, config_only: bool = False
+        self,
+        shard: ShardMetadata,
+        config_only: bool = False,
+        seed_sources: list[SeedSource] | None = None,
     ) -> Path:
         if shard not in self.active_downloads:
             self.active_downloads[shard] = asyncio.create_task(
-                self.shard_downloader.ensure_shard(shard, config_only)
+                self.shard_downloader.ensure_shard(shard, config_only, seed_sources)
             )
         try:
             return await self.active_downloads[shard]
@@ -113,7 +117,10 @@ class ResumableShardDownloader(ShardDownloader):
         self.on_progress_callbacks.append(callback)
 
     async def ensure_shard(
-        self, shard: ShardMetadata, config_only: bool = False
+        self,
+        shard: ShardMetadata,
+        config_only: bool = False,
+        seed_sources: list[SeedSource] | None = None,
     ) -> Path:
         allow_patterns = ["config.json"] if config_only else None
 
@@ -137,6 +144,7 @@ class ResumableShardDownloader(ShardDownloader):
             max_parallel_downloads=self.max_parallel_downloads,
             allow_patterns=allow_patterns,
             skip_internet=self.offline,
+            seed_sources=seed_sources,
         )
 
         if has_vision_sibling:

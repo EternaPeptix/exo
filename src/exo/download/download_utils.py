@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import random
 import shutil
@@ -31,12 +32,14 @@ from exo.download.huggingface_utils import (
     get_hf_endpoint,
     get_hf_token,
 )
+from exo.download.seed_server import SHARD_MARKER_FILENAME
 from exo.shared.constants import (
     EXO_DEFAULT_MODELS_DIR,
     EXO_MODELS_DIRS,
     EXO_MODELS_READ_ONLY_DIRS,
 )
 from exo.shared.models.model_cards import ModelCard, ModelTask
+from exo.shared.types.commands import SeedSource
 from exo.shared.types.common import ModelId
 from exo.shared.types.memory import Memory
 from exo.shared.types.worker.downloads import (
@@ -46,7 +49,7 @@ from exo.shared.types.worker.downloads import (
     RepoDownloadProgress,
     RepoFileDownloadProgress,
 )
-from exo.shared.types.worker.shards import ShardMetadata
+from exo.shared.types.worker.shards import PipelineShardMetadata, ShardMetadata
 
 
 class HuggingFaceAuthenticationError(Exception):
@@ -805,7 +808,49 @@ def calculate_repo_progress(
     )
 
 
+def _parse_weight_map_from_dir(model_dir: Path) -> dict[str, str]:
+    """Parse all *.safetensors.index.json files under a local directory."""
+    index_files = list(model_dir.glob("**/*.safetensors.index.json"))
+
+    weight_map: dict[str, str] = {}
+
+    for index_file in index_files:
+        relative_dir = index_file.parent.relative_to(model_dir)
+        index_data = ModelSafetensorsIndex.model_validate_json(
+            index_file.read_text()
+        )
+
+        if relative_dir != Path("."):
+            prefixed_weight_map = {
+                f"{relative_dir}/{key}": str(relative_dir / value)
+                for key, value in index_data.weight_map.items()
+            }
+            weight_map = weight_map | prefixed_weight_map
+        else:
+            weight_map = weight_map | index_data.weight_map
+
+    return weight_map
+
+
+def get_local_weight_map(model_id: ModelId) -> dict[str, str]:
+    """Parse the weight map from index files already on disk (any model dir)."""
+    normalized = model_id.normalize()
+    for search_dir in (*EXO_MODELS_READ_ONLY_DIRS, *EXO_MODELS_DIRS):
+        candidate = search_dir / normalized
+        if candidate.is_dir():
+            weight_map = _parse_weight_map_from_dir(candidate)
+            if weight_map:
+                return weight_map
+    return {}
+
+
 async def get_weight_map(model_id: ModelId, revision: str = "main") -> dict[str, str]:
+    # Prefer index files that are already on disk (e.g. seeded by a peer or
+    # fetched on a previous run) to avoid a HuggingFace round-trip.
+    local = await asyncio.to_thread(get_local_weight_map, model_id)
+    if local:
+        return local
+
     target_dir = await resolve_model_dir(model_id)
 
     index_files_dir = snapshot_download(
@@ -814,36 +859,19 @@ async def get_weight_map(model_id: ModelId, revision: str = "main") -> dict[str,
         allow_patterns="*.safetensors.index.json",
     )
 
-    index_files = list(Path(index_files_dir).glob("**/*.safetensors.index.json"))
-
-    weight_map: dict[str, str] = {}
-
-    for index_file in index_files:
-        relative_dir = index_file.parent.relative_to(index_files_dir)
-
-        async with aiofiles.open(index_file, "r") as f:
-            index_data = ModelSafetensorsIndex.model_validate_json(await f.read())
-
-            if relative_dir != Path("."):
-                prefixed_weight_map = {
-                    f"{relative_dir}/{key}": str(relative_dir / value)
-                    for key, value in index_data.weight_map.items()
-                }
-                weight_map = weight_map | prefixed_weight_map
-            else:
-                weight_map = weight_map | index_data.weight_map
-
-    return weight_map
+    return await asyncio.to_thread(_parse_weight_map_from_dir, Path(index_files_dir))
 
 
 async def resolve_allow_patterns(shard: ShardMetadata) -> list[str]:
-    # TODO: 'Smart' downloads are disabled because:
-    #  (i) We don't handle all kinds of files;
-    # (ii) We don't have sticky sessions.
-    # (iii) Tensor parallel requires all files.
-    return ["*"]
+    # 'Smart' (shard-scoped) downloads are only valid for pipeline-sharded
+    # text models: tensor parallel reads every tensor, and image models keep
+    # weights in component subdirectories with their own layout.
+    if not isinstance(shard, PipelineShardMetadata) or is_image_model(shard):
+        return ["*"]
     try:
-        weight_map = await get_weight_map(str(shard.model_card.model_id))
+        weight_map = await get_weight_map(shard.model_card.model_id)
+        if not weight_map:
+            return ["*"]
         return get_allow_patterns(weight_map, shard)
     except Exception:
         logger.error(f"Error getting weight map for {shard.model_card.model_id=}")
@@ -865,6 +893,31 @@ async def get_downloaded_size(path: Path) -> int:
     return 0
 
 
+async def _build_peer_file_map(
+    seed_sources: list[SeedSource], normalized_id: str
+) -> tuple[dict[str, list[str]], dict[str, int]]:
+    """Map relative file path -> seed base URLs holding it, plus file sizes."""
+    from exo.download.peer_source import fetch_peer_file_list
+
+    urls = [url for source in seed_sources for url in source.base_urls]
+    peer_files: dict[str, list[str]] = {}
+    peer_sizes: dict[str, int] = {}
+    if not urls:
+        return peer_files, peer_sizes
+
+    async def _fetch(url: str) -> tuple[str, dict[str, int] | None]:
+        return url, await fetch_peer_file_list(url, normalized_id)
+
+    results = await asyncio.gather(*(_fetch(url) for url in urls))
+    for url, files in results:
+        if not files:
+            continue
+        for path, size in files.items():
+            peer_files.setdefault(path, []).append(url)
+            peer_sizes.setdefault(path, size)
+    return peer_files, peer_sizes
+
+
 async def download_shard(
     shard: ShardMetadata,
     on_progress: Callable[[ShardMetadata, RepoDownloadProgress], Awaitable[None]],
@@ -873,12 +926,32 @@ async def download_shard(
     skip_internet: bool = False,
     allow_patterns: list[str] | None = None,
     on_connection_lost: Callable[[], None] = lambda: None,
+    seed_sources: list[SeedSource] | None = None,
 ) -> tuple[Path, RepoDownloadProgress]:
+    from exo.download.peer_source import (
+        PeerDownloadError,
+        download_file_from_peer,
+    )
+
     if not skip_download:
         logger.debug(f"Downloading {shard.model_card.model_id=}")
 
     model_id = shard.model_card.model_id
+    normalized_id = model_id.normalize()
     revision = "main"
+
+    # Discover which files each seed peer holds (parallel, failure-tolerant).
+    peer_files: dict[str, list[str]] = {}
+    peer_sizes: dict[str, int] = {}
+    if seed_sources and not skip_download:
+        peer_files, peer_sizes = await _build_peer_file_map(
+            seed_sources, normalized_id
+        )
+        if peer_files:
+            logger.info(
+                f"Peer seeding available for {model_id}: "
+                f"{len(peer_files)} files offered by {len(seed_sources)} peer(s)"
+            )
 
     if not allow_patterns:
         allow_patterns = await resolve_allow_patterns(shard)
@@ -896,26 +969,37 @@ async def download_shard(
             on_connection_lost=on_connection_lost,
         )
     except FileNotFoundError:
-        not_started_progress = RepoDownloadProgress(
-            repo_id=str(model_id),
-            repo_revision=revision,
-            shard=shard,
-            completed_files=0,
-            total_files=0,
-            downloaded=Memory.from_bytes(0),
-            downloaded_this_session=Memory.from_bytes(0),
-            total=Memory.from_bytes(0),
-            overall_speed=0.0,
-            overall_eta=timedelta(0),
-            status="not_started",
-            file_progress={},
-        )
-        return EXO_DEFAULT_MODELS_DIR / model_id.normalize(), not_started_progress
+        # HuggingFace metadata unavailable (offline/air-gapped). If seed peers
+        # hold the model we can still proceed from their file lists.
+        if peer_files:
+            logger.warning(
+                f"No HuggingFace file list for {model_id}; using peer file lists"
+            )
+            file_list = [
+                FileListEntry(type="file", path=path, size=peer_sizes.get(path))
+                for path in peer_files
+            ]
+        else:
+            not_started_progress = RepoDownloadProgress(
+                repo_id=str(model_id),
+                repo_revision=revision,
+                shard=shard,
+                completed_files=0,
+                total_files=0,
+                downloaded=Memory.from_bytes(0),
+                downloaded_this_session=Memory.from_bytes(0),
+                total=Memory.from_bytes(0),
+                overall_speed=0.0,
+                overall_eta=timedelta(0),
+                status="not_started",
+                file_progress={},
+            )
+            return EXO_DEFAULT_MODELS_DIR / normalized_id, not_started_progress
     filtered_file_list = list(
         filter_repo_objects(
             file_list,
             allow_patterns=allow_patterns,
-            ignore_patterns=["original/*", "metal/*"],
+            ignore_patterns=["original/*", "metal/*", SHARD_MARKER_FILENAME],
             key=lambda x: x.path,
         )
     )
@@ -1033,6 +1117,41 @@ async def download_shard(
 
     async def download_with_semaphore(file: FileListEntry) -> None:
         async with semaphore:
+            target_path = target_dir / file.path
+
+            def on_file_progress(curr_bytes: int, total_bytes: int, is_renamed: bool):
+                schedule_progress(file, curr_bytes, total_bytes, is_renamed)
+
+            # Skip files already fully present locally. This check uses the
+            # repo/peer file list size and avoids one HTTP HEAD per file,
+            # which keeps restarts fast and works without internet.
+            if (
+                file.size is not None
+                and await aios.path.exists(target_path)
+                and (await aios.stat(target_path)).st_size == file.size
+            ):
+                on_file_progress(file.size, file.size, True)
+                return
+
+            # Seed peers first: the LAN is typically orders of magnitude
+            # faster than HuggingFace, and it works without internet.
+            for base_url in peer_files.get(file.path, []):
+                try:
+                    await download_file_from_peer(
+                        base_url,
+                        normalized_id,
+                        file.path,
+                        target_dir,
+                        file.size,
+                        on_progress=on_file_progress,
+                    )
+                    logger.info(f"Seeded {file.path} from peer {base_url}")
+                    return
+                except PeerDownloadError as e:
+                    logger.warning(
+                        f"Peer seeding of {file.path} from {base_url} failed: {e}"
+                    )
+
             await download_file_with_retry(
                 model_id,
                 revision,
@@ -1049,6 +1168,7 @@ async def download_shard(
         await asyncio.gather(
             *[download_with_semaphore(file) for file in filtered_file_list]
         )
+        await _write_shard_marker(target_dir, shard, filtered_file_list)
     final_repo_progress = calculate_repo_progress(
         shard, model_id, revision, file_progress, all_start_time
     )
@@ -1057,3 +1177,102 @@ async def download_shard(
         return target_dir / gguf.path, final_repo_progress
     else:
         return target_dir, final_repo_progress
+
+
+async def _write_shard_marker(
+    target_dir: Path, shard: ShardMetadata, files: list[FileListEntry]
+) -> None:
+    """Record which shard layers were fetched into this directory.
+
+    The marker lets future runs recognise a shard-scoped (partial) model
+    directory as loadable without re-downloading, and tells other nodes
+    exactly which files this directory can seed.
+    """
+    match shard:
+        case PipelineShardMetadata():
+            start_layer, end_layer, n_layers = (
+                shard.start_layer,
+                shard.end_layer,
+                shard.n_layers,
+            )
+        case _:
+            # Tensor/CFG shards always fetch the full repository.
+            n_layers = shard.n_layers
+            start_layer, end_layer = 0, n_layers
+    marker = {
+        "model_id": str(shard.model_card.model_id),
+        "start_layer": start_layer,
+        "end_layer": end_layer,
+        "n_layers": n_layers,
+        "files": {f.path: f.size for f in files if f.size is not None},
+    }
+    marker_path = target_dir / SHARD_MARKER_FILENAME
+    async with aiofiles.open(marker_path, "w") as f:
+        await f.write(json.dumps(marker))
+
+
+def _read_shard_marker(model_dir: Path) -> dict | None:
+    marker_path = model_dir / SHARD_MARKER_FILENAME
+    if not marker_path.is_file():
+        return None
+    try:
+        marker = json.loads(marker_path.read_text())
+        if not isinstance(marker, dict) or "files" not in marker:
+            return None
+        return marker
+    except (OSError, ValueError):
+        return None
+
+
+def marker_covers_shard(marker: dict, shard: ShardMetadata) -> bool:
+    """True if a directory with this marker can serve ``shard`` without
+    fetching any more files."""
+    if marker.get("n_layers") != shard.n_layers:
+        return False
+    m_start, m_end = marker.get("start_layer"), marker.get("end_layer")
+    if not isinstance(m_start, int) or not isinstance(m_end, int):
+        return False
+    if m_start == 0 and m_end == shard.n_layers:
+        return True
+    if not isinstance(shard, PipelineShardMetadata):
+        # Non-pipeline shards need every file: only a full marker covers them.
+        return False
+    return m_start <= shard.start_layer and m_end >= shard.end_layer
+
+
+def resolve_existing_model_for_shard(
+    model_id: ModelId, shard: ShardMetadata
+) -> Path | None:
+    """Find a local directory that already holds everything ``shard`` needs.
+
+    Unlike :func:`resolve_existing_model` this accepts shard-scoped (partial)
+    model directories recorded by a shard marker, so a node can restart and
+    reload its pipeline shard without re-downloading.
+    """
+    normalized = model_id.normalize()
+    for search_dir in (*EXO_MODELS_READ_ONLY_DIRS, *EXO_MODELS_DIRS):
+        candidate = search_dir / normalized
+        if not candidate.is_dir():
+            continue
+        marker = _read_shard_marker(candidate)
+        if marker is None or not marker_covers_shard(marker, shard):
+            continue
+        # Verify every recorded file is still present with its recorded size.
+        if all(
+            (candidate / path).is_file()
+            and (candidate / path).stat().st_size == size
+            for path, size in marker["files"].items()
+        ):
+            return candidate
+    return None
+
+
+def build_model_path_for_shard(model_id: ModelId, shard: ShardMetadata) -> Path:
+    """Resolve the on-disk path to load ``shard`` from (full or partial dir)."""
+    found = resolve_existing_model(model_id)
+    if found is not None:
+        return found
+    found = resolve_existing_model_for_shard(model_id, shard)
+    if found is not None:
+        return found
+    return EXO_DEFAULT_MODELS_DIR / model_id.normalize()
