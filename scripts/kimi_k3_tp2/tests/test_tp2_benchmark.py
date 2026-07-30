@@ -84,7 +84,7 @@ def test_manifest_identity_is_pinned_and_rank_specific(
         },
         "runtime": {
             "mlx_lm_commit": benchmark.MLX_LM_COMMIT,
-            "mlx_lm_kimi_k3_sha256": benchmark.MLX_LM_KIMI_K3_SHA256,
+            "mlx_lm_kimi_k3_sha256": (benchmark.CHECKPOINT_MLX_LM_KIMI_K3_SHA256),
         },
         "tp": {
             "rank": 1,

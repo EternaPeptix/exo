@@ -26,9 +26,12 @@ SOURCE_REPO = "kernelpool/Kimi-K3-2bit-UVMAX"
 SOURCE_REVISION = "edb5113218df612f4a92f95145680f3f8eacd375"
 EFFECTIVE_SOURCE_REVISION = "2f7de449f18498c47fd32485566a611e66ba80ae"
 MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
-RUNTIME_MLX_LM_COMMIT = "adb00f6bc061dcfd66851c9078b05fa2ba123059"
+CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
+    "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
+)
+RUNTIME_MLX_LM_COMMIT = "bfd0924ea3a3b575a4a66007fe31eef8c3d64be8"
 MLX_LM_KIMI_K3_SHA256 = (
-    "77c5621eebfc4afb57b42ad4c0612bed89571c71746ce7ac8d5b8d1b6f90c57a"
+    "9713c76813d0b78eddcc8df1d656e16acc621988468a4cd42e33b425212fbc4a"
 )
 SOURCE_CONFIG_SHA256 = (
     "d041003554810a367bb600d18733976bdd21041bb46e75cc1e27c7b15fe034d0"
@@ -83,7 +86,7 @@ def _load_json(path: Path) -> dict:
 
 
 def _verify_runtime_source() -> None:
-    """Fail closed if a different K3 sharding implementation is installed."""
+    """Fail closed if the pinned execution-time K3 source is not imported."""
 
     from mlx_lm.models import kimi_k3
 
@@ -91,10 +94,10 @@ def _verify_runtime_source() -> None:
     actual = _sha256_file(source)
     if actual != MLX_LM_KIMI_K3_SHA256:
         raise RankLocalLoadError(
-            "mlx_lm.models.kimi_k3.py does not match the converter contract: "
+            "mlx_lm.models.kimi_k3.py does not match the execution runtime pin: "
             f"expected {MLX_LM_KIMI_K3_SHA256}, got {actual} at {source}. "
-            f"Install mlx-lm commit {RUNTIME_MLX_LM_COMMIT} or update the "
-            "runtime pin with a new audited sharding contract."
+            f"Install mlx-lm commit {RUNTIME_MLX_LM_COMMIT} or audit and update "
+            "the execution runtime pin."
         )
 
 
@@ -126,7 +129,13 @@ def _verify_manifest(
         if source.get("index_sha256") != SOURCE_INDEX_SHA256:
             raise RankLocalLoadError("manifest source index hash is not pinned")
     if runtime.get("mlx_lm_commit") != MLX_LM_COMMIT:
-        raise RankLocalLoadError("manifest mlx-lm commit does not match loader")
+        raise RankLocalLoadError(
+            "manifest mlx-lm commit does not match the checkpoint converter"
+        )
+    if runtime.get("mlx_lm_kimi_k3_sha256") != CHECKPOINT_MLX_LM_KIMI_K3_SHA256:
+        raise RankLocalLoadError(
+            "manifest Kimi K3 hash does not match the checkpoint converter"
+        )
     if int(tp.get("world_size", -1)) != group.size():
         raise RankLocalLoadError(
             f"manifest TP{tp.get('world_size')} loaded with TP{group.size()}"

@@ -32,12 +32,14 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from rank_local_loader import (
+    CHECKPOINT_MLX_LM_KIMI_K3_SHA256,
     CONTRACT_DIGEST,
     CONTRACT_VERSION,
     DTYPE_FIX_CONTRACT,
     EFFECTIVE_SOURCE_REVISION,
     MLX_LM_COMMIT,
     MLX_LM_KIMI_K3_SHA256,
+    RUNTIME_MLX_LM_COMMIT,
     SCHEMA,
     SOURCE_CONFIG_SHA256,
     SOURCE_INDEX_SHA256,
@@ -46,16 +48,7 @@ from rank_local_loader import (
     load_rank_local,
 )
 
-try:
-    from rank_local_loader import CHECKPOINT_MLX_LM_KIMI_K3_SHA256
-except ImportError:
-    # Solid runtimes use one source for both checkpoint conversion and
-    # execution. Experimental overlays may retain the converter source hash
-    # separately while pinning their modified runtime source.
-    CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = MLX_LM_KIMI_K3_SHA256
-
-
-ARTIFACT_SCHEMA = "k3-rank-local-tp2-benchmark/v1"
+ARTIFACT_SCHEMA = "k3-rank-local-tp2-benchmark/v2"
 WORLD_SIZE = 2
 TRANSPORT_CONTRACT_SCHEMA = "k3-jaccl-transport/v1"
 TRANSPORT_CONTRACT_ENV = "K3_TP_TRANSPORT_CONTRACT"
@@ -387,7 +380,7 @@ def select_rank_checkpoint(
 
 
 def inspect_pinned_manifest(model_dir: Path, *, rank: int) -> dict[str, Any]:
-    """Authenticate the immutable source/runtime/TP identity before loading."""
+    """Authenticate the immutable source/converter/TP identity before loading."""
 
     manifest_path = model_dir / "tp_manifest.json"
     manifest = _json_object(manifest_path)
@@ -414,14 +407,14 @@ def inspect_pinned_manifest(model_dir: Path, *, rank: int) -> dict[str, Any]:
                 f"manifest source {key} is not pinned: "
                 f"expected {expected!r}, got {source.get(key)!r}"
             )
-    expected_runtime = {
+    expected_converter = {
         "mlx_lm_commit": MLX_LM_COMMIT,
         "mlx_lm_kimi_k3_sha256": CHECKPOINT_MLX_LM_KIMI_K3_SHA256,
     }
-    for key, expected in expected_runtime.items():
+    for key, expected in expected_converter.items():
         if runtime.get(key) != expected:
             raise BenchmarkError(
-                f"manifest runtime {key} is not pinned: "
+                f"manifest checkpoint converter {key} is not pinned: "
                 f"expected {expected!r}, got {runtime.get(key)!r}"
             )
     expected_tp = {
@@ -454,7 +447,7 @@ def inspect_pinned_manifest(model_dir: Path, *, rank: int) -> dict[str, Any]:
 
 
 def inspect_runtime_k3_source() -> dict[str, str]:
-    """Prove that PYTHONPATH resolved the exact PR #1626 model source."""
+    """Prove that Python resolved the pinned execution-time K3 source file."""
 
     from mlx_lm.models import kimi_k3
 
@@ -462,7 +455,7 @@ def inspect_runtime_k3_source() -> dict[str, str]:
     actual = _sha256_file(source)
     if actual != MLX_LM_KIMI_K3_SHA256:
         raise BenchmarkError(
-            "imported mlx_lm.models.kimi_k3 does not match the pinned source: "
+            "imported mlx_lm.models.kimi_k3 does not match the runtime pin: "
             f"expected {MLX_LM_KIMI_K3_SHA256}, got {actual} at {source}"
         )
     return {"path": str(source), "sha256": actual}
@@ -720,6 +713,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     _event(
         rank,
         "runtime_preflight",
+        mlx_lm_commit=RUNTIME_MLX_LM_COMMIT,
         kimi_k3_path=runtime_source["path"],
         kimi_k3_sha256=runtime_source["sha256"],
     )
@@ -901,9 +895,10 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             ),
         },
         "runtime_contract": {
+            "checkpoint_converter_mlx_lm_commit": MLX_LM_COMMIT,
             "checkpoint_mlx_lm_kimi_k3_sha256": (CHECKPOINT_MLX_LM_KIMI_K3_SHA256),
-            "mlx_lm_commit": MLX_LM_COMMIT,
-            "mlx_lm_kimi_k3_sha256": MLX_LM_KIMI_K3_SHA256,
+            "execution_runtime_mlx_lm_commit": RUNTIME_MLX_LM_COMMIT,
+            "execution_runtime_kimi_k3_sha256": MLX_LM_KIMI_K3_SHA256,
             "imported_kimi_k3_path_rank0": runtime_source["path"],
             "imported_kimi_k3_sha256_by_rank": runtime_source_digests,
             "tp_contract": CONTRACT_VERSION,

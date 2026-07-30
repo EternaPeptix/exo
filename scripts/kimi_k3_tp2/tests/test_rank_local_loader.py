@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -111,7 +112,10 @@ def _checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, 
             "config_sha256": config_sha,
             "index_sha256": loader.SOURCE_INDEX_SHA256,
         },
-        "runtime": {"mlx_lm_commit": loader.MLX_LM_COMMIT},
+        "runtime": {
+            "mlx_lm_commit": loader.MLX_LM_COMMIT,
+            "mlx_lm_kimi_k3_sha256": (loader.CHECKPOINT_MLX_LM_KIMI_K3_SHA256),
+        },
         "tp": {
             "rank": 0,
             "world_size": 2,
@@ -139,9 +143,11 @@ def _checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, 
     return root, manifest
 
 
-def test_manifest_inventory_and_index_are_cross_checked(
+def test_converter_manifest_is_accepted_by_newer_execution_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    assert loader.MLX_LM_COMMIT != loader.RUNTIME_MLX_LM_COMMIT
+    assert loader.CHECKPOINT_MLX_LM_KIMI_K3_SHA256 != loader.MLX_LM_KIMI_K3_SHA256
     root, _manifest = _checkpoint(tmp_path, monkeypatch)
     result = loader._verify_manifest(
         root,
@@ -150,6 +156,30 @@ def test_manifest_inventory_and_index_are_cross_checked(
         test_only_allow_unpinned=False,
     )
     assert result["rank_data_bytes"] == 32
+
+
+def test_runtime_source_verification_uses_execution_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runtime_source = tmp_path / "kimi_k3.py"
+    runtime_source.write_bytes(b"pinned execution runtime")
+    digest = hashlib.sha256(runtime_source.read_bytes()).hexdigest()
+    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_SHA256", digest)
+
+    mlx_lm = types.ModuleType("mlx_lm")
+    models = types.ModuleType("mlx_lm.models")
+    kimi_k3 = types.ModuleType("mlx_lm.models.kimi_k3")
+    kimi_k3.__file__ = str(runtime_source)
+    models.kimi_k3 = kimi_k3
+    mlx_lm.models = models
+    monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models", models)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.kimi_k3", kimi_k3)
+
+    loader._verify_runtime_source()
+    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_SHA256", "0" * 64)
+    with pytest.raises(loader.RankLocalLoadError, match="execution runtime pin"):
+        loader._verify_runtime_source()
 
 
 def test_manifest_rejects_path_traversal(

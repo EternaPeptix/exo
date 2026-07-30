@@ -214,6 +214,32 @@ def test_width_summary_and_artifact_status_require_exact_contract():
         subject.artifact_status(records[:-1])
 
 
+def test_runtime_contract_splits_converter_and_execution_provenance():
+    record = subject.runtime_contract_record(
+        runtime_source={"path": "/opt/mlx_lm/models/kimi_k3.py", "sha256": "ab" * 32},
+        runtime_digests=["ab" * 32, "ab" * 32],
+        attestation={"lossy_requantization_enabled": False},
+    )
+    assert record["checkpoint_converter_mlx_lm_commit"] == subject.base.MLX_LM_COMMIT
+    assert record["checkpoint_mlx_lm_kimi_k3_sha256"] == (
+        subject.base.CHECKPOINT_MLX_LM_KIMI_K3_SHA256
+    )
+    assert record["execution_runtime_mlx_lm_commit"] == (
+        subject.base.RUNTIME_MLX_LM_COMMIT
+    )
+    assert record["execution_runtime_kimi_k3_sha256"] == (
+        subject.base.MLX_LM_KIMI_K3_SHA256
+    )
+    assert (
+        record["checkpoint_converter_mlx_lm_commit"]
+        != (record["execution_runtime_mlx_lm_commit"])
+    )
+    assert (
+        record["checkpoint_mlx_lm_kimi_k3_sha256"]
+        != (record["execution_runtime_kimi_k3_sha256"])
+    )
+
+
 def test_launcher_pins_current_exact_runtime_contract():
     launcher = (VERIFY_ROOT / "launch_k3_target_verify.sh").read_text()
     assert "--backend jaccl-ring" in launcher

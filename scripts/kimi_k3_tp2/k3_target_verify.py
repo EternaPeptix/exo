@@ -42,7 +42,7 @@ from typing import Any, Iterable, Sequence
 
 import tp2_benchmark as base
 
-ARTIFACT_SCHEMA = "k3-tp2-target-verification/v1"
+ARTIFACT_SCHEMA = "k3-tp2-target-verification/v2"
 VERIFY_WIDTHS = (1, 2, 3, 4, 7)
 EXPECTED_ARRAY_CACHE_COUNT = 69
 EXPECTED_KV_CACHE_COUNT = 24
@@ -684,6 +684,29 @@ def _attest_loaded_runtime(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def runtime_contract_record(
+    *,
+    runtime_source: dict[str, str],
+    runtime_digests: Sequence[str],
+    attestation: dict[str, Any],
+) -> dict[str, Any]:
+    """Record checkpoint-converter and execution-runtime provenance separately."""
+
+    return {
+        "checkpoint_converter_mlx_lm_commit": base.MLX_LM_COMMIT,
+        "checkpoint_mlx_lm_kimi_k3_sha256": (base.CHECKPOINT_MLX_LM_KIMI_K3_SHA256),
+        "execution_runtime_mlx_lm_commit": base.RUNTIME_MLX_LM_COMMIT,
+        "execution_runtime_kimi_k3_sha256": base.MLX_LM_KIMI_K3_SHA256,
+        "imported_kimi_k3_path_rank0": runtime_source["path"],
+        "imported_kimi_k3_sha256_by_rank": list(runtime_digests),
+        "tp_contract": base.CONTRACT_VERSION,
+        "tp_contract_digest": base.CONTRACT_DIGEST,
+        "attestation": attestation,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     import mlx.core as mx
     from mlx_lm.generate import wired_limit
@@ -908,17 +931,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "config_sha256": base.SOURCE_CONFIG_SHA256,
             "index_sha256": base.SOURCE_INDEX_SHA256,
         },
-        "runtime_contract": {
-            "mlx_lm_commit": base.MLX_LM_COMMIT,
-            "mlx_lm_kimi_k3_sha256": base.MLX_LM_KIMI_K3_SHA256,
-            "imported_kimi_k3_path_rank0": runtime_source["path"],
-            "imported_kimi_k3_sha256_by_rank": runtime_digests,
-            "tp_contract": base.CONTRACT_VERSION,
-            "tp_contract_digest": base.CONTRACT_DIGEST,
-            "attestation": runtime_attestation,
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-        },
+        "runtime_contract": runtime_contract_record(
+            runtime_source=runtime_source,
+            runtime_digests=runtime_digests,
+            attestation=runtime_attestation,
+        ),
         "distributed": {
             "backend": "jaccl-ring",
             "world_size": world_size,
