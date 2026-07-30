@@ -10,7 +10,7 @@ import traceback
 from collections.abc import Awaitable, Mapping
 from datetime import timedelta
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, cast
 from urllib.parse import urljoin
 
 import aiofiles
@@ -49,7 +49,24 @@ from exo.shared.types.worker.downloads import (
     RepoDownloadProgress,
     RepoFileDownloadProgress,
 )
-from exo.shared.types.worker.shards import PipelineShardMetadata, ShardMetadata
+from exo.shared.types.worker.shards import (
+    PipelineShardMetadata,
+    ShardMetadata,
+    TensorShardMetadata,
+)
+from exo.worker.engines.mlx.rank_local_checkpoint import (
+    SUPPORTED_LOADER_SCHEMA,
+    SUPPORTED_MLX_LM_COMMIT,
+    SUPPORTED_MLX_LM_KIMI_K3_SHA256,
+    SUPPORTED_SOURCE_CONFIG_SHA256,
+    SUPPORTED_SOURCE_INDEX_SHA256,
+    SUPPORTED_SOURCE_REVISION,
+    SUPPORTED_TP_CONTRACT,
+    SUPPORTED_TP_CONTRACT_DIGEST,
+    RankLocalConfigurationError,
+    preflight_rank_local_runtime,
+    resolve_configured_rank_local_checkpoint_path,
+)
 
 
 class HuggingFaceAuthenticationError(Exception):
@@ -816,9 +833,7 @@ def _parse_weight_map_from_dir(model_dir: Path) -> dict[str, str]:
 
     for index_file in index_files:
         relative_dir = index_file.parent.relative_to(model_dir)
-        index_data = ModelSafetensorsIndex.model_validate_json(
-            index_file.read_text()
-        )
+        index_data = ModelSafetensorsIndex.model_validate_json(index_file.read_text())
 
         if relative_dir != Path("."):
             prefixed_weight_map = {
@@ -944,9 +959,7 @@ async def download_shard(
     peer_files: dict[str, list[str]] = {}
     peer_sizes: dict[str, int] = {}
     if seed_sources and not skip_download:
-        peer_files, peer_sizes = await _build_peer_file_map(
-            seed_sources, normalized_id
-        )
+        peer_files, peer_sizes = await _build_peer_file_map(seed_sources, normalized_id)
         if peer_files:
             logger.info(
                 f"Peer seeding available for {model_id}: "
@@ -1211,20 +1224,27 @@ async def _write_shard_marker(
         await f.write(json.dumps(marker))
 
 
-def _read_shard_marker(model_dir: Path) -> dict | None:
+def _read_shard_marker(model_dir: Path) -> dict[str, object] | None:
     marker_path = model_dir / SHARD_MARKER_FILENAME
     if not marker_path.is_file():
         return None
     try:
-        marker = json.loads(marker_path.read_text())
-        if not isinstance(marker, dict) or "files" not in marker:
+        raw_marker = cast(object, json.loads(marker_path.read_text(encoding="utf-8")))
+        if not isinstance(raw_marker, Mapping):
+            return None
+        marker: dict[str, object] = {}
+        for key, value in cast(Mapping[object, object], raw_marker).items():
+            if not isinstance(key, str):
+                return None
+            marker[key] = value
+        if "files" not in marker:
             return None
         return marker
     except (OSError, ValueError):
         return None
 
 
-def marker_covers_shard(marker: dict, shard: ShardMetadata) -> bool:
+def marker_covers_shard(marker: Mapping[str, object], shard: ShardMetadata) -> bool:
     """True if a directory with this marker can serve ``shard`` without
     fetching any more files."""
     if marker.get("n_layers") != shard.n_layers:
@@ -1240,6 +1260,278 @@ def marker_covers_shard(marker: dict, shard: ShardMetadata) -> bool:
     return m_start <= shard.start_layer and m_end >= shard.end_layer
 
 
+def _marker_files(marker: Mapping[str, object]) -> dict[str, int] | None:
+    raw_files = marker.get("files")
+    if not isinstance(raw_files, Mapping):
+        return None
+    files: dict[str, int] = {}
+    for raw_path, raw_size in cast(Mapping[object, object], raw_files).items():
+        if (
+            not isinstance(raw_path, str)
+            or isinstance(raw_size, bool)
+            or not isinstance(raw_size, int)
+            or raw_size < 0
+        ):
+            return None
+        files[raw_path] = raw_size
+    return files
+
+
+def _rank_local_object(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise RankLocalConfigurationError(f"{label} must be a JSON object")
+    result: dict[str, object] = {}
+    for key, item in cast(Mapping[object, object], value).items():
+        if not isinstance(key, str):
+            raise RankLocalConfigurationError(f"{label} contains a non-string key")
+        result[key] = item
+    return result
+
+
+def _read_rank_local_json(path: Path, label: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise RankLocalConfigurationError(
+            f"rank-local checkpoint is missing regular {label}"
+        )
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as exc:
+        raise RankLocalConfigurationError(
+            f"rank-local checkpoint has invalid {label}"
+        ) from exc
+    return _rank_local_object(value, label)
+
+
+def _safe_rank_local_relative_path(value: object) -> str:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise RankLocalConfigurationError(
+            f"unsafe rank-local checkpoint filename {value!r}"
+        )
+    relative = Path(value)
+    if relative.is_absolute() or any(
+        part in ("", ".", "..") for part in relative.parts
+    ):
+        raise RankLocalConfigurationError(
+            f"unsafe rank-local checkpoint filename {value!r}"
+        )
+    return relative.as_posix()
+
+
+def _rank_local_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_rank_local_checkpoint(
+    checkpoint: Path,
+    model_id: ModelId,
+    shard: TensorShardMetadata,
+) -> None:
+    """Validate rank-local readiness without reading weight payloads.
+
+    The manifest, config, and rank-local index are small and authenticated.
+    Weight shards are checked by safe filename, regular-file identity, and
+    exact byte size; hashing hundreds of GiB here would duplicate the loader's
+    optional full-integrity pass and delay every readiness check.
+    """
+
+    manifest = _read_rank_local_json(
+        checkpoint / "tp_manifest.json", "tp_manifest.json"
+    )
+    if manifest.get("schema") != SUPPORTED_LOADER_SCHEMA or (
+        manifest.get("complete") is not True
+    ):
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint manifest is incomplete or unsupported"
+        )
+
+    source = _rank_local_object(manifest.get("source"), "manifest source")
+    if (
+        source.get("repo") != str(model_id)
+        or source.get("revision") != SUPPORTED_SOURCE_REVISION
+        or source.get("config_sha256") != SUPPORTED_SOURCE_CONFIG_SHA256
+        or source.get("index_sha256") != SUPPORTED_SOURCE_INDEX_SHA256
+    ):
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint source contract is not the audited checkpoint"
+        )
+    config_sha256 = source.get("config_sha256")
+    if (
+        not isinstance(config_sha256, str)
+        or len(config_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in config_sha256)
+    ):
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint manifest has an invalid config hash"
+        )
+
+    runtime = _rank_local_object(manifest.get("runtime"), "manifest runtime")
+    if (
+        runtime.get("mlx_lm_commit") != SUPPORTED_MLX_LM_COMMIT
+        or runtime.get("mlx_lm_kimi_k3_sha256") != SUPPORTED_MLX_LM_KIMI_K3_SHA256
+    ):
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint runtime contract is not audited"
+        )
+
+    tp = _rank_local_object(manifest.get("tp"), "manifest tp")
+    if (
+        tp.get("rank") != shard.device_rank
+        or tp.get("world_size") != shard.world_size
+        or tp.get("contract") != SUPPORTED_TP_CONTRACT
+        or tp.get("contract_digest") != SUPPORTED_TP_CONTRACT_DIGEST
+    ):
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint TP contract does not match TensorShardMetadata"
+        )
+
+    rank_data_bytes = manifest.get("rank_data_bytes")
+    if (
+        isinstance(rank_data_bytes, bool)
+        or not isinstance(rank_data_bytes, int)
+        or rank_data_bytes <= 0
+    ):
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint manifest has invalid rank_data_bytes"
+        )
+
+    config_path = checkpoint / "config.json"
+    if config_path.is_symlink() or not config_path.is_file():
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint is missing regular config.json"
+        )
+    if _rank_local_sha256(config_path) != config_sha256:
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint config.json hash does not match its manifest"
+        )
+
+    files = _rank_local_object(manifest.get("files"), "manifest files")
+    if not files:
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint manifest lists no weight files"
+        )
+    manifest_filenames: set[str] = set()
+    for filename, raw_record in files.items():
+        safe_name = _safe_rank_local_relative_path(filename)
+        if safe_name != filename:
+            raise RankLocalConfigurationError(
+                f"non-canonical rank-local checkpoint filename {filename!r}"
+            )
+        record = _rank_local_object(raw_record, f"manifest file record {filename}")
+        if record.get("name") != filename:
+            raise RankLocalConfigurationError(
+                f"rank-local checkpoint file record/name mismatch for {filename}"
+            )
+        byte_count = record.get("bytes")
+        checksum = record.get("sha256")
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count <= 0
+            or not isinstance(checksum, str)
+            or len(checksum) != 64
+            or any(character not in "0123456789abcdef" for character in checksum)
+        ):
+            raise RankLocalConfigurationError(
+                f"malformed rank-local checkpoint file record for {filename}"
+            )
+        weight_path = checkpoint / filename
+        try:
+            resolved_weight = weight_path.resolve(strict=True)
+        except OSError as exc:
+            raise RankLocalConfigurationError(
+                f"rank-local checkpoint file is missing: {weight_path}"
+            ) from exc
+        if (
+            weight_path.is_symlink()
+            or not resolved_weight.is_file()
+            or not resolved_weight.is_relative_to(checkpoint)
+            or resolved_weight.stat().st_size != byte_count
+        ):
+            raise RankLocalConfigurationError(
+                f"rank-local checkpoint file is missing or truncated: {weight_path}"
+            )
+        manifest_filenames.add(filename)
+
+    index = _read_rank_local_json(
+        checkpoint / "model.safetensors.index.json",
+        "model.safetensors.index.json",
+    )
+    metadata = _rank_local_object(index.get("metadata"), "rank-local metadata")
+    if metadata.get("total_size") != rank_data_bytes:
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint index and manifest byte totals differ"
+        )
+    weight_map = _rank_local_object(index.get("weight_map"), "rank-local weight_map")
+    if not weight_map:
+        raise RankLocalConfigurationError("rank-local checkpoint index has no weights")
+    index_tensor_files: dict[str, str] = {}
+    for tensor_name, raw_filename in weight_map.items():
+        if not tensor_name:
+            raise RankLocalConfigurationError(
+                "rank-local checkpoint index has an empty tensor name"
+            )
+        index_tensor_files[tensor_name] = _safe_rank_local_relative_path(raw_filename)
+    index_filenames = set(index_tensor_files.values())
+    if index_filenames != manifest_filenames:
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint index and manifest list different files"
+        )
+
+    tensors = _rank_local_object(manifest.get("tensors"), "manifest tensors")
+    if set(tensors) != set(index_tensor_files):
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint index and manifest list different tensors"
+        )
+    tensor_bytes = 0
+    for tensor_name, raw_record in tensors.items():
+        record = _rank_local_object(raw_record, f"manifest tensor record {tensor_name}")
+        source_file = _safe_rank_local_relative_path(record.get("source_file"))
+        byte_count = record.get("bytes")
+        rank_shape = record.get("rank_shape")
+        if (
+            source_file != index_tensor_files[tensor_name]
+            or isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count < 0
+            or not isinstance(rank_shape, list)
+            or any(
+                isinstance(dimension, bool)
+                or not isinstance(dimension, int)
+                or dimension < 0
+                for dimension in cast(list[object], rank_shape)
+            )
+        ):
+            raise RankLocalConfigurationError(
+                f"malformed rank-local checkpoint tensor record for {tensor_name}"
+            )
+        tensor_bytes += byte_count
+    if tensor_bytes != rank_data_bytes:
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint tensor and manifest byte totals differ"
+        )
+
+
+def _resolve_configured_rank_local_model_for_shard(
+    model_id: ModelId, shard: ShardMetadata
+) -> Path | None:
+    checkpoint = resolve_configured_rank_local_checkpoint_path(shard)
+    if checkpoint is None:
+        return None
+    if not isinstance(shard, TensorShardMetadata):
+        raise AssertionError("rank-local path resolver returned a non-tensor shard")
+    if model_id != shard.model_card.model_id:
+        raise RankLocalConfigurationError(
+            "requested model ID differs from TensorShardMetadata"
+        )
+    _validate_rank_local_checkpoint(checkpoint, model_id, shard)
+    preflight_rank_local_runtime()
+    return checkpoint
+
+
 def resolve_existing_model_for_shard(
     model_id: ModelId, shard: ShardMetadata
 ) -> Path | None:
@@ -1249,6 +1541,10 @@ def resolve_existing_model_for_shard(
     model directories recorded by a shard marker, so a node can restart and
     reload its pipeline shard without re-downloading.
     """
+    rank_local = _resolve_configured_rank_local_model_for_shard(model_id, shard)
+    if rank_local is not None:
+        return rank_local
+
     normalized = model_id.normalize()
     for search_dir in (*EXO_MODELS_READ_ONLY_DIRS, *EXO_MODELS_DIRS):
         candidate = search_dir / normalized
@@ -1257,11 +1553,13 @@ def resolve_existing_model_for_shard(
         marker = _read_shard_marker(candidate)
         if marker is None or not marker_covers_shard(marker, shard):
             continue
+        marker_files = _marker_files(marker)
+        if marker_files is None:
+            continue
         # Verify every recorded file is still present with its recorded size.
         if all(
-            (candidate / path).is_file()
-            and (candidate / path).stat().st_size == size
-            for path, size in marker["files"].items()
+            (candidate / path).is_file() and (candidate / path).stat().st_size == size
+            for path, size in marker_files.items()
         ):
             return candidate
     return None
@@ -1269,10 +1567,13 @@ def resolve_existing_model_for_shard(
 
 def build_model_path_for_shard(model_id: ModelId, shard: ShardMetadata) -> Path:
     """Resolve the on-disk path to load ``shard`` from (full or partial dir)."""
-    found = resolve_existing_model(model_id)
+    # An explicit tensor-rank checkpoint wins over a legacy full checkpoint;
+    # invalid opt-in state raises instead of silently falling back and risking
+    # a full-checkpoint load or duplicate download.
+    found = resolve_existing_model_for_shard(model_id, shard)
     if found is not None:
         return found
-    found = resolve_existing_model_for_shard(model_id, shard)
+    found = resolve_existing_model(model_id)
     if found is not None:
         return found
     return EXO_DEFAULT_MODELS_DIR / model_id.normalize()

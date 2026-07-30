@@ -61,11 +61,28 @@ from exo.shared.types.worker.shards import (
 from exo.worker.engines.mlx.auto_parallel import (
     get_inner_model,
     get_layers,
+    patch_tensor_model,
     pipeline_auto_parallel,
     tensor_auto_parallel,
 )
+from exo.worker.engines.mlx.rank_local_checkpoint import (
+    load_configured_rank_local_model,
+)
 from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
+
+_RANK_LOCAL_TENSOR_PATCH_MARKER = "_exo_rank_local_tensor_patch_applied"
+
+
+def _patch_rank_local_tensor_model_once(model: nn.Module) -> nn.Module:
+    """Apply EXO's tensor dependency patch once per concrete model class."""
+
+    model_class = type(model)
+    if getattr(model_class, _RANK_LOCAL_TENSOR_PATCH_MARKER, False):
+        return model
+    model = patch_tensor_model(model)
+    setattr(type(model), _RANK_LOCAL_TENSOR_PATCH_MARKER, True)
+    return model
 
 
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
@@ -147,7 +164,15 @@ def mlx_distributed_init(
                     (len(cell) for row in jaccl_devices for cell in row),
                     default=0,
                 )
-                if max_links > 1:
+                force_mesh = (
+                    os.environ.get("EXO_MLX_JACCL_FORCE_MESH", "0") == "1"
+                )
+                if force_mesh:
+                    os.environ.pop("MLX_JACCL_RING", None)
+                    logger.info(
+                        f"rank {rank} using JACCL mesh by explicit override"
+                    )
+                elif max_links > 1:
                     os.environ["MLX_JACCL_RING"] = "1"
                     logger.info(
                         f"rank {rank} MLX_JACCL_RING=1 "
@@ -250,6 +275,26 @@ def shard_and_load(
     shard_metadata: ShardMetadata,
     group: mx.distributed.Group,
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
+    rank_local = load_configured_rank_local_model(shard_metadata, group)
+    if rank_local is not None:
+        # The external loader shards the empty model structure before loading
+        # its already-sliced tensors. Never retry this opt-in path through
+        # load_model: doing so would materialize the full checkpoint per rank.
+        model_value = rank_local.model
+        if not isinstance(model_value, nn.Module):
+            raise TypeError("rank-local loader did not return an MLX module")
+        # load_rank_local_model already applies K3's native structural shard.
+        # Keep EXO's normal tensor-inference dependency patch, but do not call
+        # tensor_auto_parallel because that would shard the model a second time.
+        model = _patch_rank_local_tensor_model_once(model_value)
+        tokenizer = get_tokenizer(rank_local.checkpoint_path, shard_metadata)
+        yield ModelLoadingResponse(
+            layers_loaded=shard_metadata.n_layers,
+            total=shard_metadata.n_layers,
+        )
+        mx_barrier(group)
+        return model, tokenizer
+
     model_path = build_model_path_for_shard(
         shard_metadata.model_card.model_id, shard_metadata
     )
@@ -328,7 +373,7 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
         List of EOS token IDs, or None if the model uses standard tokenizer config
     """
     model_id_lower = model_id.lower()
-    if "kimi-k2" in model_id_lower:
+    if "kimi-k2" in model_id_lower or "kimi-k3" in model_id_lower:
         return [163586]
     elif "glm-5" in model_id_lower:
         # 154820: <|endoftext|>, 154827: <|user|>, 154829: <|observation|>

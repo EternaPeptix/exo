@@ -1,0 +1,22 @@
+model_id = "kernelpool/Kimi-K3-2bit-UVMAX"
+n_layers = 93
+hidden_size = 7168
+num_key_value_heads = 96
+supports_tensor = false
+tasks = ["TextGeneration"]
+family = "kimi"
+quantization = "UVMAX mixed 2/4/6/8-bit"
+base_model = "Kimi K3"
+capabilities = ["text"]
+context_length = 1048576
+backends = ["MlxMetal"]
+trust_remote_code = true
+
+[storage_size]
+in_bytes = 816776699111
+
+# Sources:
+# https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX
+# https://github.com/ml-explore/mlx-lm/pull/1626
+[sampling_defaults]
+temperature = 0.6

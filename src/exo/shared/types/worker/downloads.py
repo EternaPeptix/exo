@@ -5,7 +5,12 @@ from pydantic import BaseModel, ConfigDict, Field, PositiveInt
 
 from exo.shared.types.common import NodeId
 from exo.shared.types.memory import Memory
-from exo.shared.types.worker.shards import PipelineShardMetadata, ShardMetadata
+from exo.shared.types.worker.shards import (
+    CfgShardMetadata,
+    PipelineShardMetadata,
+    ShardMetadata,
+    TensorShardMetadata,
+)
 from exo.utils.pydantic_ext import FrozenModel, TaggedModel
 
 
@@ -52,38 +57,40 @@ DownloadProgress = (
 )
 
 
-def _is_full_coverage(shard: ShardMetadata) -> bool:
-    """True if a download with this shard metadata fetched every weight file."""
-    match shard:
-        case PipelineShardMetadata():
-            return shard.start_layer == 0 and shard.end_layer == shard.n_layers
-        case _:
-            # Tensor/CFG downloads always fetch the full repository.
-            return True
-
-
 def download_covers_shard(dp: DownloadProgress, required: ShardMetadata) -> bool:
     """True if a completed download holds every file ``required`` needs.
 
-    Downloads are keyed by model id, but with shard-scoped downloads a node
-    may only hold the layer range of a previous placement. A full download
-    covers everything; a partial pipeline download only covers pipeline
-    shards inside its layer range.
+    Pipeline weights are layer-addressable, so a completed pipeline range can
+    cover another pipeline shard contained within it regardless of placement.
+    Tensor completions require exact rank/world/layer metadata because one
+    rank-local checkpoint cannot serve another rank. CFG downloads always
+    contain the full repository, so CFG-to-CFG coverage only depends on model
+    and layer-count identity. Different sharding modes never cover each other.
     """
     if not isinstance(dp, DownloadCompleted):
         return False
     have = dp.shard_metadata
     if have.model_card.model_id != required.model_card.model_id:
         return False
-    if _is_full_coverage(have):
-        return True
-    if not isinstance(required, PipelineShardMetadata):
-        return False
-    return (
-        have.n_layers == required.n_layers
-        and have.start_layer <= required.start_layer
-        and have.end_layer >= required.end_layer
-    )
+    match have, required:
+        case PipelineShardMetadata(), PipelineShardMetadata():
+            return (
+                have.n_layers == required.n_layers
+                and have.start_layer <= required.start_layer
+                and have.end_layer >= required.end_layer
+            )
+        case TensorShardMetadata(), TensorShardMetadata():
+            return (
+                have.device_rank == required.device_rank
+                and have.world_size == required.world_size
+                and have.start_layer == required.start_layer
+                and have.end_layer == required.end_layer
+                and have.n_layers == required.n_layers
+            )
+        case CfgShardMetadata(), CfgShardMetadata():
+            return have.n_layers == required.n_layers
+        case _:
+            return False
 
 
 class ModelSafetensorsIndexMetadata(BaseModel):

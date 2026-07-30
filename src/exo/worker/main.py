@@ -60,7 +60,11 @@ from exo.shared.types.tasks import (
 )
 from exo.shared.types.text_generation import Base64Image, Base64ImageHash
 from exo.shared.types.topology import Connection, SocketConnection
-from exo.shared.types.worker.downloads import DownloadCompleted, DownloadOngoing
+from exo.shared.types.worker.downloads import (
+    DownloadCompleted,
+    DownloadFailed,
+    DownloadOngoing,
+)
 from exo.shared.types.worker.instances import InstanceId
 from exo.shared.types.worker.runners import RunnerId
 from exo.shared.types.worker.shards import ShardMetadata
@@ -69,6 +73,9 @@ from exo.utils.info_gatherer.info_gatherer import GatheredInfo, InfoGatherer
 from exo.utils.info_gatherer.net_profile import check_reachable
 from exo.utils.keyed_backoff import KeyedBackoff
 from exo.utils.task_group import TaskGroup
+from exo.worker.engines.mlx.rank_local_checkpoint import (
+    RankLocalConfigurationError,
+)
 from exo.worker.plan import plan
 from exo.worker.runner.supervisor import RunnerSupervisor
 
@@ -306,14 +313,35 @@ class Worker:
                     model_id = shard.model_card.model_id
                     self._download_backoff.record_attempt(model_id)
 
-                    found_path = await to_thread.run_sync(
-                        resolve_existing_model, model_id, shard.model_card
-                    )
-                    if found_path is None:
-                        # Accept shard-scoped (partial) directories recorded by
-                        # a shard marker from a previous download.
+                    try:
                         found_path = await to_thread.run_sync(
                             resolve_existing_model_for_shard, model_id, shard
+                        )
+                    except RankLocalConfigurationError as exc:
+                        logger.error(
+                            f"Rank-local checkpoint for {model_id} is invalid: {exc}"
+                        )
+                        await self.event_sender.send(
+                            NodeDownloadProgress(
+                                download_progress=DownloadFailed(
+                                    node_id=self.node_id,
+                                    shard_metadata=shard,
+                                    error_message=str(exc),
+                                )
+                            )
+                        )
+                        await self.event_sender.send(
+                            TaskStatusUpdated(
+                                task_id=task.task_id,
+                                task_status=TaskStatus.Failed,
+                            )
+                        )
+                        continue
+                    if found_path is None:
+                        # Preserve full-model fallback for pipeline and
+                        # non-opted-in tensor shards.
+                        found_path = await to_thread.run_sync(
+                            resolve_existing_model, model_id, shard.model_card
                         )
                     if found_path is not None:
                         logger.info(f"Model {model_id} found at {found_path}")

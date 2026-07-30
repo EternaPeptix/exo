@@ -47,6 +47,9 @@ from exo.shared.types.worker.downloads import (
 from exo.shared.types.worker.shards import PipelineShardMetadata, ShardMetadata
 from exo.utils.channels import Receiver, Sender
 from exo.utils.task_group import TaskGroup
+from exo.worker.engines.mlx.rank_local_checkpoint import (
+    RankLocalConfigurationError,
+)
 
 
 @dataclass
@@ -214,20 +217,35 @@ class DownloadCoordinator:
                     f"Existing download of {model_id} does not cover "
                     f"layers [{shard.start_layer}, {shard.end_layer}), topping up"
                 )
-            elif isinstance(status, (DownloadOngoing, DownloadCompleted, DownloadFailed)):
+            elif isinstance(
+                status, (DownloadOngoing, DownloadCompleted, DownloadFailed)
+            ):
                 logger.debug(
                     f"Download for {model_id} already in progress, complete, or failed, skipping"
                 )
                 return
 
-        # Check all model directories for pre-existing complete models
-        found_path = await to_thread.run_sync(
-            resolve_existing_model, model_id, shard.model_card
-        )
-        if found_path is None:
-            # Accept shard-scoped (partial) directories that cover this shard.
+        # Prefer an explicit rank-local tensor checkpoint or a shard marker.
+        # Invalid rank-local opt-in state fails closed before any download.
+        try:
             found_path = await to_thread.run_sync(
                 resolve_existing_model_for_shard, model_id, shard
+            )
+        except RankLocalConfigurationError as exc:
+            logger.error(f"Rank-local checkpoint for {model_id} is invalid: {exc}")
+            failed = DownloadFailed(
+                shard_metadata=shard,
+                node_id=self.node_id,
+                error_message=str(exc),
+                model_directory=self._default_model_dir(model_id),
+            )
+            self.download_status[model_id] = failed
+            await self.event_sender.send(NodeDownloadProgress(download_progress=failed))
+            return
+        if found_path is None:
+            # Preserve the legacy full-model fallback.
+            found_path = await to_thread.run_sync(
+                resolve_existing_model, model_id, shard.model_card
             )
         if found_path is not None:
             logger.info(f"DownloadCoordinator: Model {model_id} found at {found_path}")
