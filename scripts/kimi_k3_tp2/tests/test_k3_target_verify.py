@@ -255,6 +255,41 @@ def test_runtime_contract_splits_converter_and_execution_provenance():
     )
 
 
+def test_transport_mode_is_hashed_before_shared_digest_validation(monkeypatch):
+    observed = {}
+
+    def strict_digest_validator(_mx, _group, digest, label):
+        raw = bytes.fromhex(digest)
+        assert len(raw) == 32
+        observed["digest"] = digest
+        observed["label"] = label
+        return [digest, digest]
+
+    monkeypatch.setattr(subject.base, "require_shared_digest", strict_digest_validator)
+    expected = subject.base.sha256_text("jaccl-mesh")
+    attestation = subject.attest_shared_transport_mode(
+        None,
+        None,
+        {"mode": "jaccl-mesh", "mode_sha256": expected},
+    )
+    assert observed == {
+        "digest": expected,
+        "label": "JACCL transport mode",
+    }
+    assert attestation == {
+        "mode": "jaccl-mesh",
+        "mode_sha256": expected,
+        "mode_sha256_by_rank": [expected, expected],
+    }
+
+    with pytest.raises(subject.VerificationError, match="digest is inconsistent"):
+        subject.attest_shared_transport_mode(
+            None,
+            None,
+            {"mode": "jaccl-mesh", "mode_sha256": "0" * 64},
+        )
+
+
 def test_current_launcher_pins_current_exact_runtime_contract():
     launcher = (VERIFY_ROOT / "launch_k3_target_verify_current.sh").read_text()
     assert 'K3_TARGET_VERIFY_TRANSPORT_MODE:-mesh' in launcher

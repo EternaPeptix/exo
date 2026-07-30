@@ -98,6 +98,14 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def sha256_text(value: str) -> str:
+    """Return a canonical UTF-8 SHA-256 digest for shared text provenance."""
+
+    if not isinstance(value, str):
+        raise BenchmarkError("shared text provenance must be a string")
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def load_transport_contract(path: str | Path | None = None) -> dict[str, Any]:
     """Load an explicit operator-supplied JACCL topology contract."""
 
@@ -261,6 +269,7 @@ def inspect_jaccl_transport(
     return {
         "schema": TRANSPORT_ATTESTATION_SCHEMA,
         "mode": runtime_mode,
+        "mode_sha256": sha256_text(runtime_mode),
         "topology": mode,
         "ring": mode == "ring",
         "mesh": mode == "mesh",
@@ -588,6 +597,18 @@ def require_shared_digest(
     if any(value != digest for value in gathered):
         raise BenchmarkError(f"{label} differs across TP ranks: {gathered}")
     return gathered
+
+
+def require_shared_text(
+    mx: Any,
+    group: Any,
+    value: str,
+    label: str,
+) -> tuple[str, list[str]]:
+    """Hash readable text before applying the strict shared-digest gate."""
+
+    digest = sha256_text(value)
+    return digest, require_shared_digest(mx, group, digest, label)
 
 
 def phase_metrics(

@@ -730,6 +730,31 @@ def runtime_contract_record(
     }
 
 
+def attest_shared_transport_mode(
+    mx: Any,
+    group: Any,
+    transport: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve readable mode provenance while gathering only its SHA-256."""
+
+    mode = transport.get("mode")
+    if not isinstance(mode, str) or not mode:
+        raise VerificationError("JACCL transport attestation has no mode")
+    mode_sha256, mode_sha256_by_rank = base.require_shared_text(
+        mx,
+        group,
+        mode,
+        "JACCL transport mode",
+    )
+    if transport.get("mode_sha256") != mode_sha256:
+        raise VerificationError("JACCL transport mode digest is inconsistent")
+    return {
+        "mode": mode,
+        "mode_sha256": mode_sha256,
+        "mode_sha256_by_rank": mode_sha256_by_rank,
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     import mlx.core as mx
     from mlx_lm.generate import wired_limit
@@ -744,12 +769,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     init_seconds = time.perf_counter() - init_started
 
     transport = base.inspect_jaccl_transport(rank=rank)
-    mode_digests = base.require_shared_digest(
-        mx,
-        group,
-        transport["mode"],
-        "JACCL transport mode",
-    )
+    mode_attestation = attest_shared_transport_mode(mx, group, transport)
     matrix_digests = base.require_shared_digest(
         mx,
         group,
@@ -967,7 +987,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             attestation=runtime_attestation,
         ),
         "distributed": {
-            "backend": transport["mode"],
+            "backend": mode_attestation["mode"],
             "initialization_backend": "jaccl",
             "world_size": world_size,
             "strict_init_requested": True,
@@ -978,12 +998,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "load_peak_memory_gb_by_rank": [row[1] / 1e9 for row in load_rows],
             "transport": {
                 "schema": transport["schema"],
-                "mode": transport["mode"],
+                "mode": mode_attestation["mode"],
                 "topology": transport["topology"],
                 "ring": transport["ring"],
                 "mesh": transport["mesh"],
                 "mlx_jaccl_ring": transport["mlx_jaccl_ring"],
-                "mode_sha256_by_rank": mode_digests,
+                "mode_sha256": mode_attestation["mode_sha256"],
+                "mode_sha256_by_rank": mode_attestation["mode_sha256_by_rank"],
                 "coordinator_sha256_by_rank": coordinator_digests,
                 "device_matrix": transport["device_matrix"],
                 "device_matrix_sha256_by_rank": matrix_digests,

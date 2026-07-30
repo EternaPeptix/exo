@@ -177,6 +177,7 @@ def test_transport_environment_requires_exact_four_rail_ring(
     result = benchmark.inspect_jaccl_ring_transport(rank=1)
     assert result["schema"] == benchmark.TRANSPORT_ATTESTATION_SCHEMA
     assert result["mode"] == "jaccl-ring"
+    assert result["mode_sha256"] == benchmark.sha256_text("jaccl-ring")
     assert result["ring"] is True
     assert result["mesh"] is False
     assert result["mlx_jaccl_ring"] == "1"
@@ -220,6 +221,7 @@ def test_transport_environment_attests_exact_four_rail_mesh(
     result = benchmark.inspect_jaccl_transport(rank=0)
     assert result["schema"] == benchmark.TRANSPORT_ATTESTATION_SCHEMA
     assert result["mode"] == "jaccl-mesh"
+    assert result["mode_sha256"] == benchmark.sha256_text("jaccl-mesh")
     assert result["topology"] == "mesh"
     assert result["mesh"] is True
     assert result["ring"] is False
