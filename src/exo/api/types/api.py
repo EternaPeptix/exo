@@ -167,6 +167,16 @@ class GenerationStats(BaseModel):
     generation_tokens: int
     peak_memory_usage: Memory
     prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
+    # ``generation_tps`` preserves MLX-LM's historical timing contract, which
+    # starts after the first output token.  The effective fields include the
+    # complete decode interval and are therefore the authoritative values for
+    # comparing ordinary and speculative end-to-end generation.
+    decode_elapsed_seconds: float | None = None
+    effective_generation_tps: float | None = None
+    speculative_rounds: int = 0
+    speculative_drafted_tokens: int = 0
+    speculative_accepted_tokens: int = 0
+    speculative_committed_tokens: int = 0
 
 
 class ImageGenerationStats(BaseModel):

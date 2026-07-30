@@ -96,6 +96,20 @@ class _PromptLookupConfig:
     round_telemetry: bool
 
 
+@dataclass
+class _PromptLookupTelemetry:
+    rounds: int = 0
+    drafted_tokens: int = 0
+    accepted_tokens: int = 0
+    committed_tokens: int = 0
+
+    def observe(self, stats: "_SpeculativeRoundStatsLike") -> None:
+        self.rounds += 1
+        self.drafted_tokens += int(stats.drafted_tokens)
+        self.accepted_tokens += int(stats.accepted_tokens)
+        self.committed_tokens += int(stats.committed_tokens)
+
+
 class _SpeculativeRoundStatsLike(Protocol):
     round_index: int
     source: str
@@ -207,21 +221,27 @@ def prompt_lookup_config(
 
 def _prompt_lookup_round_callback(
     group: mx.distributed.Group | None,
+    *,
+    telemetry: _PromptLookupTelemetry | None = None,
+    log_rounds: bool = True,
 ) -> Callable[[_SpeculativeRoundStatsLike], None]:
     rank = group.rank() if group is not None else 0
 
     def report(stats: _SpeculativeRoundStatsLike) -> None:
-        logger.info(
-            "MLX prompt-lookup round: "
-            f"rank={rank}, "
-            f"round={stats.round_index}, "
-            f"source={stats.source}, "
-            f"drafted={stats.drafted_tokens}, "
-            f"accepted={stats.accepted_tokens}, "
-            f"committed={stats.committed_tokens}, "
-            f"target_cache={stats.target_cache_tokens}, "
-            f"cancelled={stats.cancelled}"
-        )
+        if telemetry is not None:
+            telemetry.observe(stats)
+        if log_rounds:
+            logger.info(
+                "MLX prompt-lookup round: "
+                f"rank={rank}, "
+                f"round={stats.round_index}, "
+                f"source={stats.source}, "
+                f"drafted={stats.drafted_tokens}, "
+                f"accepted={stats.accepted_tokens}, "
+                f"committed={stats.committed_tokens}, "
+                f"target_cache={stats.target_cache_tokens}, "
+                f"cancelled={stats.cancelled}"
+            )
 
     return report
 
@@ -230,6 +250,7 @@ def prompt_lookup_stream_kwargs(
     config: _PromptLookupConfig | None,
     group: mx.distributed.Group | None,
     history: mx.array,
+    telemetry: _PromptLookupTelemetry | None = None,
 ) -> _PromptLookupStreamKwargs | None:
     if config is None:
         return None
@@ -244,7 +265,13 @@ def prompt_lookup_stream_kwargs(
         # history without asking MLX-LM to process those tokens a second time.
         "prompt_lookup_history": history,
         "speculative_round_callback": (
-            _prompt_lookup_round_callback(group) if config.round_telemetry else None
+            _prompt_lookup_round_callback(
+                group,
+                telemetry=telemetry,
+                log_rounds=config.round_telemetry,
+            )
+            if telemetry is not None or config.round_telemetry
+            else None
         ),
     }
 
@@ -1129,6 +1156,7 @@ def mlx_generate(
         accumulated_text = ""
         generated_text_parts: list[str] = []
         generation_start_time = time.perf_counter()
+        prompt_lookup_telemetry = _PromptLookupTelemetry()
         usage: Usage | None = None
         logger.info("Starting decode")
         # Pipeline prefill and decode share one ordered P2P stream. A collective
@@ -1142,6 +1170,7 @@ def mlx_generate(
             prompt_lookup_configuration,
             group,
             all_prompt_tokens,
+            prompt_lookup_telemetry,
         )
         # MLX-LM normally launches token N+1 before yielding token N. If token N
         # is EOS (or EXO matches a stop sequence), abandoning that lookahead
@@ -1208,6 +1237,20 @@ def mlx_generate(
 
             stats: GenerationStats | None = None
             if is_done:
+                # MLX-LM reports a speculative round only after its emitted
+                # tokens have been consumed.  Its terminal response is yielded
+                # before the inner token generator is resumed, so close it now
+                # to resolve the final cache transaction and account for that
+                # round before serializing telemetry.
+                decode_outputs.close()
+                decode_elapsed_seconds = (
+                    time.perf_counter() - generation_start_time
+                )
+                effective_generation_tps = (
+                    completion_tokens / decode_elapsed_seconds
+                    if decode_elapsed_seconds > 0
+                    else 0.0
+                )
                 prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
                 if prefix_hit_length > 0:
                     prefix_cache_hit = "exact" if is_exact_hit else "partial"
@@ -1218,6 +1261,18 @@ def mlx_generate(
                     generation_tokens=int(out.generation_tokens),
                     peak_memory_usage=_memory_from_mlx_decimal_gb(out.peak_memory),
                     prefix_cache_hit=prefix_cache_hit,
+                    decode_elapsed_seconds=decode_elapsed_seconds,
+                    effective_generation_tps=effective_generation_tps,
+                    speculative_rounds=prompt_lookup_telemetry.rounds,
+                    speculative_drafted_tokens=(
+                        prompt_lookup_telemetry.drafted_tokens
+                    ),
+                    speculative_accepted_tokens=(
+                        prompt_lookup_telemetry.accepted_tokens
+                    ),
+                    speculative_committed_tokens=(
+                        prompt_lookup_telemetry.committed_tokens
+                    ),
                 )
                 if not stop_matched and out.finish_reason not in get_args(FinishReason):
                     logger.warning(
@@ -1233,7 +1288,15 @@ def mlx_generate(
                         cached_tokens=prefix_hit_length
                     ),
                     completion_tokens_details=CompletionTokensDetails(
-                        reasoning_tokens=0
+                        reasoning_tokens=0,
+                        accepted_prediction_tokens=(
+                            prompt_lookup_telemetry.accepted_tokens
+                        ),
+                        rejected_prediction_tokens=max(
+                            0,
+                            prompt_lookup_telemetry.drafted_tokens
+                            - prompt_lookup_telemetry.accepted_tokens,
+                        ),
                     ),
                 )
 
@@ -1251,7 +1314,12 @@ def mlx_generate(
 
             if is_done:
                 # Log generation stats
-                generation_elapsed = time.perf_counter() - generation_start_time
+                generation_elapsed = (
+                    stats.decode_elapsed_seconds
+                    if stats is not None
+                    and stats.decode_elapsed_seconds is not None
+                    else time.perf_counter() - generation_start_time
+                )
                 generated_tokens = len(generated_text_parts)
                 generation_tps = (
                     generated_tokens / generation_elapsed

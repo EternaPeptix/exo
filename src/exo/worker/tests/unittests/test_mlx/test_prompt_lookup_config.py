@@ -7,6 +7,7 @@ import pytest
 
 import exo.worker.engines.mlx.generator.generate as generate_module
 from exo.worker.engines.mlx.generator.generate import (
+    _PromptLookupTelemetry,
     prompt_lookup_config,
     prompt_lookup_stream_kwargs,
 )
@@ -96,6 +97,54 @@ def test_round_telemetry_is_opt_in_and_reports_every_field(
         "MLX prompt-lookup round: rank=0, round=4, source=prompt_lookup, "
         "drafted=3, accepted=2, committed=3, target_cache=3, cancelled=False"
     ]
+
+
+def test_round_callback_accumulates_without_verbose_logging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXO_MLX_PROMPT_LOOKUP_NUM_TOKENS", "1")
+    logged: list[str] = []
+    monkeypatch.setattr(generate_module.logger, "info", logged.append)
+    telemetry = _PromptLookupTelemetry()
+
+    config = prompt_lookup_config(is_pipeline=False, is_batch=False)
+    kwargs = prompt_lookup_stream_kwargs(
+        config,
+        None,
+        mx.array([1, 2]),
+        telemetry,
+    )
+    assert kwargs is not None
+    callback = kwargs["speculative_round_callback"]
+    assert callback is not None
+    callback(
+        _RoundStats(
+            round_index=0,
+            source="prompt_lookup",
+            drafted_tokens=1,
+            accepted_tokens=1,
+            committed_tokens=2,
+            target_cache_tokens=2,
+            cancelled=False,
+        )
+    )
+    callback(
+        _RoundStats(
+            round_index=1,
+            source="prompt_lookup",
+            drafted_tokens=1,
+            accepted_tokens=0,
+            committed_tokens=1,
+            target_cache_tokens=1,
+            cancelled=False,
+        )
+    )
+
+    assert logged == []
+    assert telemetry.rounds == 2
+    assert telemetry.drafted_tokens == 2
+    assert telemetry.accepted_tokens == 1
+    assert telemetry.committed_tokens == 3
 
 
 @pytest.mark.parametrize(
