@@ -1,5 +1,5 @@
 {
-  "schema": "k3-tp2-public-benchmark/v1",
+  "schema": "k3-tp2-public-benchmark/v2",
   "recorded_utc_date": "2026-07-30",
   "model": {
     "repository": "kernelpool/Kimi-K3-2bit-UVMAX",
@@ -12,11 +12,11 @@
     "transport": "four-rail JACCL over Thunderbolt 5"
   },
   "runtime": {
-    "exo_execution_commit": "0b17ae3c4141141d3eee71413301bac0d5388035",
-    "exo_coordinated_branch_head_before_result_docs": "93e6897dc6095159fe54263e24ce0868293ae6b4",
+    "exo_execution_commit": "69bf6a2a821493e5ebe3982eecc089e81637f60e",
+    "exo_publication_base_commit": "2653972d3a43f434c853026a2d68f86a700d5abb",
     "mlx_commit": "57b87fe47cfce34d6dc59d0e274d8ee36bfb9308",
-    "mlx_lm_execution_commit": "c7b1c3b77e91cd47e91885f186fa33ba274d8bf8",
-    "rank_local_loader_sha256": "b8294c0e3eb42cb6f95652962c2579d68d02b5d0bcad4f5ce571969830f3c3a7"
+    "mlx_lm_execution_commit": "076f1bda08744a50501b69036d7aa21b1a9cccee",
+    "rank_local_loader_sha256": "ca04936de4c3c5b1f138ae94b93892e4ec9d1b180e23561fe2b20de8885a8b5f"
   },
   "common_configuration": {
     "temperature": 0,
@@ -24,7 +24,10 @@
     "vocabulary_parallel_head": true,
     "async_decode_boundaries": "laguna8",
     "async_decode_state": "hidden",
-    "authoritative_packed_moe_front": true
+    "authoritative_packed_moe_front": true,
+    "row_tiled_kda_prefill": true,
+    "fused_experts": true,
+    "fused_down_reduce": true
   },
   "canonical_decode": {
     "target_prompt_tokens": 512,
@@ -58,6 +61,25 @@
       ],
       "median_generation_tps": 13.298487659382511,
       "improvement_percent": 2.435
+    },
+    "fused_down_candidate": {
+      "generation_tps": [
+        13.613178872859125,
+        13.583503079572177,
+        13.59280571778252,
+        13.46348520666856,
+        13.545266129888994
+      ],
+      "peak_memory_bytes": [
+        414029987174,
+        413958896990,
+        413944790366,
+        413944495450,
+        413958880606
+      ],
+      "median_generation_tps": 13.583503079572177,
+      "improvement_over_fused_expert_percent": 2.1432,
+      "cumulative_improvement_over_control_percent": 4.6304
     }
   },
   "coding_decode": {
@@ -72,7 +94,31 @@
       13.270951566641257
     ],
     "fused_expert_median_generation_tps": 13.263662148394186,
-    "improvement_percent": 2.59
+    "fused_down_generation_tps": [
+      13.493612145040336,
+      13.510163607694636,
+      13.51569198851176
+    ],
+    "fused_down_median_generation_tps": 13.510163607694636,
+    "fused_down_improvement_over_fused_expert_percent": 1.8585,
+    "cumulative_improvement_over_control_percent": 4.4979
+  },
+  "rejected_router_screen": {
+    "target_prompt_tokens": 512,
+    "actual_prompt_tokens": 575,
+    "decode_tokens": 128,
+    "expected_completion_sha256": "c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71",
+    "observed_completion_sha256": "905f41a15d7933fd33da36382e1766469fffbe17c9da03084c22e62376f77cfc",
+    "generation_tps": [
+      13.65218915898534,
+      13.755676545454499,
+      13.74178806220853,
+      13.718854399005338,
+      13.600628239701232
+    ],
+    "median_generation_tps": 13.718854399005338,
+    "accepted": false,
+    "rejection_reason": "deterministic completion digest changed in all five repetitions"
   },
   "prefill": {
     "decode_tokens": 8,

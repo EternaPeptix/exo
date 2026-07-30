@@ -18,9 +18,9 @@ The cluster work is published under the same branch name in all three forks:
 
 | Repository | Public branch | Scope |
 | --- | --- | --- |
-| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, prompt-lookup integration, reproducible benchmarks, and target-divergence diagnostics |
-| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack) | Kimi K3 model support, deterministic generation control, vocabulary-parallel output head, exact expert path, asynchronous decode, authoritative MoE-front packing, and exact row-tiled KDA prefill |
-| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack) | Exact Darwin/JACCL lineage used by the benchmarked Mac runtime, plus eval-walk and gather-index CPU-overhead reductions |
+| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack-v2) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, prompt-lookup integration, reproducible benchmarks, and target-divergence diagnostics |
+| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v2) | Kimi K3 model support, deterministic generation control, vocabulary-parallel output head, exact expert/down paths, asynchronous decode, authoritative MoE-front packing, and exact row-tiled KDA prefill |
+| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v2) | Exact Darwin/JACCL lineage used by the benchmarked Mac runtime, plus eval-walk and gather-index CPU-overhead reductions |
 
 This coordinated branch is experimental. Its exact path remains the reference
 configuration. The opt-in segmented decode experiment improved median short
@@ -40,6 +40,17 @@ raised the canonical 575-prompt/128-decode median from `12.9824` to
 `13.2985` tok/s (`+2.44%`) over five candidate repetitions. All repetitions
 retained the canonical completion digest, and a separate 1,067-token coding
 prompt reached `13.2637` tok/s while retaining its own reference digest.
+Fusing the expert down projection, BF16 route multiplication, and exact
+top-16 reduction then raised the canonical median to `13.5835` tok/s
+(`+2.14%` versus fused experts alone, `+4.63%` cumulatively) while retaining
+the same canonical digest in all five repetitions. The coding prompt reached
+`13.5102` tok/s (`+1.86%` versus fused experts alone, `+4.50%`
+cumulatively) with its reference digest unchanged.
+
+A follow-on fused-router prototype reached `13.7189` median decode tok/s, but
+all five repetitions changed the canonical completion digest from `c84d…` to
+`905f…`. It is excluded from this coordinated branch and remains a
+correctness investigation.
 
 The row-tiled KDA prefill kernel is bit-exact and now also has a matched
 full-model TP2 result. At 2K target context it reached `147.4168` prompt
@@ -69,8 +80,8 @@ checkpoint, so they remain research evidence rather than production defaults.
 | --- | --- |
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
-| Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
-| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack) coordinated commit `c7b1c3b77e91cd47e91885f186fa33ba274d8bf8` |
+| Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v2) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
+| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v2) coordinated code commit `076f1bda08744a50501b69036d7aa21b1a9cccee` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v1` |
 
@@ -84,7 +95,7 @@ at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@c7b1c3b77e91cd47e91885f186fa33ba274d8bf8"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@076f1bda08744a50501b69036d7aa21b1a9cccee"
 ```
 
 ## License and trust boundary
@@ -171,6 +182,7 @@ export MLX_LM_KIMI_K3_ASYNC_DECODE_STATE=hidden
 export MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT=1
 export MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL=1
 export MLX_LM_KIMI_K3_FUSED_EXPERTS=1
+export MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE=1
 ```
 
 The EXO MLX worker resolves `{rank}` from the distributed rank, verifies the
@@ -191,12 +203,13 @@ prompt positions; measure representative long prompts before enabling it for
 a latency-sensitive production workload.
 
 The asynchronous schedule, authoritative packed MoE-front, row-tiled KDA
-prefill, and exact fused-expert paths are also opt-in. The authoritative path
-avoids keeping unpacked copies of the four packed projections. The row-tiled
-path activates only for supported Metal prefill shapes of at least 128 tokens.
-The fused-expert path activates only for supported affine 2-bit decode shapes.
-Unsupported shapes use the reference path. Keep the variables unset when
-reproducing a feature-off control.
+prefill, exact fused-expert, and fused-down/reduction paths are also opt-in.
+The authoritative path avoids keeping unpacked copies of the four packed
+projections. The row-tiled path activates only for supported Metal prefill
+shapes of at least 128 tokens. The fused expert and down/reduction paths
+activate only for supported affine 2-bit decode shapes. Unsupported shapes use
+the reference path. Keep the variables unset when reproducing a feature-off
+control.
 
 ### Prompt-lookup speculative decode
 
