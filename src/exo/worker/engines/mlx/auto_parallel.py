@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Collection, Generator
 from dataclasses import dataclass
 from functools import partial
 from inspect import signature
@@ -184,6 +184,9 @@ _PIPELINE_TCP_DEFAULT_MAX_ACTIVATION_BYTES = 512 * 1024 * 1024
 _PIPELINE_TCP_MAX_TOKEN_BYTES = 1024 * 1024
 _PIPELINE_DYNAMIC_PORT_START = 49152
 _PIPELINE_DYNAMIC_PORT_COUNT = 16384
+_PIPELINE_RELAY_HOST_ENV = "EXO_PIPELINE_TOKEN_RELAY_HOST"
+_PIPELINE_RELAY_DERIVED_HOST_ENV = "_EXO_PIPELINE_TOKEN_RELAY_HOST"
+_PIPELINE_WILDCARD_HOSTS = frozenset({"", "0.0.0.0", "::"})
 _PIPELINE_ACTIVATION_TRANSPORT_TCP = 1
 _PIPELINE_ACTIVATION_TRANSPORT_RING = 2
 _PIPELINE_RING_CANARY_VALUE = 0x4B335250
@@ -194,6 +197,52 @@ _PIPELINE_DTYPE_ITEMSIZE = {
     PIPELINE_DTYPE_FLOAT32: 4,
     PIPELINE_DTYPE_INT32: 4,
 }
+
+
+def derive_two_rank_pipeline_relay_host(
+    jaccl_coordinator_endpoints: Collection[str],
+) -> str | None:
+    """Return the rank-zero address advertised to its only peer.
+
+    EXO gives JACCL rank zero ``0.0.0.0`` so its own coordinator can listen on
+    every fabric interface. In a two-rank instance, the other map entry is the
+    exact rank-zero address selected for the peer. Reuse that address for the
+    separate pipeline relay instead of inheriting JACCL's wildcard.
+    """
+
+    if len(jaccl_coordinator_endpoints) != 2:
+        return None
+    specific_hosts: set[str] = set()
+    for endpoint in jaccl_coordinator_endpoints:
+        try:
+            host, port_text = endpoint.rsplit(":", 1)
+            port = int(port_text)
+        except (AttributeError, ValueError):
+            return None
+        if not 1 <= port <= 65535:
+            return None
+        if host not in _PIPELINE_WILDCARD_HOSTS:
+            specific_hosts.add(host)
+    if len(specific_hosts) != 1:
+        return None
+    return next(iter(specific_hosts))
+
+
+def replace_derived_pipeline_relay_host(
+    jaccl_coordinator_endpoints: Collection[str] | None,
+) -> str | None:
+    """Replace process-local relay routing derived from one JACCL instance."""
+
+    relay_host = (
+        None
+        if jaccl_coordinator_endpoints is None
+        else derive_two_rank_pipeline_relay_host(jaccl_coordinator_endpoints)
+    )
+    if relay_host is None:
+        os.environ.pop(_PIPELINE_RELAY_DERIVED_HOST_ENV, None)
+    else:
+        os.environ[_PIPELINE_RELAY_DERIVED_HOST_ENV] = relay_host
+    return relay_host
 
 
 def _pipeline_activation_transport() -> str:
@@ -387,6 +436,16 @@ class _PipelineTcpTransport:
             raise ValueError(
                 f"invalid MLX_JACCL_COORDINATOR {coordinator!r}"
             ) from error
+        relay_host = (
+            os.environ.get(_PIPELINE_RELAY_HOST_ENV)
+            or os.environ.get(_PIPELINE_RELAY_DERIVED_HOST_ENV)
+            or coordinator_host
+        )
+        if relay_host in _PIPELINE_WILDCARD_HOSTS:
+            raise ValueError(
+                "Kimi-K3 TCP pipeline relay requires a specific coordinator "
+                f"interface via {_PIPELINE_RELAY_HOST_ENV}"
+            )
 
         # Toggle one bit inside the IANA dynamic range. This is deterministic,
         # non-identity and bijective for EXO's 49152-65535 coordinator ports.
@@ -413,7 +472,7 @@ class _PipelineTcpTransport:
 
         self.rank = rank
         self.world_size = world_size
-        self.coordinator_host = coordinator_host
+        self.coordinator_host = relay_host
         self.coordinator_port = coordinator_port
         self.relay_port = relay_port
         self.timeout_seconds = timeout_seconds
@@ -446,7 +505,11 @@ class _PipelineTcpTransport:
         if rank == 0:
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind(("0.0.0.0", relay_port))
+            # The control protocol is intentionally limited to the exact
+            # coordinator interface selected for this two-rank run. Binding
+            # every interface would let an unrelated LAN client win the
+            # single accept slot and poison the runner.
+            listener.bind((relay_host, relay_port))
             listener.listen(1)
             listener.settimeout(timeout_seconds)
             self.listener = listener
@@ -454,7 +517,7 @@ class _PipelineTcpTransport:
         atexit.register(self.close)
         logger.info(
             "Kimi-K3 pipeline control transport using TCP "
-            f"rank={rank} endpoint={coordinator_host}:{relay_port} "
+            f"rank={rank} endpoint={relay_host}:{relay_port} "
             f"activation_transport={self.activation_transport}"
         )
 

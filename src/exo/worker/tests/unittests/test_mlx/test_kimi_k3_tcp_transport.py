@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import socket
 import threading
 from collections.abc import Iterator
@@ -12,7 +13,15 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
-from exo.worker.engines.mlx import auto_parallel, kimi_k3_pipeline
+from exo.shared.models.model_cards import ModelId
+from exo.shared.types.common import Host, NodeId
+from exo.shared.types.worker.instances import (
+    BoundInstance,
+    InstanceId,
+    MlxRingInstance,
+)
+from exo.shared.types.worker.runners import RunnerId, ShardAssignments
+from exo.worker.engines.mlx import auto_parallel, kimi_k3_pipeline, utils_mlx
 from exo.worker.engines.mlx.auto_parallel import (
     PIPELINE_DTYPE_BFLOAT16,
     PIPELINE_DTYPE_FLOAT16,
@@ -63,6 +72,88 @@ def _transport_pair(
     finally:
         rank_zero.close()
         rank_one.close()
+
+
+def test_rank_zero_listener_binds_only_the_coordinator_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relay_port = _reserve_loopback_port()
+    monkeypatch.setenv("MLX_JACCL_COORDINATOR", "0.0.0.0:49000")
+    monkeypatch.setenv("EXO_PIPELINE_TOKEN_RELAY_PORT", str(relay_port))
+    relay_host = auto_parallel.replace_derived_pipeline_relay_host(
+        {
+            "rank-zero": "0.0.0.0:49000",
+            "rank-one": "127.0.0.1:49000",
+        }.values()
+    )
+    assert relay_host == "127.0.0.1"
+    transport = _PipelineTcpTransport(rank=0, world_size=2)
+    try:
+        assert transport.listener is not None
+        host, port = transport.listener.getsockname()
+        assert host == "127.0.0.1"
+        assert port == relay_port
+    finally:
+        transport.close()
+
+
+def test_derived_relay_host_is_cleared_between_instances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("_EXO_PIPELINE_TOKEN_RELAY_HOST", "127.0.0.1")
+    assert auto_parallel.replace_derived_pipeline_relay_host(None) is None
+    assert "_EXO_PIPELINE_TOKEN_RELAY_HOST" not in os.environ
+
+
+def test_ring_initialization_clears_derived_relay_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node_id = NodeId("node-zero")
+    runner_id = RunnerId("runner-zero")
+    assignments = ShardAssignments.model_construct(
+        model_id=ModelId("test/model"),
+        runner_to_shard={
+            runner_id: SimpleNamespace(device_rank=0),
+        },
+        node_to_runner={node_id: runner_id},
+    )
+    instance = MlxRingInstance.model_construct(
+        instance_id=InstanceId("instance-zero"),
+        shard_assignments=assignments,
+        hosts_by_node={
+            node_id: [
+                Host(ip="127.0.0.1", port=49000),
+            ]
+        },
+        ephemeral_port=49000,
+    )
+    bound_instance = BoundInstance.model_construct(
+        instance=instance,
+        bound_runner_id=runner_id,
+        bound_node_id=node_id,
+    )
+    fake_group = SimpleNamespace()
+
+    def fake_distributed_init(*, backend: str, strict: bool) -> SimpleNamespace:
+        assert backend == "ring"
+        assert strict
+        return fake_group
+
+    monkeypatch.setattr(utils_mlx.mx.distributed, "init", fake_distributed_init)
+    monkeypatch.setenv("_EXO_PIPELINE_TOKEN_RELAY_HOST", "127.0.0.1")
+
+    assert utils_mlx.mlx_distributed_init(bound_instance) is fake_group
+    assert "_EXO_PIPELINE_TOKEN_RELAY_HOST" not in os.environ
+
+
+def test_rank_zero_listener_rejects_wildcard_without_relay_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MLX_JACCL_COORDINATOR", "0.0.0.0:49000")
+    monkeypatch.delenv("EXO_PIPELINE_TOKEN_RELAY_HOST", raising=False)
+    monkeypatch.delenv("_EXO_PIPELINE_TOKEN_RELAY_HOST", raising=False)
+    with pytest.raises(ValueError, match="specific coordinator interface"):
+        _PipelineTcpTransport(rank=0, world_size=2)
 
 
 @contextmanager

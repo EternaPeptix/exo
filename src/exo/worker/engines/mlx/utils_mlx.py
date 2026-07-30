@@ -63,6 +63,7 @@ from exo.worker.engines.mlx.auto_parallel import (
     get_layers,
     patch_tensor_model,
     pipeline_auto_parallel,
+    replace_derived_pipeline_relay_host,
     tensor_auto_parallel,
 )
 from exo.worker.engines.mlx.rank_local_checkpoint import (
@@ -112,6 +113,10 @@ def mlx_distributed_init(
     """
     rank = bound_instance.bound_shard.device_rank
     logger.info(f"Starting initialization for rank {rank}")
+    # This value is derived per JACCL instance. Never let a previous two-rank
+    # instance influence a later ring or differently shaped JACCL instance in
+    # the same runner process.
+    replace_derived_pipeline_relay_host(None)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         coordination_file = str(
@@ -147,6 +152,7 @@ def mlx_distributed_init(
                     _ = f.write(jaccl_devices_json)
 
                 jaccl_coordinator = jaccl_coordinators[bound_instance.bound_node_id]
+                replace_derived_pipeline_relay_host(jaccl_coordinators.values())
 
                 logger.info(
                     f"rank {rank} MLX_IBV_DEVICES: {coordination_file} with devices: {jaccl_devices_json}"
@@ -164,14 +170,10 @@ def mlx_distributed_init(
                     (len(cell) for row in jaccl_devices for cell in row),
                     default=0,
                 )
-                force_mesh = (
-                    os.environ.get("EXO_MLX_JACCL_FORCE_MESH", "0") == "1"
-                )
+                force_mesh = os.environ.get("EXO_MLX_JACCL_FORCE_MESH", "0") == "1"
                 if force_mesh:
                     os.environ.pop("MLX_JACCL_RING", None)
-                    logger.info(
-                        f"rank {rank} using JACCL mesh by explicit override"
-                    )
+                    logger.info(f"rank {rank} using JACCL mesh by explicit override")
                 elif max_links > 1:
                     os.environ["MLX_JACCL_RING"] = "1"
                     logger.info(

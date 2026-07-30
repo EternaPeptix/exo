@@ -318,6 +318,7 @@ exo supports several environment variables for configuration:
 | `EXO_SEED_PORT` | TCP port used by the peer seed server | `52416` |
 | `EXO_LIBP2P_NAMESPACE` | Custom namespace for cluster isolation | None |
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
+| `EXO_PIPELINE_TOKEN_RELAY_HOST` | Specific rank-zero interface for the Kimi-K3 TCP pipeline relay. Normally auto-derived for two-rank JACCL; wildcards are rejected, so override only when auto-derivation is unavailable. | Auto |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
 
 **Example usage:**
