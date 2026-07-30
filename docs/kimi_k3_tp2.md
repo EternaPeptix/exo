@@ -162,6 +162,36 @@ result. It is opt-in because the full-logit gather scales with the number of
 prompt positions; measure representative long prompts before enabling it for
 a latency-sensitive production workload.
 
+### Prompt-lookup speculative decode
+
+A compatible MLX-LM build can use repeated token sequences already present in
+the prompt as draft continuations, without loading a separate draft model:
+
+```bash
+export EXO_MLX_PROMPT_LOOKUP_NUM_TOKENS=7
+export EXO_MLX_PROMPT_LOOKUP_MAX_NGRAM_SIZE=4
+export EXO_MLX_PROMPT_LOOKUP_ROUND_TELEMETRY=1
+```
+
+The opt-in is disabled when `EXO_MLX_PROMPT_LOOKUP_NUM_TOKENS` is absent. EXO
+supplies MLX-LM with the complete logical prompt as lookup-only history while
+retaining its two-token post-prefill decode boundary. This is important for
+both fresh and prefix-cache-hit requests: the history seeds only the n-gram
+index and is not processed into the model cache a second time.
+
+This path is experimental. Kimi K3's strict-v3 multi-token target-equivalence
+gate currently fails, so a verified multi-token block can change a
+deterministic greedy completion relative to sequential one-token decode. Keep
+the feature off when exact output reproducibility is required.
+
+The token count must be 1–7, the maximum n-gram size must be 2–64, and
+telemetry must be exactly `0` or `1`. Companion variables without the enabling
+token count are rejected. Pipeline-parallel and batch generation are also
+rejected rather than silently running a different decode path. Tensor
+parallelism remains supported. The MLX-LM checkout must expose the
+`prompt_lookup_history` argument; enabling this option against an older build
+fails at the generation boundary.
+
 ## Validate before the full model
 
 Run the source-only unit suite:

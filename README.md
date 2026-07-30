@@ -319,6 +319,9 @@ exo supports several environment variables for configuration:
 | `EXO_LIBP2P_NAMESPACE` | Custom namespace for cluster isolation | None |
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
 | `EXO_PIPELINE_TOKEN_RELAY_HOST` | Specific rank-zero interface for the Kimi-K3 TCP pipeline relay. Normally auto-derived for two-rank JACCL; wildcards are rejected, so override only when auto-derivation is unavailable. | Auto |
+| `EXO_MLX_PROMPT_LOOKUP_NUM_TOKENS` | Opt in to MLX-LM prompt-lookup speculative decoding, proposing 1–7 tokens per verification. Requires a compatible MLX-LM build; pipeline and batch generation are rejected. | Disabled |
+| `EXO_MLX_PROMPT_LOOKUP_MAX_NGRAM_SIZE` | Maximum prompt-lookup suffix n-gram size (2–64). Requires `EXO_MLX_PROMPT_LOOKUP_NUM_TOKENS`. | `4` |
+| `EXO_MLX_PROMPT_LOOKUP_ROUND_TELEMETRY` | Log per-rank drafted, accepted, committed, and target-cache token counts for every prompt-lookup verification round. Must be `0` or `1` and requires `EXO_MLX_PROMPT_LOOKUP_NUM_TOKENS`. | `0` |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
 
 **Example usage:**

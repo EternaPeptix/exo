@@ -43,6 +43,7 @@ from exo.worker.engines.mlx.generator.generate import (
     extract_top_logprobs,
     patch_embed_tokens,
     prefill,
+    prompt_lookup_config,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.patches.opt_batch_gen import (
@@ -116,6 +117,10 @@ class ExoBatchGenerator:
         self._step_count = 0
         self._supports_token_relay = self.group is not None and any(
             isinstance(layer, PipelineLastLayer) for layer in self.model.layers
+        )
+        prompt_lookup_config(
+            is_pipeline=self._supports_token_relay,
+            is_batch=True,
         )
 
     @property

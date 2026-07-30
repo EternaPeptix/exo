@@ -4,9 +4,13 @@ import math
 import os
 import time
 import uuid
-from typing import Callable, Generator, Literal, cast, get_args
+from dataclasses import dataclass
+from typing import Callable, Generator, Literal, Protocol, TypedDict, cast, get_args
 
 import mlx.core as mx
+from mlx_lm.generate import (
+    GenerationResponse as MlxGenerationResponse,
+)
 from mlx_lm.generate import (
     maybe_quantize_kv_cache,
     stream_generate,
@@ -85,6 +89,166 @@ generation_stream = mx.new_stream(mx.default_device())
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 
 
+@dataclass(frozen=True)
+class _PromptLookupConfig:
+    num_tokens: int
+    max_ngram_size: int
+    round_telemetry: bool
+
+
+class _SpeculativeRoundStatsLike(Protocol):
+    round_index: int
+    source: str
+    drafted_tokens: int
+    accepted_tokens: int
+    committed_tokens: int
+    target_cache_tokens: int
+    cancelled: bool
+
+
+class _PromptLookupStreamKwargs(TypedDict):
+    prompt_lookup_num_tokens: int
+    prompt_lookup_max_ngram_size: int
+    prompt_lookup_history: mx.array
+    speculative_round_callback: Callable[[_SpeculativeRoundStatsLike], None] | None
+
+
+class _PromptLookupStreamGenerate(Protocol):
+    def __call__(
+        self,
+        *,
+        prompt_lookup_num_tokens: int,
+        prompt_lookup_max_ngram_size: int,
+        prompt_lookup_history: mx.array,
+        speculative_round_callback: (
+            Callable[[_SpeculativeRoundStatsLike], None] | None
+        ),
+        **kwargs: object,
+    ) -> Generator[MlxGenerationResponse, None, None]: ...
+
+
+def _strict_env_int(name: str, value: str, *, minimum: int, maximum: int) -> int:
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+    parsed = int(value)
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+    return parsed
+
+
+def _strict_env_flag(name: str, value: str) -> bool:
+    if value not in {"0", "1"}:
+        raise ValueError(f"{name} must be 0 or 1")
+    return value == "1"
+
+
+def prompt_lookup_config(
+    *,
+    is_pipeline: bool,
+    is_batch: bool,
+) -> _PromptLookupConfig | None:
+    """Parse the opt-in MLX-LM prompt-lookup configuration.
+
+    Companion settings without the enabling token count are rejected so a
+    misspelled or incomplete deployment does not silently fall back to normal
+    decode. The upper draft bound matches Kimi K3's transactional target-cache
+    implementation (draft + verification token <= 8).
+    """
+    num_tokens_raw = os.environ.get("EXO_MLX_PROMPT_LOOKUP_NUM_TOKENS")
+    max_ngram_raw = os.environ.get("EXO_MLX_PROMPT_LOOKUP_MAX_NGRAM_SIZE")
+    telemetry_raw = os.environ.get("EXO_MLX_PROMPT_LOOKUP_ROUND_TELEMETRY")
+
+    if num_tokens_raw is None:
+        configured_companions = [
+            name
+            for name, value in (
+                ("EXO_MLX_PROMPT_LOOKUP_MAX_NGRAM_SIZE", max_ngram_raw),
+                ("EXO_MLX_PROMPT_LOOKUP_ROUND_TELEMETRY", telemetry_raw),
+            )
+            if value is not None
+        ]
+        if configured_companions:
+            raise ValueError(
+                f"{', '.join(configured_companions)} requires "
+                "EXO_MLX_PROMPT_LOOKUP_NUM_TOKENS"
+            )
+        return None
+
+    num_tokens = _strict_env_int(
+        "EXO_MLX_PROMPT_LOOKUP_NUM_TOKENS",
+        num_tokens_raw,
+        minimum=1,
+        maximum=7,
+    )
+    max_ngram_size = _strict_env_int(
+        "EXO_MLX_PROMPT_LOOKUP_MAX_NGRAM_SIZE",
+        max_ngram_raw if max_ngram_raw is not None else "4",
+        minimum=2,
+        maximum=64,
+    )
+    round_telemetry = _strict_env_flag(
+        "EXO_MLX_PROMPT_LOOKUP_ROUND_TELEMETRY",
+        telemetry_raw if telemetry_raw is not None else "0",
+    )
+
+    if is_pipeline:
+        raise ValueError(
+            "MLX prompt-lookup decoding does not support pipeline parallelism"
+        )
+    if is_batch:
+        raise ValueError("MLX prompt-lookup decoding does not support batch generation")
+
+    return _PromptLookupConfig(
+        num_tokens=num_tokens,
+        max_ngram_size=max_ngram_size,
+        round_telemetry=round_telemetry,
+    )
+
+
+def _prompt_lookup_round_callback(
+    group: mx.distributed.Group | None,
+) -> Callable[[_SpeculativeRoundStatsLike], None]:
+    rank = group.rank() if group is not None else 0
+
+    def report(stats: _SpeculativeRoundStatsLike) -> None:
+        logger.info(
+            "MLX prompt-lookup round: "
+            f"rank={rank}, "
+            f"round={stats.round_index}, "
+            f"source={stats.source}, "
+            f"drafted={stats.drafted_tokens}, "
+            f"accepted={stats.accepted_tokens}, "
+            f"committed={stats.committed_tokens}, "
+            f"target_cache={stats.target_cache_tokens}, "
+            f"cancelled={stats.cancelled}"
+        )
+
+    return report
+
+
+def prompt_lookup_stream_kwargs(
+    config: _PromptLookupConfig | None,
+    group: mx.distributed.Group | None,
+    history: mx.array,
+) -> _PromptLookupStreamKwargs | None:
+    if config is None:
+        return None
+    if len(history) < 2:
+        raise ValueError("MLX prompt-lookup decoding requires at least two tokens")
+
+    return {
+        "prompt_lookup_num_tokens": config.num_tokens,
+        "prompt_lookup_max_ngram_size": config.max_ngram_size,
+        # EXO pre-fills its cache directly, then gives stream_generate only the
+        # final two-token decode boundary. Seed lookup from the complete logical
+        # history without asking MLX-LM to process those tokens a second time.
+        "prompt_lookup_history": history,
+        "speculative_round_callback": (
+            _prompt_lookup_round_callback(group) if config.round_telemetry else None
+        ),
+    }
+
+
 def _prefill_step_size(
     num_tokens: int,
     *,
@@ -112,13 +276,9 @@ def _prefill_step_size(
         )
     )
     if long_context_min < 1:
-        raise ValueError(
-            "EXO_MLX_PIPELINE_LONG_CONTEXT_MIN_TOKENS must be positive"
-        )
+        raise ValueError("EXO_MLX_PIPELINE_LONG_CONTEXT_MIN_TOKENS must be positive")
     if long_context_step < 4:
-        raise ValueError(
-            "EXO_MLX_PIPELINE_LONG_CONTEXT_STEP_SIZE must be at least 4"
-        )
+        raise ValueError("EXO_MLX_PIPELINE_LONG_CONTEXT_STEP_SIZE must be at least 4")
     if num_tokens < long_context_min:
         return base_step
 
@@ -132,9 +292,7 @@ def _prefill_step_size(
         )
     )
     if max_attention_cells < 0:
-        raise ValueError(
-            "EXO_MLX_MAX_ATTENTION_CELLS_PER_CHUNK cannot be negative"
-        )
+        raise ValueError("EXO_MLX_MAX_ATTENTION_CELLS_PER_CHUNK cannot be negative")
     if max_attention_cells == 0:
         return long_context_step
 
@@ -151,9 +309,7 @@ def _prefill_memory_log_interval() -> int:
     """Return the optional chunk interval for synchronized MLX memory traces."""
     interval = int(os.environ.get("EXO_MLX_PREFILL_MEMORY_LOG_INTERVAL", "0"))
     if interval < 0:
-        raise ValueError(
-            "EXO_MLX_PREFILL_MEMORY_LOG_INTERVAL cannot be negative"
-        )
+        raise ValueError("EXO_MLX_PREFILL_MEMORY_LOG_INTERVAL cannot be negative")
     return interval
 
 
@@ -528,9 +684,7 @@ def prefill(
             pipeline_divisor=pipeline_divisor,
         )
         effective_chunk_size = (
-            prefill_step_size // pipeline_divisor
-            if is_pipeline
-            else prefill_step_size
+            prefill_step_size // pipeline_divisor if is_pipeline else prefill_step_size
         )
         logger.info(
             f"Prefill step size: nominal={prefill_step_size}, "
@@ -769,6 +923,10 @@ def mlx_generate(
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
     is_pipeline = _has_pipeline_communication_layer(model)
+    prompt_lookup_configuration = prompt_lookup_config(
+        is_pipeline=is_pipeline,
+        is_batch=False,
+    )
     # TODO: Randomise task seed and set in taskparams, instead of hard coding as 42.
     seed = task.seed or 42
     mx.random.seed(seed)
@@ -955,6 +1113,7 @@ def mlx_generate(
 
     max_tokens = task.max_output_tokens or MAX_TOKENS
     relay_enabled = is_pipeline and not task.logprobs
+    decode_sampler = sampler
     with _pipeline_token_relay_scope(model, relay_enabled):
         if relay_enabled:
             relay_context = get_active_relay_context(model)
@@ -962,8 +1121,10 @@ def mlx_generate(
                 raise RuntimeError("pipeline token relay failed to initialize")
             base_sampler = sampler
 
-            def sampler(logprobs: mx.array) -> mx.array:
+            def relay_sampler(logprobs: mx.array, /) -> mx.array:
                 return relay_sampled_tokens(base_sampler(logprobs), relay_context)
+
+            decode_sampler = relay_sampler
 
         accumulated_text = ""
         generated_text_parts: list[str] = []
@@ -977,26 +1138,50 @@ def mlx_generate(
         if not is_pipeline:
             mx_barrier(group)
 
-        for completion_tokens, out in enumerate(
-            stream_generate(
+        prompt_lookup_kwargs = prompt_lookup_stream_kwargs(
+            prompt_lookup_configuration,
+            group,
+            all_prompt_tokens,
+        )
+        # MLX-LM normally launches token N+1 before yielding token N. If token N
+        # is EOS (or EXO matches a stop sequence), abandoning that lookahead
+        # leaves pipeline rank zero in an unmatched send while the final rank
+        # enters the completion barrier.
+        if prompt_lookup_kwargs is None:
+            decode_outputs = stream_generate(
                 model=model,
                 tokenizer=tokenizer,
                 prompt=last_token,
                 max_tokens=max_tokens,
-                # MLX-LM normally launches token N+1 before yielding token N.
-                # If token N is EOS (or EXO matches a stop sequence), abandoning
-                # that lookahead leaves pipeline rank zero in an unmatched send
-                # while the final rank enters the completion barrier.
                 async_lookahead=not is_pipeline,
-                sampler=sampler,
+                sampler=decode_sampler,
                 logits_processors=logits_processors,
                 prompt_cache=caches,
                 prefill_step_size=1,
                 kv_group_size=KV_GROUP_SIZE,
                 kv_bits=KV_BITS,
-            ),
-            start=1,
-        ):
+            )
+        else:
+            prompt_lookup_generate = cast(
+                _PromptLookupStreamGenerate,
+                stream_generate,
+            )
+            decode_outputs = prompt_lookup_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=last_token,
+                max_tokens=max_tokens,
+                async_lookahead=not is_pipeline,
+                sampler=decode_sampler,
+                logits_processors=logits_processors,
+                prompt_cache=caches,
+                prefill_step_size=1,
+                kv_group_size=KV_GROUP_SIZE,
+                kv_bits=KV_BITS,
+                **prompt_lookup_kwargs,
+            )
+
+        for completion_tokens, out in enumerate(decode_outputs, start=1):
             generated_text_parts.append(out.text)
             accumulated_text += out.text
 
