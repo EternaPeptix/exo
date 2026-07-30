@@ -18,15 +18,18 @@ The cluster work is published under the same branch name in all three forks:
 
 | Repository | Public branch | Scope |
 | --- | --- | --- |
-| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-exo-mlx-stack) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, reproducible benchmarks, and target-divergence diagnostics |
-| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-exo-mlx-stack) | Kimi K3 model support, deterministic generation control, vocabulary-parallel output head, exact expert path, and opt-in segmented decode experiment |
-| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-exo-mlx-stack) | Core eval-walk and gather-index overhead reductions plus the accepted CUDA/MoE experiments from the heterogeneous-cluster work |
+| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-exo-mlx-stack) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, prompt-lookup integration, reproducible benchmarks, and target-divergence diagnostics |
+| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-exo-mlx-stack) | Kimi K3 model support, deterministic generation control, vocabulary-parallel output head, exact expert path, opt-in segmented decode, and transactional prompt-lookup speculation |
+| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-exo-mlx-stack) | Exact Darwin/JACCL lineage used by the benchmarked Mac runtime, plus eval-walk and gather-index CPU-overhead reductions |
 
 This coordinated branch is experimental. Its exact path remains the reference
 configuration. The opt-in segmented decode experiment improved median short
 decode throughput from `12.1544` to `12.6206` tok/s on the two-Mac TP2 setup,
 but changed the deterministic completion digest. It is published for
 reproduction and further investigation, not enabled as a production default.
+Earlier Spark CUDA/MoE experiments remain available on the separate
+[`experiment/exo-mlx-inference-optimizations`](https://github.com/EternaPeptix/mlx/tree/experiment/exo-mlx-inference-optimizations)
+branch; they were not replayed onto this newer JACCL base.
 
 The companion width-2 diagnostic also found that batched target verification
 first diverges in the first recurrent KDA layer. The sampled top-1 continuation
@@ -43,7 +46,8 @@ checkpoint, so they remain research evidence rather than production defaults.
 | --- | --- |
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
-| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-exo-mlx-stack) exact-path base commit `52ecaae77f461d7ae8a5e3ac1260d23203e4ebba`; coordinated experimental runtime commit `21279f696002a0f278988f4d3cf37374520168bb` |
+| Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-exo-mlx-stack) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
+| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-exo-mlx-stack) exact-path base commit `52ecaae77f461d7ae8a5e3ac1260d23203e4ebba`; coordinated experimental runtime commit `d8e711bb4a97b2d520507ca43ab1d158dcf7720e` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v1` |
 
@@ -57,7 +61,7 @@ at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@21279f696002a0f278988f4d3cf37374520168bb"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@d8e711bb4a97b2d520507ca43ab1d158dcf7720e"
 ```
 
 ## License and trust boundary
