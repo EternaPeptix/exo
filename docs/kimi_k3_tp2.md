@@ -147,6 +147,7 @@ export EXO_MLX_RANK_LOCAL_LOADER="$EXO_REPO/scripts/kimi_k3_tp2/rank_local_loade
 export EXO_MLX_RANK_LOCAL_CHECKPOINT="/models/kimi-k3-tp2/rank{rank}"
 export EXO_MLX_RANK_LOCAL_VERIFY_HASHES=1
 export EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1
+export EXO_MLX_K3_VOCAB_PARALLEL_GREEDY=1
 ```
 
 The EXO MLX worker resolves `{rank}` from the distributed rank, verifies the
@@ -160,11 +161,14 @@ The loader file is hash-pinned by EXO. `.gitattributes` forces LF line endings
 so a checkout cannot silently change that hash.
 
 The vocabulary-parallel option row-shards Kimi K3's untied output projection
-after the rank-local weights are loaded. Each tensor rank computes half of the
-vocabulary projection, then an all-gather reconstructs the standard full-logit
-result. It is opt-in because the full-logit gather scales with the number of
-prompt positions; measure representative long prompts before enabling it for
-a latency-sensitive production workload.
+after the rank-local weights are loaded. Its standard path all-gathers the
+shards to reconstruct full logits. The separate compact-greedy opt-in avoids
+that full-vocabulary gather and log normalization only for temperature-zero
+requests that disable logprobs and have no logits processors. Each rank
+contributes its local maximum and global token ID; rank-ordered argmax retains
+the standard lowest-token-ID tie break. Non-greedy sampling, prompt lookup,
+pipeline parallelism, processors (including benchmark EOS suppression), and
+logprob requests automatically retain the full-logit path.
 
 ### Prompt-lookup speculative decode
 

@@ -113,6 +113,10 @@ class _PromptLookupStreamKwargs(TypedDict):
     speculative_round_callback: Callable[[_SpeculativeRoundStatsLike], None] | None
 
 
+class _GreedyVocabParallelStreamKwargs(TypedDict, total=False):
+    greedy_vocab_parallel_no_logprobs: bool
+
+
 class _PromptLookupStreamGenerate(Protocol):
     def __call__(
         self,
@@ -140,6 +144,32 @@ def _strict_env_flag(name: str, value: str) -> bool:
     if value not in {"0", "1"}:
         raise ValueError(f"{name} must be 0 or 1")
     return value == "1"
+
+
+def greedy_vocab_parallel_stream_kwargs(
+    *,
+    temperature: float,
+    logprobs: bool,
+    has_logits_processors: bool,
+    is_pipeline: bool,
+    speculative: bool,
+) -> _GreedyVocabParallelStreamKwargs:
+    """Enable compact TP argmax only for the exact request shape it supports."""
+
+    enabled = _strict_env_flag(
+        "EXO_MLX_K3_VOCAB_PARALLEL_GREEDY",
+        os.environ.get("EXO_MLX_K3_VOCAB_PARALLEL_GREEDY", "0"),
+    )
+    if (
+        not enabled
+        or temperature != 0.0
+        or logprobs
+        or has_logits_processors
+        or is_pipeline
+        or speculative
+    ):
+        return {}
+    return {"greedy_vocab_parallel_no_logprobs": True}
 
 
 def prompt_lookup_config(
@@ -1143,6 +1173,15 @@ def mlx_generate(
             group,
             all_prompt_tokens,
         )
+        greedy_vocab_parallel_kwargs = greedy_vocab_parallel_stream_kwargs(
+            temperature=(
+                task.temperature if task.temperature is not None else 0.7
+            ),
+            logprobs=task.logprobs,
+            has_logits_processors=bool(logits_processors),
+            is_pipeline=is_pipeline,
+            speculative=prompt_lookup_kwargs is not None,
+        )
         # MLX-LM normally launches token N+1 before yielding token N. If token N
         # is EOS (or EXO matches a stop sequence), abandoning that lookahead
         # leaves pipeline rank zero in an unmatched send while the final rank
@@ -1160,6 +1199,7 @@ def mlx_generate(
                 prefill_step_size=1,
                 kv_group_size=KV_GROUP_SIZE,
                 kv_bits=KV_BITS,
+                **greedy_vocab_parallel_kwargs,
             )
         else:
             prompt_lookup_generate = cast(
