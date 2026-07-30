@@ -18,9 +18,9 @@ The cluster work is published under the same branch name in all three forks:
 
 | Repository | Public branch | Scope |
 | --- | --- | --- |
-| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-distributed-optimizations) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, prompt-lookup integration, reproducible benchmarks, and target-divergence diagnostics |
-| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-distributed-optimizations) | Kimi K3 model support, deterministic generation control, vocabulary-parallel output head, exact expert path, opt-in segmented decode, transactional prompt-lookup speculation, and eager asynchronous decode boundaries |
-| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-distributed-optimizations) | Exact Darwin/JACCL lineage used by the benchmarked Mac runtime, plus eval-walk and gather-index CPU-overhead reductions |
+| EXO | [`EternaPeptix/exo`](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack) | RDMA striping, rank-local checkpoints, TP2 placement/runtime integration, prompt-lookup integration, reproducible benchmarks, and target-divergence diagnostics |
+| MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack) | Kimi K3 model support, deterministic generation control, vocabulary-parallel output head, exact expert path, asynchronous decode, authoritative MoE-front packing, and exact row-tiled KDA prefill |
+| MLX | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack) | Exact Darwin/JACCL lineage used by the benchmarked Mac runtime, plus eval-walk and gather-index CPU-overhead reductions |
 
 This coordinated branch is experimental. Its exact path remains the reference
 configuration. The opt-in segmented decode experiment improved median short
@@ -31,6 +31,13 @@ The opt-in `laguna8` hidden-state asynchronous schedule improved a matched
 three-repetition exact run from `12.0465` to `12.9399` tok/s (`7.4%`) while
 retaining the canonical completion digest and approximately `414 GB` peak
 memory per rank.
+Adding the authoritative packed MoE front to that exact schedule produced
+`12.9576` tok/s versus its matched `12.8921` asynchronous control (`+0.51%`)
+over five repetitions, retained the canonical digest, and removed
+approximately `6.93 GiB` of persistent duplicate projection storage per rank.
+The row-tiled KDA prefill kernel is bit-exact and substantially faster in
+isolated KDA measurements, but a matched full-model TP2 prefill result is not
+yet claimed.
 Earlier Spark CUDA/MoE experiments remain available on the separate
 [`experiment/exo-mlx-inference-optimizations`](https://github.com/EternaPeptix/mlx/tree/experiment/exo-mlx-inference-optimizations)
 branch; they were not replayed onto this newer JACCL base.
@@ -50,8 +57,8 @@ checkpoint, so they remain research evidence rather than production defaults.
 | --- | --- |
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
-| Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-distributed-optimizations) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
-| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-distributed-optimizations) exact-path base commit `52ecaae77f461d7ae8a5e3ac1260d23203e4ebba`; asynchronous runtime commit `14a8c6bfeccdfd64aac70596571eb6ac13fd940d` |
+| Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
+| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack) coordinated commit `c7b1c3b77e91cd47e91885f186fa33ba274d8bf8` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v1` |
 
@@ -65,7 +72,7 @@ at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@14a8c6bfeccdfd64aac70596571eb6ac13fd940d"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@c7b1c3b77e91cd47e91885f186fa33ba274d8bf8"
 ```
 
 ## License and trust boundary
@@ -147,6 +154,8 @@ export EXO_MLX_RANK_LOCAL_LOADER="$EXO_REPO/scripts/kimi_k3_tp2/rank_local_loade
 export EXO_MLX_RANK_LOCAL_CHECKPOINT="/models/kimi-k3-tp2/rank{rank}"
 export EXO_MLX_RANK_LOCAL_VERIFY_HASHES=1
 export EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1
+export MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT=1
+export MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL=1
 ```
 
 The EXO MLX worker resolves `{rank}` from the distributed rank, verifies the
@@ -165,6 +174,12 @@ vocabulary projection, then an all-gather reconstructs the standard full-logit
 result. It is opt-in because the full-logit gather scales with the number of
 prompt positions; measure representative long prompts before enabling it for
 a latency-sensitive production workload.
+
+The authoritative packed MoE-front and row-tiled KDA prefill paths are also
+opt-in. The former avoids keeping unpacked copies of the four packed
+projections; the latter activates only for supported Metal prefill shapes of
+at least 128 tokens. Unsupported shapes use the reference path. Keep the
+variables unset when reproducing a feature-off control.
 
 ### Prompt-lookup speculative decode
 
