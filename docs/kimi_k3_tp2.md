@@ -288,6 +288,14 @@ checkpoint's layer-0 KDA projection, normalization, convolution, recurrence,
 gate, output, and cache stages. Both tools are diagnostic only: they reproduce
 and localize a failure but never relax the strict promotion gate.
 
+The decoder-layer localizer also has a fail-closed candidate selector for the
+ordinary non-transactional width-2 short convolution. Run the accepted control
+with `K3_DECODER_LAYER_LOCALIZER_EXACT_WIDE_SHORT_CONV=0`, then repeat with it
+set to `1` against the matching MLX-LM candidate. A useful candidate artifact
+must make the controlled direct-attention convolution/output/cache stages exact
+while the separately measured history-producing transaction path remains exact;
+the full-model layer-0 endpoint reproduction check is mandatory in both runs.
+
 ## Reference performance
 
 On two 512 GB M3 Ultra systems connected by a four-rail JACCL fabric, the

@@ -25,9 +25,29 @@ def test_runtime_flags_require_accepted_control_and_reject_candidate(monkeypatch
     for name, value in localizer.kda.REQUIRED_RUNTIME_ENV.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv(localizer.kda.CANDIDATE_EXACT_ENV, "0")
+    monkeypatch.setenv(
+        localizer.kda.CANDIDATE_EXACT_WIDE_SHORT_CONV_ENV,
+        "0",
+    )
     actual = localizer.require_runtime_flags()
     assert actual[localizer.kda.CANDIDATE_EXACT_ENV] == "0"
+    assert actual[localizer.kda.CANDIDATE_EXACT_WIDE_SHORT_CONV_ENV] == "0"
 
+    monkeypatch.setenv(
+        localizer.kda.CANDIDATE_EXACT_WIDE_SHORT_CONV_ENV,
+        "1",
+    )
+    actual = localizer.require_runtime_flags()
+    assert actual[localizer.kda.CANDIDATE_EXACT_WIDE_SHORT_CONV_ENV] == "1"
+
+    monkeypatch.setenv(
+        localizer.kda.CANDIDATE_EXACT_WIDE_SHORT_CONV_ENV,
+        "true",
+    )
+    with pytest.raises(localizer.kda.LocalizerError, match="must be 0 or 1"):
+        localizer.require_runtime_flags()
+
+    monkeypatch.setenv(localizer.kda.CANDIDATE_EXACT_WIDE_SHORT_CONV_ENV, "0")
     monkeypatch.setenv(localizer.kda.CANDIDATE_EXACT_ENV, "1")
     with pytest.raises(localizer.LocalizerError, match="accepted v6 control"):
         localizer.require_runtime_flags()
@@ -178,6 +198,8 @@ def test_launcher_pins_mesh_and_every_accepted_v6_feature():
     assert "--backend jaccl" in launcher
     assert "MLX_JACCL_RING must be unset" in launcher
     assert "MLX_LM_KIMI_K3_EXACT_SPECULATIVE_KDA=0" in launcher
+    assert "K3_DECODER_LAYER_LOCALIZER_EXACT_WIDE_SHORT_CONV" in launcher
+    assert "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV=" in launcher
     for feature_state in (
         "EXO_MLX_K3_VOCAB_PARALLEL_HEAD=1",
         "MLX_LM_KIMI_K3_FUSED_EXPERTS=1",

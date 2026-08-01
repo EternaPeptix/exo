@@ -62,6 +62,7 @@ REQUIRED_RUNTIME_ENV = {
     "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE": "hidden",
 }
 CANDIDATE_EXACT_ENV = "MLX_LM_KIMI_K3_EXACT_SPECULATIVE_KDA"
+CANDIDATE_EXACT_WIDE_SHORT_CONV_ENV = "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV"
 
 
 class LocalizerError(diagnostic.DiagnosticError):
@@ -106,10 +107,14 @@ def require_runtime_flags() -> dict[str, str]:
             "current accepted runtime flags are not pinned: "
             + json.dumps(mismatches, sort_keys=True, separators=(",", ":"))
         )
-    candidate_value = os.environ.get(CANDIDATE_EXACT_ENV, "0")
-    if candidate_value not in {"0", "1"}:
-        raise LocalizerError(f"{CANDIDATE_EXACT_ENV} must be 0 or 1")
-    actual[CANDIDATE_EXACT_ENV] = candidate_value
+    for candidate_env in (
+        CANDIDATE_EXACT_ENV,
+        CANDIDATE_EXACT_WIDE_SHORT_CONV_ENV,
+    ):
+        candidate_value = os.environ.get(candidate_env, "0")
+        if candidate_value not in {"0", "1"}:
+            raise LocalizerError(f"{candidate_env} must be 0 or 1")
+        actual[candidate_env] = candidate_value
     return actual
 
 

@@ -42,7 +42,11 @@ parallel checkpoints.
   transaction's history-producing KDA path; complete-model layer-0 endpoint
   reproduction is mandatory before an artifact can be written.
 - `launch_k3_decoder_layer_stage_localizer_current.sh` runs that checker only
-  on the accepted v6 JACCL mesh and rejects candidate KDA rewrites.
+  on the accepted v6 JACCL mesh. It rejects the superseded speculative-KDA
+  rewrite and defaults the exact direct-wide short-convolution candidate off;
+  set `K3_DECODER_LAYER_LOCALIZER_EXACT_WIDE_SHORT_CONV=1` for the explicit
+  candidate run. The selector is validated as exactly `0` or `1` and is
+  attested in the artifact.
 - `transport-jaccl-tp2.example.json` documents the explicit topology contract
   that both ranks must receive; it contains placeholders, not deployment
   inventory.

@@ -89,17 +89,24 @@ mlx_core_override="${K3_MLX_CORE_OVERRIDE}"
 
 transport_mode="${K3_DECODER_LAYER_LOCALIZER_TRANSPORT_MODE:-mesh}"
 file_hashes="${K3_DECODER_LAYER_LOCALIZER_FILE_HASHES:-0}"
+exact_wide_short_conv="${K3_DECODER_LAYER_LOCALIZER_EXACT_WIDE_SHORT_CONV:-0}"
 [[ "${transport_mode}" == "mesh" ]] ||
   die "K3_DECODER_LAYER_LOCALIZER_TRANSPORT_MODE must be mesh"
 [[ "${file_hashes}" == "0" || "${file_hashes}" == "1" ]] ||
   die "K3_DECODER_LAYER_LOCALIZER_FILE_HASHES must be 0 or 1"
+[[ "${exact_wide_short_conv}" == "0" || "${exact_wide_short_conv}" == "1" ]] ||
+  die "K3_DECODER_LAYER_LOCALIZER_EXACT_WIDE_SHORT_CONV must be 0 or 1"
 [[ "${MLX_JACCL_RING+x}" != "x" ]] ||
   die "MLX_JACCL_RING must be unset for the authenticated mesh"
 unset MLX_JACCL_RING
 
 pythonpath="${mlx_core_override}:${mlx_lm_root}:${localizer_root}:${tp_tools_root}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-artifact="${artifact_root}/k3-decoder-layer-stage-localizer-current-128p-w2-${stamp}-p$$-mesh.json"
+variant="control"
+if [[ "${exact_wide_short_conv}" == "1" ]]; then
+  variant="exact-wide-short-conv"
+fi
+artifact="${artifact_root}/k3-decoder-layer-stage-localizer-current-128p-w2-${stamp}-p$$-mesh-${variant}.json"
 arguments=(
   "${localizer_root}/k3_decoder_layer_stage_localizer.py"
   --rank-checkpoint "${rank0_root}"
@@ -142,5 +149,6 @@ exec "${launcher}" \
   --env MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES=laguna8 \
   --env MLX_LM_KIMI_K3_ASYNC_DECODE_STATE=hidden \
   --env MLX_LM_KIMI_K3_EXACT_SPECULATIVE_KDA=0 \
+  --env "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV=${exact_wide_short_conv}" \
   -- \
   "${arguments[@]}"

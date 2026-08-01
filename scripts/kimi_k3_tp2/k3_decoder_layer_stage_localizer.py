@@ -103,13 +103,15 @@ class LayerCapture:
 
 
 def require_runtime_flags() -> dict[str, str]:
-    """Require exactly the accepted v6 runtime, with no candidate rewrite."""
+    """Require the accepted v6 base plus an attested short-conv selector."""
 
     actual = kda.require_runtime_flags()
     if actual[kda.CANDIDATE_EXACT_ENV] != "0":
         raise LocalizerError(
             f"{kda.CANDIDATE_EXACT_ENV} must be 0 for the accepted v6 control"
         )
+    if actual[kda.CANDIDATE_EXACT_WIDE_SHORT_CONV_ENV] not in {"0", "1"}:
+        raise LocalizerError("exact wide short-conv candidate is not attested")
     return actual
 
 
