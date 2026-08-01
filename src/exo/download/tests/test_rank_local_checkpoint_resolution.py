@@ -50,6 +50,21 @@ def _pin_synthetic_config_hash(  # pyright: ignore[reportUnusedFunction]
         "SUPPORTED_SOURCE_CONFIG_SHA256",
         TEST_CONFIG_SHA256,
     )
+    synthetic_license = b"synthetic Kimi K3 license"
+    monkeypatch.setattr(
+        download_utils,
+        "PINNED_RANK_LOCAL_METADATA_FILES",
+        {
+            "LICENSE": {
+                "bytes": len(synthetic_license),
+                "sha256": hashlib.sha256(synthetic_license).hexdigest(),
+            },
+            "config.json": {
+                "bytes": len(TEST_CONFIG.encode()),
+                "sha256": TEST_CONFIG_SHA256,
+            },
+        },
+    )
     loader = tmp_path / "rank_local_loader.py"
     loader.write_text("# synthetic audited loader\n", encoding="utf-8")
     monkeypatch.setattr(
@@ -399,14 +414,36 @@ def test_metadata_payload_is_always_hashed_during_readiness(
 ) -> None:
     checkpoint = _set_rank_template(monkeypatch, tmp_path)
     _rank_checkpoint(checkpoint)
+    config = checkpoint / "config.json"
+    config.write_text('{"model_type":"kimi_k4"}', encoding="utf-8")
+
+    with pytest.raises(RankLocalConfigurationError, match="metadata checksum"):
+        resolve_existing_model_for_shard(MODEL_ID, _tensor_shard())
+
+
+def test_identical_but_unpinned_executable_metadata_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _set_rank_template(monkeypatch, tmp_path)
+    _rank_checkpoint(checkpoint)
+    expected_metadata = dict(download_utils.PINNED_RANK_LOCAL_METADATA_FILES)
+    expected_metadata["tokenization_kimi.py"] = {
+        "bytes": 1,
+        "sha256": "0" * 64,
+    }
+    monkeypatch.setattr(
+        download_utils,
+        "PINNED_RANK_LOCAL_METADATA_FILES",
+        expected_metadata,
+    )
+    executable = checkpoint / "tokenization_kimi.py"
+    executable.write_text("raise RuntimeError('malicious')\n", encoding="utf-8")
     manifest_path = checkpoint / "tp_manifest.json"
     manifest = _json_object(manifest_path)
     metadata_files = _object(manifest["metadata_files"])
-    tokenizer = checkpoint / "tokenizer.json"
-    tokenizer.write_text('{"version":"1"}', encoding="utf-8")
-    metadata_files[tokenizer.name] = {
-        "bytes": tokenizer.stat().st_size,
-        "sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
+    metadata_files[executable.name] = {
+        "bytes": executable.stat().st_size,
+        "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
     }
     manifest["metadata_contract_sha256"] = (
         download_utils._rank_local_metadata_contract_sha256(
@@ -414,9 +451,8 @@ def test_metadata_payload_is_always_hashed_during_readiness(
         )
     )
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    tokenizer.write_text('{"version":"2"}', encoding="utf-8")
 
-    with pytest.raises(RankLocalConfigurationError, match="metadata checksum"):
+    with pytest.raises(RankLocalConfigurationError, match="authenticated source"):
         resolve_existing_model_for_shard(MODEL_ID, _tensor_shard())
 
 

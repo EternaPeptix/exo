@@ -55,9 +55,7 @@ from exo.shared.types.worker.shards import (
     TensorShardMetadata,
 )
 from exo.worker.engines.mlx.rank_local_checkpoint import (
-    ALLOWED_RANK_LOCAL_METADATA_FILENAMES,
-    RANK_LOCAL_LICENSE_FILENAMES,
-    REQUIRED_RANK_LOCAL_METADATA_FILENAMES,
+    PINNED_RANK_LOCAL_METADATA_FILES,
     SUPPORTED_LOADER_SCHEMA,
     SUPPORTED_MLX_LM_COMMIT,
     SUPPORTED_MLX_LM_KIMI_K3_SHA256,
@@ -1356,7 +1354,7 @@ def _validate_rank_local_metadata(
 
     normalized: dict[str, dict[str, object]] = {}
     for filename, raw_record in raw_metadata.items():
-        if filename not in ALLOWED_RANK_LOCAL_METADATA_FILENAMES:
+        if filename not in PINNED_RANK_LOCAL_METADATA_FILES:
             raise RankLocalConfigurationError(
                 f"rank-local checkpoint metadata is not allowlisted: {filename}"
             )
@@ -1365,9 +1363,7 @@ def _validate_rank_local_metadata(
             raise RankLocalConfigurationError(
                 f"non-canonical rank-local metadata filename {filename!r}"
             )
-        record = _rank_local_object(
-            raw_record, f"manifest metadata record {filename}"
-        )
+        record = _rank_local_object(raw_record, f"manifest metadata record {filename}")
         if set(record) != {"bytes", "sha256"}:
             raise RankLocalConfigurationError(
                 f"malformed rank-local metadata record for {filename}"
@@ -1386,11 +1382,7 @@ def _validate_rank_local_metadata(
                 f"malformed rank-local metadata record for {filename}"
             )
         path = checkpoint / filename
-        if (
-            path.is_symlink()
-            or not path.is_file()
-            or path.stat().st_size != byte_count
-        ):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != byte_count:
             raise RankLocalConfigurationError(
                 f"rank-local metadata is missing or truncated: {path}"
             )
@@ -1400,15 +1392,10 @@ def _validate_rank_local_metadata(
             )
         normalized[filename] = {"bytes": byte_count, "sha256": checksum}
 
-    missing = REQUIRED_RANK_LOCAL_METADATA_FILENAMES - normalized.keys()
-    if missing:
+    if normalized != PINNED_RANK_LOCAL_METADATA_FILES:
         raise RankLocalConfigurationError(
-            f"rank-local checkpoint metadata is missing required files: "
-            f"{sorted(missing)}"
-        )
-    if not RANK_LOCAL_LICENSE_FILENAMES.intersection(normalized):
-        raise RankLocalConfigurationError(
-            "rank-local checkpoint metadata is missing the Kimi K3 license"
+            "rank-local checkpoint metadata differs from the authenticated "
+            "source contract"
         )
     if normalized["config.json"]["sha256"] != source.get("config_sha256"):
         raise RankLocalConfigurationError(

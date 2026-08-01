@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -70,6 +71,39 @@ def write_pinned_test_metadata(
     )
     monkeypatch.setattr(
         checkpoint, "SOURCE_INDEX_SHA256", checkpoint._sha256_file(index_path)
+    )
+    pin_test_metadata(monkeypatch, metadata_dir, {"config.json"})
+
+
+def pin_test_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_dir: Path,
+    names: set[str],
+) -> dict[str, dict[str, int | str]]:
+    records = {
+        name: {
+            "bytes": (metadata_dir / name).stat().st_size,
+            "sha256": checkpoint._sha256_file(metadata_dir / name),
+        }
+        for name in sorted(names)
+    }
+    monkeypatch.setattr(checkpoint, "PINNED_METADATA_FILES", records)
+    monkeypatch.setattr(checkpoint, "ALLOWED_METADATA_FILENAMES", frozenset(records))
+    monkeypatch.setattr(checkpoint, "REQUIRED_METADATA_FILENAMES", frozenset(records))
+    return records
+
+
+def pin_test_legacy_manifests(
+    monkeypatch: pytest.MonkeyPatch,
+    rank_dirs: list[Path],
+) -> None:
+    monkeypatch.setattr(
+        checkpoint,
+        "LEGACY_MANIFEST_SHA256",
+        {
+            rank: checkpoint._sha256_file(root / "tp_manifest.json")
+            for rank, root in enumerate(rank_dirs)
+        },
     )
 
 
@@ -348,6 +382,803 @@ def test_source_free_resume_rejects_file_with_mismatched_safetensors_header(
             source_dir=source_dir,
             cache_dir=cache_dir,
         )
+
+
+def write_legacy_upgrade_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[Path], str, str, list[dict], Path]:
+    tensor_name = "language_model.model.layers.0.self_attn.A_log"
+    filename = "model-00001-of-00185.safetensors"
+    metadata_dir = tmp_path / "metadata"
+    write_pinned_test_metadata(
+        metadata_dir,
+        monkeypatch,
+        {tensor_name: filename},
+    )
+    (metadata_dir / "LICENSE").write_text("Kimi K3 license text\n")
+    (metadata_dir / "tokenizer.json").write_text('{"version": "test"}\n')
+    pin_test_metadata(
+        monkeypatch,
+        metadata_dir,
+        {"LICENSE", "config.json", "tokenizer.json"},
+    )
+    source_path = tmp_path / "source" / filename
+    write_synthetic_safetensors(
+        source_path,
+        {tensor_name: ("F32", seq((6,), np.float32))},
+    )
+    rank_dirs = [tmp_path / "rank0", tmp_path / "rank1"]
+    checkpoint._copy_metadata_files(metadata_dir, rank_dirs)
+    contract = KimiK3ShardingContract(synthetic_config(), world_size=2)
+    manifests: list[dict] = []
+    with SafeTensorFile(source_path) as source:
+        for rank, rank_dir in enumerate(rank_dirs):
+            desc = source.tensors[tensor_name]
+            plan = contract.plan(desc, rank)
+            assert plan is not None
+            with monkeypatch.context() as legacy:
+                legacy.setattr(checkpoint, "SCHEMA", checkpoint.LEGACY_SCHEMA)
+                record = write_rank_shard(
+                    source,
+                    rank_dir / filename,
+                    [plan],
+                    rank=rank,
+                    world_size=2,
+                    max_buffer_bytes=64,
+                )
+            tensor = checkpoint._tensor_manifest(plan, filename)
+            record["tensors"] = {tensor_name: tensor}
+            index = {
+                "metadata": {
+                    "total_size": tensor["bytes"],
+                    "source_total_parameters": 2_779_483_539_072,
+                    "tp_rank": rank,
+                    "tp_world_size": 2,
+                    "source_revision": checkpoint.SOURCE_REVISION,
+                },
+                "weight_map": {tensor_name: filename},
+            }
+            checkpoint._atomic_json(
+                rank_dir / "model.safetensors.index.json",
+                index,
+            )
+            manifest = {
+                "schema": checkpoint.LEGACY_SCHEMA,
+                "complete": True,
+                "source": {
+                    "repo": checkpoint.SOURCE_REPO,
+                    "revision": checkpoint.SOURCE_REVISION,
+                    "config_sha256": checkpoint.SOURCE_CONFIG_SHA256,
+                    "index_sha256": checkpoint.SOURCE_INDEX_SHA256,
+                    "total_size": 816_773_159_296,
+                    "total_parameters": 2_779_483_539_072,
+                },
+                "runtime": {
+                    "mlx_lm_pr": checkpoint.MLX_LM_PR,
+                    "mlx_lm_commit": checkpoint.MLX_LM_COMMIT,
+                    "mlx_lm_kimi_k3_sha256": (checkpoint.MLX_LM_KIMI_K3_SHA256),
+                },
+                "tp": {
+                    "rank": rank,
+                    "world_size": 2,
+                    "contract": checkpoint.CONTRACT_VERSION,
+                    "contract_digest": contract.contract_digest(),
+                },
+                "rank_data_bytes": tensor["bytes"],
+                "files": {filename: record},
+                "tensors": {tensor_name: tensor},
+            }
+            checkpoint._atomic_json(rank_dir / "tp_manifest.json", manifest)
+            manifests.append(manifest)
+    pin_test_legacy_manifests(monkeypatch, rank_dirs)
+    return (
+        rank_dirs,
+        filename,
+        tensor_name,
+        manifests,
+        metadata_dir / "model.safetensors.index.json",
+    )
+
+
+def run_manifest_upgrade(
+    tmp_path: Path,
+    rank_dirs: list[Path],
+    source_index: Path,
+    *,
+    transaction_id: str = "test-upgrade",
+):
+    transaction_dir = tmp_path / "manifest-transactions"
+    transaction_dir.mkdir(exist_ok=True)
+    return checkpoint.upgrade_rank_local_manifests(
+        rank_dirs=rank_dirs,
+        source_index=source_index,
+        transaction_dir=transaction_dir,
+        transaction_id=transaction_id,
+    )
+
+
+def test_upgrade_manifests_validates_pair_and_publishes_v2_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, filename, _tensor_name, manifests, source_index = (
+        write_legacy_upgrade_fixture(
+            tmp_path,
+            monkeypatch,
+        )
+    )
+    weight_state = [
+        (
+            (root / filename).read_bytes(),
+            (root / filename).stat().st_ino,
+            (root / filename).stat().st_mtime_ns,
+        )
+        for root in rank_dirs
+    ]
+
+    report = run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+    assert report["schema"] == checkpoint.MANIFEST_UPGRADE_SCHEMA
+    assert report["from_schema"] == checkpoint.LEGACY_SCHEMA
+    assert report["to_schema"] == checkpoint.SCHEMA
+    assert report["transaction"]["state"] == "committed"
+    assert report["transaction"]["durable_recovery"] is True
+    assert report["transaction"]["recovery_actions"] == ["rollback", "complete"]
+    assert report["authenticated_source_index"]["sha256"] == (
+        checkpoint.SOURCE_INDEX_SHA256
+    )
+    assert set(report["metadata_files"]) == {
+        "LICENSE",
+        "config.json",
+        "tokenizer.json",
+    }
+    for rank, root in enumerate(rank_dirs):
+        manifest = json.loads((root / "tp_manifest.json").read_text())
+        assert manifest["schema"] == checkpoint.SCHEMA
+        assert manifest["metadata_files"] == report["metadata_files"]
+        assert (
+            manifest["metadata_contract_sha256"] == report["metadata_contract_sha256"]
+        )
+        current_weight_state = (
+            (root / filename).read_bytes(),
+            (root / filename).stat().st_ino,
+            (root / filename).stat().st_mtime_ns,
+        )
+        assert current_weight_state == weight_state[rank]
+        assert not list(root.glob(".*.upgrade-*.partial"))
+
+
+def test_upgrade_manifests_cli_prints_attested_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    transaction_dir = tmp_path / "manifest-transactions"
+    transaction_dir.mkdir()
+
+    status = main(
+        [
+            "upgrade-manifests",
+            "--rank-dir",
+            str(rank_dirs[0]),
+            "--rank-dir",
+            str(rank_dirs[1]),
+            "--source-index",
+            str(source_index),
+            "--transaction-dir",
+            str(transaction_dir),
+            "--transaction-id",
+            "cli-test",
+        ]
+    )
+
+    assert status == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["schema"] == checkpoint.MANIFEST_UPGRADE_SCHEMA
+    assert [rank["rank"] for rank in report["ranks"]] == [0, 1]
+
+
+def test_upgrade_manifests_rejects_tampered_weight_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, filename, _tensor_name, manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    shard = rank_dirs[0] / filename
+    tampered = bytearray(shard.read_bytes())
+    tampered[-1] ^= 1
+    shard.write_bytes(tampered)
+
+    with pytest.raises(ConversionError, match="checksum"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+    assert all(
+        json.loads((root / "tp_manifest.json").read_text())["schema"]
+        == checkpoint.LEGACY_SCHEMA
+        for root in rank_dirs
+    )
+
+
+def test_upgrade_manifests_rejects_missing_weight_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    (rank_dirs[1] / filename).unlink()
+
+    with pytest.raises(ConversionError, match="missing checkpoint file"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+    assert all(
+        json.loads((root / "tp_manifest.json").read_text())["schema"]
+        == checkpoint.LEGACY_SCHEMA
+        for root in rank_dirs
+    )
+
+
+def test_upgrade_manifests_rejects_manifest_for_the_wrong_rank(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    manifests[1]["tp"]["rank"] = 0
+    checkpoint._atomic_json(rank_dirs[1] / "tp_manifest.json", manifests[1])
+    pin_test_legacy_manifests(monkeypatch, rank_dirs)
+
+    with pytest.raises(ConversionError, match="root contains manifest for rank"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "message"),
+    [
+        ("source", "repo", "attacker/repacked-k3", "source contract"),
+        ("runtime", "mlx_lm_commit", "0" * 40, "runtime contract"),
+    ],
+)
+def test_upgrade_manifests_rejects_unpinned_source_and_runtime_contracts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    section: str,
+    field: str,
+    value: str,
+    message: str,
+):
+    rank_dirs, _filename, _tensor_name, manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    manifests[0][section][field] = value
+    checkpoint._atomic_json(rank_dirs[0] / "tp_manifest.json", manifests[0])
+    pin_test_legacy_manifests(monkeypatch, rank_dirs)
+
+    with pytest.raises(ConversionError, match=message):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+
+def test_upgrade_manifests_rejects_authenticated_header_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, filename, tensor_name, manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    shard = rank_dirs[0] / filename
+    write_synthetic_safetensors(
+        shard,
+        {tensor_name: ("F32", seq((3,), np.float32))},
+        metadata={
+            "format": "mlx",
+            "schema": checkpoint.LEGACY_SCHEMA,
+            "source_repo": checkpoint.SOURCE_REPO,
+            "source_revision": checkpoint.SOURCE_REVISION,
+            # Same byte length as the expected name so canonical-size
+            # validation passes and exact metadata validation is exercised.
+            "source_file": "model-99999-of-00185.safetensors",
+            "tp_rank": "0",
+            "tp_world_size": "2",
+            "sharding_contract": checkpoint.CONTRACT_VERSION,
+        },
+    )
+    record = manifests[0]["files"][filename]
+    record["bytes"] = shard.stat().st_size
+    record["sha256"] = checkpoint._sha256_file(shard)
+    checkpoint._atomic_json(rank_dirs[0] / "tp_manifest.json", manifests[0])
+    pin_test_legacy_manifests(monkeypatch, rank_dirs)
+
+    with pytest.raises(ConversionError, match="safetensors metadata"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+
+def test_upgrade_manifests_rejects_locally_valid_asymmetric_tensor_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, filename, tensor_name, manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    replacement_source = tmp_path / "replacement" / filename
+    write_synthetic_safetensors(
+        replacement_source,
+        {tensor_name: ("F16", seq((12,), np.float16))},
+    )
+    contract = KimiK3ShardingContract(synthetic_config(), world_size=2)
+    with SafeTensorFile(replacement_source) as source:
+        plan = contract.plan(source.tensors[tensor_name], rank=1)
+        assert plan is not None
+        (rank_dirs[1] / filename).unlink()
+        with monkeypatch.context() as legacy:
+            legacy.setattr(checkpoint, "SCHEMA", checkpoint.LEGACY_SCHEMA)
+            record = write_rank_shard(
+                source,
+                rank_dirs[1] / filename,
+                [plan],
+                rank=1,
+                world_size=2,
+                max_buffer_bytes=64,
+            )
+    tensor = checkpoint._tensor_manifest(plan, filename)
+    record["tensors"] = {tensor_name: tensor}
+    manifests[1]["files"] = {filename: record}
+    manifests[1]["tensors"] = {tensor_name: tensor}
+    manifests[1]["rank_data_bytes"] = tensor["bytes"]
+    checkpoint._atomic_json(rank_dirs[1] / "tp_manifest.json", manifests[1])
+    index = json.loads((rank_dirs[1] / "model.safetensors.index.json").read_text())
+    index["metadata"]["total_size"] = tensor["bytes"]
+    checkpoint._atomic_json(
+        rank_dirs[1] / "model.safetensors.index.json",
+        index,
+    )
+    pin_test_legacy_manifests(monkeypatch, rank_dirs)
+
+    with pytest.raises(ConversionError, match="source contracts are not symmetric"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+
+def test_upgrade_manifests_rejects_unallowlisted_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    (rank_dirs[0] / "remote_code.py").write_text("raise RuntimeError\n")
+
+    with pytest.raises(ConversionError, match="metadata inventory differs"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+
+def test_upgrade_manifests_rejects_identical_unpinned_executable_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    malicious = "raise RuntimeError('identical but unauthenticated')\n"
+    for root in rank_dirs:
+        (root / "tokenization_kimi.py").write_text(malicious)
+
+    with pytest.raises(ConversionError, match="metadata inventory differs"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+
+def test_upgrade_manifests_rejects_rank_metadata_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    (rank_dirs[1] / "tokenizer.json").write_text('{"version": "tampered"}\n')
+
+    with pytest.raises(ConversionError, match="metadata (size|checksum) differs"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+
+def test_upgrade_manifests_rejects_rank_index_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    index_path = rank_dirs[0] / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["metadata"]["total_size"] += 1
+    checkpoint._atomic_json(index_path, index)
+
+    with pytest.raises(ConversionError, match="weight index differs"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+
+def test_upgrade_manifests_rolls_back_first_publish_if_second_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    manifest_paths = [root / "tp_manifest.json" for root in rank_dirs]
+    originals = [path.read_bytes() for path in manifest_paths]
+    real_replace = checkpoint.os.replace
+    publication_count = 0
+    failure_injected = False
+
+    def fail_second_publication(src, dst):
+        nonlocal publication_count, failure_injected
+        if str(src).endswith(".upgrade-transaction.partial"):
+            publication_count += 1
+            if publication_count == 2 and not failure_injected:
+                failure_injected = True
+                raise OSError("injected second-manifest publication failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(checkpoint.os, "replace", fail_second_publication)
+    with pytest.raises(OSError, match="injected second-manifest"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+    assert [path.read_bytes() for path in manifest_paths] == originals
+    assert all(not list(root.glob(".*.upgrade-*.partial")) for root in rank_dirs)
+
+
+def test_upgrade_manifests_rejects_consistently_truncated_pair_against_source_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, filename, _tensor_name, manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    source = json.loads(source_index.read_text())
+    source["weight_map"]["language_model.model.layers.1.self_attn.A_log"] = filename
+    source_index.write_text(json.dumps(source, sort_keys=True))
+    monkeypatch.setattr(
+        checkpoint,
+        "SOURCE_INDEX_SHA256",
+        checkpoint._sha256_file(source_index),
+    )
+    for root, manifest in zip(rank_dirs, manifests, strict=True):
+        manifest["source"]["index_sha256"] = checkpoint.SOURCE_INDEX_SHA256
+        checkpoint._atomic_json(root / "tp_manifest.json", manifest)
+    pin_test_legacy_manifests(monkeypatch, rank_dirs)
+
+    with pytest.raises(ConversionError, match="tensor inventory differs"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+    assert all(
+        json.loads((root / "tp_manifest.json").read_text())["schema"]
+        == checkpoint.LEGACY_SCHEMA
+        for root in rank_dirs
+    )
+
+
+def test_upgrade_manifests_recovers_after_process_death_between_rank_replaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    transaction_dir = tmp_path / "manifest-transactions"
+    transaction_dir.mkdir()
+    real_replace = checkpoint.os.replace
+    publication_count = 0
+
+    def die_before_rank_one(src, dst):
+        nonlocal publication_count
+        if str(src).endswith(".upgrade-transaction.partial"):
+            publication_count += 1
+            if publication_count == 2:
+                raise SystemExit("simulated SIGKILL boundary")
+        return real_replace(src, dst)
+
+    with monkeypatch.context() as crash:
+        crash.setattr(checkpoint.os, "replace", die_before_rank_one)
+        with pytest.raises(SystemExit, match="simulated SIGKILL"):
+            checkpoint.upgrade_rank_local_manifests(
+                rank_dirs=rank_dirs,
+                source_index=source_index,
+                transaction_dir=transaction_dir,
+                transaction_id="crash-after-rank0",
+            )
+
+    schemas = [
+        json.loads((root / "tp_manifest.json").read_text())["schema"]
+        for root in rank_dirs
+    ]
+    assert schemas == [checkpoint.SCHEMA, checkpoint.LEGACY_SCHEMA]
+    transaction = transaction_dir / "crash-after-rank0"
+
+    rollback = checkpoint.recover_manifest_upgrade(
+        transaction=transaction,
+        action="rollback",
+    )
+    assert rollback["state"] == "rolled-back"
+    assert all(
+        json.loads((root / "tp_manifest.json").read_text())["schema"]
+        == checkpoint.LEGACY_SCHEMA
+        for root in rank_dirs
+    )
+
+    completed = checkpoint.recover_manifest_upgrade(
+        transaction=transaction,
+        action="complete",
+    )
+    assert completed["state"] == "committed"
+    assert all(
+        json.loads((root / "tp_manifest.json").read_text())["schema"]
+        == checkpoint.SCHEMA
+        for root in rank_dirs
+    )
+
+
+def test_manifest_recovery_refuses_unknown_concurrent_writer_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    report = run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+    transaction = Path(report["transaction"]["path"])
+    (rank_dirs[1] / "tp_manifest.json").write_text('{"third_party":true}\n')
+
+    with pytest.raises(ConversionError, match="refusing to clobber"):
+        checkpoint.recover_manifest_upgrade(
+            transaction=transaction,
+            action="rollback",
+        )
+    assert (rank_dirs[1] / "tp_manifest.json").read_text() == ('{"third_party":true}\n')
+
+
+def test_manifest_recovery_complete_rehashes_all_rank_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    transaction_dir = tmp_path / "manifest-transactions"
+    transaction_dir.mkdir()
+    real_replace = checkpoint.os.replace
+    publications = 0
+
+    def die_before_rank_one(src, dst):
+        nonlocal publications
+        if str(src).endswith(".upgrade-transaction.partial"):
+            publications += 1
+            if publications == 2:
+                raise SystemExit("simulated process death")
+        return real_replace(src, dst)
+
+    with monkeypatch.context() as crash:
+        crash.setattr(checkpoint.os, "replace", die_before_rank_one)
+        with pytest.raises(SystemExit):
+            checkpoint.upgrade_rank_local_manifests(
+                rank_dirs=rank_dirs,
+                source_index=source_index,
+                transaction_dir=transaction_dir,
+                transaction_id="corrupt-before-complete",
+            )
+
+    rank_one_shard = rank_dirs[1] / filename
+    corrupted = bytearray(rank_one_shard.read_bytes())
+    corrupted[-1] ^= 1
+    rank_one_shard.write_bytes(corrupted)
+    transaction = transaction_dir / "corrupt-before-complete"
+    with pytest.raises(ConversionError, match="checksum"):
+        checkpoint.recover_manifest_upgrade(
+            transaction=transaction,
+            action="complete",
+        )
+    assert json.loads((rank_dirs[0] / "tp_manifest.json").read_text())["schema"] == (
+        checkpoint.SCHEMA
+    )
+    assert json.loads((rank_dirs[1] / "tp_manifest.json").read_text())["schema"] == (
+        checkpoint.LEGACY_SCHEMA
+    )
+
+
+def test_manifest_recovery_rejects_unknown_journal_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    report = run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+    transaction = Path(report["transaction"]["path"])
+    journal_path = transaction / "transaction.json"
+    journal = json.loads(journal_path.read_text())
+    journal["state"] = "attacker-controlled-state"
+    checkpoint._atomic_json(journal_path, journal)
+
+    with pytest.raises(ConversionError, match="unrecognized transaction state"):
+        checkpoint.recover_manifest_upgrade(
+            transaction=transaction,
+            action="rollback",
+        )
+
+
+def test_manifest_transaction_rejects_invalid_known_state_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    report = run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+    transaction = Path(report["transaction"]["path"])
+    journal = json.loads((transaction / "transaction.json").read_text())
+    assert journal["state"] == "committed"
+
+    with pytest.raises(ConversionError, match="invalid transaction state transition"):
+        checkpoint._set_upgrade_transaction_state(
+            transaction,
+            journal,
+            "rank-0-published",
+        )
+
+
+def test_manifest_recovery_rejects_coherently_rewritten_v2_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    report = run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+    transaction = Path(report["transaction"]["path"])
+    checkpoint.recover_manifest_upgrade(
+        transaction=transaction,
+        action="rollback",
+    )
+
+    journal_path = transaction / "transaction.json"
+    journal = json.loads(journal_path.read_text())
+    artifact_record = journal["ranks"][0]["upgraded"]
+    artifact_path = transaction / artifact_record["artifact"]
+    malicious = json.loads(artifact_path.read_text())
+    malicious["metadata_contract_sha256"] = "0" * 64
+    payload = checkpoint._encode_json(malicious)
+    artifact_path.write_bytes(payload)
+    artifact_record["bytes"] = len(payload)
+    artifact_record["sha256"] = checkpoint._sha256_bytes(payload)
+    checkpoint._atomic_json(journal_path, journal)
+
+    with pytest.raises(ConversionError, match="deterministic compiled v2"):
+        checkpoint.recover_manifest_upgrade(
+            transaction=transaction,
+            action="complete",
+        )
+    assert all(
+        json.loads((root / "tp_manifest.json").read_text())["schema"]
+        == checkpoint.LEGACY_SCHEMA
+        for root in rank_dirs
+    )
+
+
+def test_upgrade_manifests_rejects_symlink_rank_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    alias = tmp_path / "rank0-alias"
+    alias.symlink_to(rank_dirs[0], target_is_directory=True)
+    transaction_dir = tmp_path / "manifest-transactions"
+    transaction_dir.mkdir()
+
+    with pytest.raises(ConversionError, match="must be a real directory"):
+        checkpoint.upgrade_rank_local_manifests(
+            rank_dirs=[alias, rank_dirs[1]],
+            source_index=source_index,
+            transaction_dir=transaction_dir,
+            transaction_id="symlink-root",
+        )
+
+
+def test_upgrade_manifests_detects_rank_root_swap_before_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    original_create = checkpoint._create_manifest_upgrade_transaction
+
+    def create_then_swap(**kwargs):
+        result = original_create(**kwargs)
+        moved = tmp_path / "rank1-moved"
+        rank_dirs[1].rename(moved)
+        rank_dirs[1].mkdir()
+        return result
+
+    monkeypatch.setattr(
+        checkpoint,
+        "_create_manifest_upgrade_transaction",
+        create_then_swap,
+    )
+    with pytest.raises(ConversionError, match="rank root identity changed"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+
+
+def test_upgrade_parses_the_authenticated_manifest_byte_buffer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rank_dirs, _filename, _tensor_name, _manifests, source_index = (
+        write_legacy_upgrade_fixture(tmp_path, monkeypatch)
+    )
+    target = rank_dirs[0] / "tp_manifest.json"
+    real_read = checkpoint._read_regular_bytes
+    swapped = False
+
+    def read_then_swap(path: Path) -> bytes:
+        nonlocal swapped
+        payload = real_read(path)
+        if path == target and not swapped:
+            swapped = True
+            path.write_text('{"attacker":"replaced-after-authentication"}\n')
+        return payload
+
+    monkeypatch.setattr(checkpoint, "_read_regular_bytes", read_then_swap)
+    with pytest.raises(ConversionError, match="manifest changed before publication"):
+        run_manifest_upgrade(tmp_path, rank_dirs, source_index)
+    assert swapped is True
+
+
+def test_safetensors_rejects_extra_descriptor_fields(tmp_path: Path):
+    path = tmp_path / "extra-field.safetensors"
+    write_synthetic_safetensors(
+        path,
+        {"language_model.weight": ("F32", seq((2,), np.float32))},
+    )
+    raw = path.read_bytes()
+    (header_len,) = struct.unpack("<Q", raw[:8])
+    header = json.loads(raw[8 : 8 + header_len].rstrip(b" "))
+    header["language_model.weight"]["attacker_extension"] = True
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * ((-len(encoded)) % 8)
+    payload = raw[8 + header_len :]
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+
+    with (
+        pytest.raises(ConversionError, match="invalid descriptor"),
+        SafeTensorFile(path),
+    ):
+        pass
+
+
+def test_safetensors_uses_fstat_on_the_opened_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    path = tmp_path / "same-fd.safetensors"
+    tensor_name = "language_model.weight"
+    write_synthetic_safetensors(
+        path,
+        {tensor_name: ("F32", seq((2,), np.float32))},
+    )
+    real_stat = Path.stat
+
+    def reject_path_stat(self: Path, *args, **kwargs):
+        if self == path:
+            raise AssertionError("SafeTensorFile must not stat by pathname after open")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", reject_path_stat)
+    with SafeTensorFile(path) as safe:
+        assert list(safe.tensors) == [tensor_name]
 
 
 def test_rule_classification_exact_model_shard_contract():
@@ -840,7 +1671,10 @@ def test_convert_shard_refuses_duplicate_dirs_and_existing_outputs(
     assert not rank1.exists()
 
 
-def test_copy_metadata_uses_allowlist_and_preserves_license(tmp_path: Path):
+def test_copy_metadata_uses_exact_authenticated_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
@@ -849,6 +1683,11 @@ def test_copy_metadata_uses_allowlist_and_preserves_license(tmp_path: Path):
     (metadata / ".exo_shard.json").write_text('{"start_layer": 0}')
     (metadata / "model.safetensors.index.json").write_text("{}")
     (metadata / "unexpected.txt").write_text("not part of the allowlist")
+    pin_test_metadata(
+        monkeypatch,
+        metadata,
+        {"LICENSE", "config.json", "tokenizer.json"},
+    )
     rank_dirs = [tmp_path / "rank0", tmp_path / "rank1"]
 
     records = checkpoint._copy_metadata_files(metadata, rank_dirs)
@@ -871,12 +1710,18 @@ def test_copy_metadata_uses_allowlist_and_preserves_license(tmp_path: Path):
         assert not list(rank_dir.glob(".*.metadata.partial"))
 
 
-def test_copy_metadata_requires_kimi_license(tmp_path: Path):
+def test_copy_metadata_requires_every_pinned_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
+    (metadata / "tokenizer.json").write_text("{}")
+    pin_test_metadata(monkeypatch, metadata, {"config.json", "tokenizer.json"})
+    (metadata / "tokenizer.json").unlink()
 
-    with pytest.raises(ConversionError, match="missing Kimi K3 license"):
+    with pytest.raises(ConversionError, match="missing required metadata"):
         checkpoint._copy_metadata_files(
             metadata,
             [tmp_path / "rank0", tmp_path / "rank1"],
@@ -886,10 +1731,16 @@ def test_copy_metadata_requires_kimi_license(tmp_path: Path):
     assert not (tmp_path / "rank1").exists()
 
 
-def test_copy_metadata_rejects_source_symlinks(tmp_path: Path):
+def test_copy_metadata_rejects_source_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
+    (metadata / "LICENSE").write_text("Kimi K3 license text\n")
+    pin_test_metadata(monkeypatch, metadata, {"LICENSE", "config.json"})
+    (metadata / "LICENSE").unlink()
     license_target = tmp_path / "upstream-license"
     license_target.write_text("Kimi K3 license text\n")
     (metadata / "LICENSE").symlink_to(license_target)
@@ -901,11 +1752,15 @@ def test_copy_metadata_rejects_source_symlinks(tmp_path: Path):
         )
 
 
-def test_copy_metadata_rejects_destination_symlinks(tmp_path: Path):
+def test_copy_metadata_rejects_destination_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
     (metadata / "LICENSE").write_text("Kimi K3 license text\n")
+    pin_test_metadata(monkeypatch, metadata, {"LICENSE", "config.json"})
     outside = tmp_path / "outside-config"
     outside.write_text("must remain unchanged")
     rank0 = tmp_path / "rank0"
@@ -921,11 +1776,13 @@ def test_copy_metadata_rejects_destination_symlinks(tmp_path: Path):
 
 def test_copy_metadata_reuses_identical_files_without_replacing_them(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
     (metadata / "LICENSE").write_text("Kimi K3 license text\n")
+    pin_test_metadata(monkeypatch, metadata, {"LICENSE", "config.json"})
     rank0 = tmp_path / "rank0"
     rank0.mkdir()
     existing = rank0 / "config.json"
@@ -940,11 +1797,13 @@ def test_copy_metadata_reuses_identical_files_without_replacing_them(
 
 def test_copy_metadata_refuses_different_existing_file_before_publish(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
     (metadata / "LICENSE").write_text("Kimi K3 license text\n")
+    pin_test_metadata(monkeypatch, metadata, {"LICENSE", "config.json"})
     rank0 = tmp_path / "rank0"
     rank0.mkdir()
     existing = rank0 / "config.json"
@@ -967,6 +1826,7 @@ def test_copy_metadata_rolls_back_if_atomic_publish_fails(
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
     (metadata / "LICENSE").write_text("Kimi K3 license text\n")
+    pin_test_metadata(monkeypatch, metadata, {"LICENSE", "config.json"})
     rank_dirs = [tmp_path / "rank0", tmp_path / "rank1"]
     real_link = checkpoint.os.link
     calls = 0

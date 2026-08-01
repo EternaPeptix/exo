@@ -28,6 +28,7 @@ import argparse
 import contextlib
 import dataclasses
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import math
@@ -63,42 +64,150 @@ LEGACY_SCHEMA = "k3-rank-local-tp/v1"
 JOURNAL_SCHEMAS = frozenset({LEGACY_SCHEMA, SCHEMA})
 SHARD_AUDIT_SCHEMA = "k3-rank-local-tp-shard-audit/v1"
 SHARD_CONVERSION_SCHEMA = "k3-rank-local-tp-shard-conversion/v1"
+MANIFEST_UPGRADE_SCHEMA = "k3-rank-local-tp-manifest-upgrade/v1"
+MANIFEST_UPGRADE_TRANSACTION_SCHEMA = "k3-rank-local-tp-manifest-upgrade-transaction/v1"
+LEGACY_MANIFEST_SHA256 = {
+    0: "2da4db586e81a61fbea990e95fcfa14d14a0563c6cdafc6767373f5a74e12b21",
+    1: "c91c25a9439471ba115d45ae3371341954bbb0453677549c1fb6eeb2ace0d23f",
+}
+MANIFEST_UPGRADE_TRANSACTION_STATES = frozenset(
+    {
+        "prepared",
+        "rank-0-published",
+        "rank-1-published",
+        "recovering-rollback",
+        "rollback-rank-1-durable",
+        "rollback-rank-0-durable",
+        "rolled-back",
+        "recovering-complete",
+        "complete-rank-0-durable",
+        "complete-rank-1-durable",
+        "committed",
+    }
+)
+MANIFEST_UPGRADE_STATE_TRANSITIONS = {
+    "prepared": frozenset(
+        {"rank-0-published", "recovering-rollback", "recovering-complete"}
+    ),
+    "rank-0-published": frozenset(
+        {"rank-1-published", "recovering-rollback", "recovering-complete"}
+    ),
+    "rank-1-published": frozenset(
+        {"committed", "recovering-rollback", "recovering-complete"}
+    ),
+    "recovering-rollback": frozenset(
+        {
+            "recovering-rollback",
+            "recovering-complete",
+            "rollback-rank-1-durable",
+        }
+    ),
+    "rollback-rank-1-durable": frozenset(
+        {
+            "recovering-rollback",
+            "recovering-complete",
+            "rollback-rank-0-durable",
+        }
+    ),
+    "rollback-rank-0-durable": frozenset(
+        {"recovering-rollback", "recovering-complete", "rolled-back"}
+    ),
+    "rolled-back": frozenset({"recovering-rollback", "recovering-complete"}),
+    "recovering-complete": frozenset(
+        {
+            "recovering-complete",
+            "recovering-rollback",
+            "complete-rank-0-durable",
+        }
+    ),
+    "complete-rank-0-durable": frozenset(
+        {
+            "recovering-complete",
+            "recovering-rollback",
+            "complete-rank-1-durable",
+        }
+    ),
+    "complete-rank-1-durable": frozenset(
+        {"recovering-complete", "recovering-rollback", "committed"}
+    ),
+    "committed": frozenset({"recovering-rollback", "recovering-complete"}),
+}
 CONTRACT_VERSION = "mlx-lm-kimi-k3-shard@7d505c2"
 DEFAULT_WORLD_SIZE = 2
 TEXT_PREFIX = "language_model."
-
-# Only these non-weight files may cross from an untrusted model snapshot into a
-# rank-local checkpoint.  Keep this list explicit: copying an arbitrary sibling
-# file can accidentally publish credentials, host configuration, or executable
-# hooks that were never reviewed.
-ALLOWED_METADATA_FILENAMES = frozenset(
-    {
-        "LICENSE",
-        "LICENSE.md",
-        "LICENSE.txt",
-        "README.md",
-        "added_tokens.json",
-        "chat_template.jinja",
-        "config.json",
-        "configuration_kimi_k3.py",
-        "encoding_k3.py",
-        "generation_config.json",
-        "kimi_k3_processor.py",
-        "kimi_k3_vision_processing.py",
-        "media_utils.py",
-        "merges.txt",
-        "preprocessor_config.json",
-        "processor_config.json",
-        "special_tokens_map.json",
-        "tokenization_kimi.py",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "video_preprocessor_config.json",
-        "vocab.json",
-    }
+INTERNAL_CHECKPOINT_FILENAMES = frozenset(
+    {"model.safetensors.index.json", "tp_manifest.json"}
 )
-REQUIRED_METADATA_FILENAMES = frozenset({"config.json"})
-LICENSE_FILENAMES = frozenset({"LICENSE", "LICENSE.md", "LICENSE.txt"})
+
+# Exact non-weight inventory from SOURCE_REPO@SOURCE_REVISION.  These files are
+# executable under ``trust_remote_code=True``; an allowlist of names alone is
+# not authentication.  The immutable per-file identities deliberately reject
+# both extra files and byte substitutions.  ``.gitattributes`` is not runtime
+# metadata and is intentionally excluded.
+PINNED_METADATA_FILES: dict[str, dict[str, int | str]] = {
+    "README.md": {
+        "bytes": 1923,
+        "sha256": "d0d7a4d1a5af37c542594449d2ce893b9e3c33ccb031afb71cf13e4f23a5349d",
+    },
+    "added_tokens.json": {
+        "bytes": 200,
+        "sha256": "27373c2f39a52c87e674caf7e9604ec6756c68c5f8d5f140657299048b6ab8ba",
+    },
+    "config.json": {
+        "bytes": 459349,
+        "sha256": SOURCE_CONFIG_SHA256,
+    },
+    "configuration_kimi_k3.py": {
+        "bytes": 11343,
+        "sha256": "735eb9ebe593e17d231e08e1df7f7be9b5ee0e079f511aa201f9572077b416ae",
+    },
+    "encoding_k3.py": {
+        "bytes": 22827,
+        "sha256": "b9cb7ae100fed34b9337f80dacee5abbf7e261fe9b74bc0e76366701d46f5333",
+    },
+    "generation_config.json": {
+        "bytes": 53,
+        "sha256": "c6648c25e9705af7fba8847e243840d21b5cc63ddeb6297f750a7ddbb6a02836",
+    },
+    "kimi_k3_processor.py": {
+        "bytes": 7660,
+        "sha256": "ec9f7e86d2ab0eee07a8e7e7c037046e77ac3c25a710ad1298ec13be3b585b54",
+    },
+    "kimi_k3_vision_processing.py": {
+        "bytes": 6686,
+        "sha256": "d122b30bfd3a51a6f05d4bfcfda1e657827322b1353f7caefeebc2835d7736b5",
+    },
+    "media_utils.py": {
+        "bytes": 13844,
+        "sha256": "78403540328f9847d6b7ebc5c44eb2e6a752863de0afb7d0710728bb161dc60d",
+    },
+    "modeling_kimi_k3.py": {
+        "bytes": 53444,
+        "sha256": "b9171c96726eda55234c92ac8dfae7e24c512fda68968ae8f2c3782b42665ea2",
+    },
+    "modeling_kimi_linear.py": {
+        "bytes": 51506,
+        "sha256": "9e3564c70ac21854ce5a090cc946c5dc76b70d1050ef50840449181a20fff44a",
+    },
+    "preprocessor_config.json": {
+        "bytes": 1011,
+        "sha256": "4be333605990c53a816e586dee9d5dd545afb7a59947c17f8f7ef26b4782668e",
+    },
+    "tiktoken.model": {
+        "bytes": 2795286,
+        "sha256": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
+    },
+    "tokenization_kimi.py": {
+        "bytes": 16145,
+        "sha256": "f28ea66e2d862a2a5814970b2ce40c2f7d8296ff09aed90a7e7def689b906944",
+    },
+    "tokenizer_config.json": {
+        "bytes": 4790,
+        "sha256": "d06a6e8a2ef0a09d62031591d0ea2b7c5128fd28a17ea693984bf85eafade1df",
+    },
+}
+ALLOWED_METADATA_FILENAMES = frozenset(PINNED_METADATA_FILES)
+REQUIRED_METADATA_FILENAMES = ALLOWED_METADATA_FILENAMES
 
 
 DTYPES: dict[str, tuple[np.dtype, int]] = {
@@ -238,8 +347,8 @@ class SafeTensorFile:
         self.data_offset = 0
 
     def __enter__(self) -> "SafeTensorFile":
-        self._fh = self.path.open("rb")
-        file_size = self.path.stat().st_size
+        self._fh = os.fdopen(_open_regular_readonly(self.path), "rb")
+        file_size = os.fstat(self._fh.fileno()).st_size
         raw_len = self._fh.read(8)
         if len(raw_len) != 8:
             raise ConversionError(f"{self.path}: truncated safetensors prefix")
@@ -252,7 +361,19 @@ class SafeTensorFile:
         if len(header_raw) != header_len:
             raise ConversionError(f"{self.path}: truncated safetensors header")
         try:
-            header = json.loads(header_raw.rstrip(b" ").decode("utf-8"))
+
+            def reject_duplicate_keys(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError(f"duplicate JSON key {key!r}")
+                    result[key] = value
+                return result
+
+            header = json.loads(
+                header_raw.rstrip(b" ").decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+            )
         except Exception as exc:
             raise ConversionError(
                 f"{self.path}: invalid safetensors JSON header"
@@ -271,14 +392,28 @@ class SafeTensorFile:
                     raise ConversionError(f"{self.path}: invalid __metadata__")
                 self.metadata = dict(info)
                 continue
-            try:
-                dtype = info["dtype"]
-                shape = tuple(int(x) for x in info["shape"])
-                start, end = (int(x) for x in info["data_offsets"])
-            except Exception as exc:
-                raise ConversionError(
-                    f"{self.path}: invalid descriptor for {name!r}"
-                ) from exc
+            if not isinstance(name, str) or not name:
+                raise ConversionError(f"{self.path}: invalid tensor name {name!r}")
+            if not isinstance(info, dict) or set(info) != {
+                "dtype",
+                "shape",
+                "data_offsets",
+            }:
+                raise ConversionError(f"{self.path}: invalid descriptor for {name!r}")
+            dtype = info["dtype"]
+            raw_shape = info["shape"]
+            raw_offsets = info["data_offsets"]
+            if (
+                not isinstance(dtype, str)
+                or not isinstance(raw_shape, list)
+                or any(type(dimension) is not int for dimension in raw_shape)
+                or not isinstance(raw_offsets, list)
+                or len(raw_offsets) != 2
+                or any(type(offset) is not int for offset in raw_offsets)
+            ):
+                raise ConversionError(f"{self.path}: invalid descriptor for {name!r}")
+            shape = tuple(raw_shape)
+            start, end = raw_offsets
             if dtype not in DTYPES:
                 raise ConversionError(
                     f"{self.path}:{name}: unsupported dtype {dtype!r}"
@@ -1164,26 +1299,30 @@ def _copy_metadata_files(
     for src in metadata_dir.iterdir():
         if src.is_symlink():
             raise ConversionError(f"{src}: metadata symlinks are not permitted")
-        if src.name not in ALLOWED_METADATA_FILENAMES:
+        if src.name not in PINNED_METADATA_FILES:
             continue
         if not src.is_file():
             raise ConversionError(f"{src}: allowlisted metadata must be a regular file")
         sources[src.name] = src
 
-    missing = sorted(REQUIRED_METADATA_FILENAMES - sources.keys())
+    missing = sorted(set(PINNED_METADATA_FILES) - sources.keys())
     if missing:
         raise ConversionError(
             f"{metadata_dir}: missing required metadata: {', '.join(missing)}"
         )
-    if not (LICENSE_FILENAMES & sources.keys()):
-        raise ConversionError(
-            f"{metadata_dir}: missing Kimi K3 license; expected one of "
-            f"{', '.join(sorted(LICENSE_FILENAMES))}"
-        )
-
-    source_hashes = {
-        name: _sha256_regular_file(src) for name, src in sorted(sources.items())
-    }
+    source_hashes: dict[str, str] = {}
+    for name, src in sorted(sources.items()):
+        identity = _regular_file_identity(src)
+        expected = PINNED_METADATA_FILES[name]
+        if identity[3] != expected["bytes"]:
+            raise ConversionError(
+                f"{src}: metadata size differs from the pinned source"
+            )
+        source_hashes[name] = _sha256_regular_file(src)
+        if source_hashes[name] != expected["sha256"]:
+            raise ConversionError(
+                f"{src}: metadata checksum differs from the pinned source"
+            )
     destinations: list[tuple[Path, Path, str]] = []
     roots = [Path(root) for root in rank_dirs]
     for root in roots:
@@ -1245,10 +1384,9 @@ def _copy_metadata_files(
             raise ConversionError(
                 f"rank metadata copies diverged after publication: {name}"
             )
-        records[name] = {
-            "bytes": sizes.pop(),
-            "sha256": expected_sha256,
-        }
+        records[name] = {"bytes": sizes.pop(), "sha256": expected_sha256}
+    if records != PINNED_METADATA_FILES:
+        raise ConversionError("rank metadata contract differs from the pinned source")
     return records
 
 
@@ -1288,6 +1426,1384 @@ def _tensor_manifest(plan: TensorPlan, source_file: str) -> dict:
         "intervals": [list(x) for x in plan.intervals],
         "bytes": plan.output_nbytes,
     }
+
+
+def _upgrade_object(
+    value: object,
+    expected_fields: set[str],
+    field: str,
+) -> dict:
+    if not isinstance(value, dict):
+        raise ConversionError(f"legacy manifest {field} must be an object")
+    if set(value) != expected_fields:
+        raise ConversionError(
+            f"legacy manifest {field} fields differ from the v1 contract: "
+            f"extra={sorted(set(value) - expected_fields)}, "
+            f"missing={sorted(expected_fields - set(value))}"
+        )
+    return value
+
+
+def _same_json_contract(left: object, right: object) -> bool:
+    """Compare JSON contracts without Python's bool/int equality coercion."""
+
+    options = {
+        "sort_keys": True,
+        "separators": (",", ":"),
+        "ensure_ascii": True,
+        "allow_nan": False,
+    }
+    try:
+        return json.dumps(left, **options) == json.dumps(right, **options)
+    except (TypeError, ValueError):
+        return False
+
+
+def _upgrade_int(value: object, field: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ConversionError(
+            f"legacy manifest {field} must be an integer >= {minimum}"
+        )
+    return value
+
+
+def _upgrade_sha256(value: object, field: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ConversionError(
+            f"legacy manifest {field} must be a lowercase SHA-256 digest"
+        )
+    return value
+
+
+def _upgrade_basename(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise ConversionError(f"legacy manifest {field} must be a string")
+    _safe_repo_relative_name(value)
+    if "/" in value or Path(value).name != value:
+        raise ConversionError(
+            f"legacy manifest {field} must be a safe checkpoint basename"
+        )
+    return value
+
+
+def _regular_file_identity(path: Path) -> tuple[int, int, int, int, int, int]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ConversionError(f"{path}: missing checkpoint file") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ConversionError(f"{path}: checkpoint entry must be a regular file")
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ConversionError(f"{path}: missing directory") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise ConversionError(f"{path}: expected a real directory")
+    return (info.st_dev, info.st_ino)
+
+
+def _resolved_real_directory(path: Path, field: str) -> Path:
+    path = Path(path)
+    if path.is_symlink() or not path.is_dir():
+        raise ConversionError(f"{path}: {field} must be a real directory")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ConversionError(f"{path}: cannot resolve {field}") from exc
+    _directory_identity(resolved)
+    return resolved
+
+
+def _read_regular_bytes(path: Path) -> bytes:
+    fd = _open_regular_readonly(path)
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read()
+
+
+def _load_regular_json(path: Path) -> dict:
+    try:
+        raw = _read_regular_bytes(path)
+    except ConversionError:
+        raise
+    except Exception as exc:
+        raise ConversionError(f"cannot load regular JSON file {path}") from exc
+    return _load_json_bytes(raw, str(path))
+
+
+def _load_json_bytes(raw: bytes, source: str) -> dict:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ConversionError(f"cannot load JSON object from {source}") from exc
+    if not isinstance(value, dict):
+        raise ConversionError(f"{source}: expected JSON object")
+    return value
+
+
+def _validate_legacy_root_contract(manifest: dict, rank: int) -> None:
+    _upgrade_object(
+        manifest,
+        {
+            "schema",
+            "complete",
+            "source",
+            "runtime",
+            "tp",
+            "rank_data_bytes",
+            "files",
+            "tensors",
+        },
+        f"rank {rank}",
+    )
+    if manifest["schema"] != LEGACY_SCHEMA:
+        raise ConversionError(
+            f"rank {rank} manifest must use {LEGACY_SCHEMA!r}, "
+            f"got {manifest['schema']!r}"
+        )
+    if manifest["complete"] is not True:
+        raise ConversionError(f"rank {rank} legacy manifest is incomplete")
+
+    source = _upgrade_object(
+        manifest["source"],
+        {
+            "repo",
+            "revision",
+            "config_sha256",
+            "index_sha256",
+            "total_size",
+            "total_parameters",
+        },
+        f"rank {rank}.source",
+    )
+    expected_source = {
+        "repo": SOURCE_REPO,
+        "revision": SOURCE_REVISION,
+        "config_sha256": SOURCE_CONFIG_SHA256,
+        "index_sha256": SOURCE_INDEX_SHA256,
+        "total_size": 816_773_159_296,
+        "total_parameters": 2_779_483_539_072,
+    }
+    if not _same_json_contract(source, expected_source):
+        raise ConversionError(
+            f"rank {rank} legacy source contract does not match the pinned checkpoint"
+        )
+
+    runtime = _upgrade_object(
+        manifest["runtime"],
+        {"mlx_lm_pr", "mlx_lm_commit", "mlx_lm_kimi_k3_sha256"},
+        f"rank {rank}.runtime",
+    )
+    expected_runtime = {
+        "mlx_lm_pr": MLX_LM_PR,
+        "mlx_lm_commit": MLX_LM_COMMIT,
+        "mlx_lm_kimi_k3_sha256": MLX_LM_KIMI_K3_SHA256,
+    }
+    if not _same_json_contract(runtime, expected_runtime):
+        raise ConversionError(
+            f"rank {rank} legacy runtime contract does not match the converter"
+        )
+
+    tp = _upgrade_object(
+        manifest["tp"],
+        {"rank", "world_size", "contract", "contract_digest"},
+        f"rank {rank}.tp",
+    )
+    tp_rank = _upgrade_int(tp.get("rank"), f"rank {rank}.tp.rank")
+    if tp_rank != rank:
+        raise ConversionError(
+            f"rank {rank} root contains manifest for rank {tp_rank!r}"
+        )
+    tp_world_size = _upgrade_int(
+        tp.get("world_size"),
+        f"rank {rank}.tp.world_size",
+        minimum=1,
+    )
+    if tp_world_size != DEFAULT_WORLD_SIZE:
+        raise ConversionError(f"rank {rank} manifest is not TP{DEFAULT_WORLD_SIZE}")
+    if tp.get("contract") != CONTRACT_VERSION:
+        raise ConversionError(f"rank {rank} manifest uses a different TP contract")
+    _upgrade_sha256(tp.get("contract_digest"), f"rank {rank}.tp.contract_digest")
+    _upgrade_int(manifest["rank_data_bytes"], f"rank {rank}.rank_data_bytes")
+    if not isinstance(manifest["files"], dict) or not manifest["files"]:
+        raise ConversionError(f"rank {rank} manifest files must be a non-empty object")
+    if not isinstance(manifest["tensors"], dict) or not manifest["tensors"]:
+        raise ConversionError(
+            f"rank {rank} manifest tensors must be a non-empty object"
+        )
+
+
+def _validate_legacy_tensor_record(
+    tensor_name: object,
+    value: object,
+    *,
+    filename: str,
+    contract: KimiK3ShardingContract,
+    rank: int,
+    field: str,
+) -> TensorPlan:
+    if not isinstance(tensor_name, str) or not tensor_name:
+        raise ConversionError(f"legacy manifest {field} has an invalid tensor name")
+    record = _upgrade_object(
+        value,
+        {
+            "source_file",
+            "dtype",
+            "source_shape",
+            "rank_shape",
+            "rule",
+            "resolved_axis",
+            "intervals",
+            "bytes",
+        },
+        field,
+    )
+    dtype = record.get("dtype")
+    if not isinstance(dtype, str) or dtype not in DTYPES:
+        raise ConversionError(f"legacy manifest {field}.dtype is unsupported")
+    source_shape = record.get("source_shape")
+    if (
+        not isinstance(source_shape, list)
+        or not source_shape
+        or any(
+            type(dimension) is not int or dimension <= 0 for dimension in source_shape
+        )
+    ):
+        raise ConversionError(f"legacy manifest {field}.source_shape is invalid")
+    desc = TensorDesc(
+        tensor_name,
+        dtype,
+        tuple(source_shape),
+        0,
+        math.prod(source_shape) * DTYPES[dtype][1],
+    )
+    plan = contract.plan(desc, rank)
+    if plan is None or not _same_json_contract(
+        record,
+        _tensor_manifest(plan, filename),
+    ):
+        raise ConversionError(
+            f"legacy manifest {field} does not match the pinned TP contract"
+        )
+    return plan
+
+
+def _validate_legacy_weight_file(
+    path: Path,
+    *,
+    filename: str,
+    record: dict,
+    plans: Sequence[TensorPlan],
+    rank: int,
+) -> tuple[int, int, int, int, int, int]:
+    identity_before = _regular_file_identity(path)
+    expected_bytes = _upgrade_int(
+        record.get("bytes"),
+        f"rank {rank}.files[{filename!r}].bytes",
+        minimum=1,
+    )
+    if identity_before[3] != expected_bytes:
+        raise ConversionError(
+            f"{path}: shard size {identity_before[3]} does not match legacy manifest "
+            f"size {expected_bytes}"
+        )
+    expected_checksum = _upgrade_sha256(
+        record.get("sha256"),
+        f"rank {rank}.files[{filename!r}].sha256",
+    )
+    actual_checksum = _sha256_regular_file(path)
+    if actual_checksum != expected_checksum:
+        raise ConversionError(
+            f"{path}: shard checksum does not match the legacy manifest"
+        )
+
+    expected_metadata = {
+        "format": "mlx",
+        "schema": LEGACY_SCHEMA,
+        "source_repo": SOURCE_REPO,
+        "source_revision": SOURCE_REVISION,
+        "source_file": filename,
+        "tp_rank": str(rank),
+        "tp_world_size": str(DEFAULT_WORLD_SIZE),
+        "sharding_contract": CONTRACT_VERSION,
+    }
+    expected_header, _header = _build_header(plans, expected_metadata)
+    canonical_size = (
+        8 + len(expected_header) + sum(plan.output_nbytes for plan in plans)
+    )
+    if expected_bytes != canonical_size:
+        raise ConversionError(
+            f"{path}: shard size is not canonical for its safetensors header"
+        )
+
+    with SafeTensorFile(path) as shard:
+        if shard.metadata != expected_metadata:
+            raise ConversionError(
+                f"{path}: safetensors metadata does not match the legacy TP contract"
+            )
+        expected_headers = {
+            plan.source.name: (plan.source.dtype, plan.output_shape) for plan in plans
+        }
+        actual_headers = {
+            name: (desc.dtype, desc.shape) for name, desc in shard.tensors.items()
+        }
+        if actual_headers != expected_headers:
+            raise ConversionError(
+                f"{path}: safetensors header does not match the legacy manifest"
+            )
+        cursor = shard.data_offset
+        for desc in shard.tensors.values():
+            if desc.data_start != cursor:
+                raise ConversionError(f"{path}: safetensors payload contains a gap")
+            cursor = desc.data_end
+        if cursor != identity_before[3]:
+            raise ConversionError(
+                f"{path}: safetensors descriptors do not cover the physical payload"
+            )
+
+    identity_after = _regular_file_identity(path)
+    if identity_after != identity_before:
+        raise ConversionError(f"{path}: shard changed while it was being validated")
+    return identity_after
+
+
+def _validate_legacy_rank(
+    root: Path,
+    manifest: dict,
+    contract: KimiK3ShardingContract,
+    rank: int,
+    expected_weight_map: Mapping[str, str],
+) -> tuple[dict[str, tuple[int, int, int, int, int, int]], dict]:
+    if manifest["tp"]["contract_digest"] != contract.contract_digest():
+        raise ConversionError(
+            f"rank {rank} manifest TP digest does not match its pinned config"
+        )
+
+    combined_tensors: dict[str, dict] = {}
+    observed: dict[str, tuple[int, int, int, int, int, int]] = {}
+    files = manifest["files"]
+    expected_files = set(expected_weight_map.values())
+    if set(files) != expected_files:
+        raise ConversionError(
+            f"rank {rank} shard inventory differs from the authenticated source index"
+        )
+    for raw_filename, raw_record in sorted(files.items()):
+        filename = _upgrade_basename(
+            raw_filename,
+            f"rank {rank}.files key",
+        )
+        record = _upgrade_object(
+            raw_record,
+            {"name", "bytes", "sha256", "tensor_count", "tensors"},
+            f"rank {rank}.files[{filename!r}]",
+        )
+        if (
+            _upgrade_basename(
+                record.get("name"),
+                f"rank {rank}.files[{filename!r}].name",
+            )
+            != filename
+        ):
+            raise ConversionError(
+                f"rank {rank} file record name differs from its manifest key"
+            )
+        tensors = record.get("tensors")
+        if not isinstance(tensors, dict) or not tensors:
+            raise ConversionError(
+                f"rank {rank} file {filename!r} has no tensor records"
+            )
+        tensor_count = _upgrade_int(
+            record.get("tensor_count"),
+            f"rank {rank}.files[{filename!r}].tensor_count",
+            minimum=1,
+        )
+        if tensor_count != len(tensors):
+            raise ConversionError(
+                f"rank {rank} file {filename!r} tensor_count is inconsistent"
+            )
+        plans: list[TensorPlan] = []
+        for tensor_name, tensor_record in sorted(tensors.items()):
+            if tensor_name in combined_tensors:
+                raise ConversionError(
+                    f"rank {rank} tensor {tensor_name!r} appears in multiple files"
+                )
+            plan = _validate_legacy_tensor_record(
+                tensor_name,
+                tensor_record,
+                filename=filename,
+                contract=contract,
+                rank=rank,
+                field=(f"rank {rank}.files[{filename!r}].tensors[{tensor_name!r}]"),
+            )
+            plans.append(plan)
+            combined_tensors[tensor_name] = tensor_record
+            if expected_weight_map.get(tensor_name) != filename:
+                raise ConversionError(
+                    f"rank {rank} tensor {tensor_name!r} source file differs from "
+                    "the authenticated source index"
+                )
+        path = root / filename
+        observed[str(path)] = _validate_legacy_weight_file(
+            path,
+            filename=filename,
+            record=record,
+            plans=plans,
+            rank=rank,
+        )
+
+    if not _same_json_contract(manifest["tensors"], combined_tensors):
+        raise ConversionError(
+            f"rank {rank} top-level tensor map differs from its file records"
+        )
+    if set(combined_tensors) != set(expected_weight_map):
+        raise ConversionError(
+            f"rank {rank} tensor inventory differs from the authenticated source index"
+        )
+    expected_data_bytes = sum(
+        int(tensor["bytes"]) for tensor in combined_tensors.values()
+    )
+    if manifest["rank_data_bytes"] != expected_data_bytes:
+        raise ConversionError(
+            f"rank {rank} rank_data_bytes differs from its tensor records"
+        )
+
+    index_path = root / "model.safetensors.index.json"
+    observed[str(index_path)] = _regular_file_identity(index_path)
+    index = _load_json_bytes(_read_regular_bytes(index_path), str(index_path))
+    expected_index = {
+        "metadata": {
+            "total_size": expected_data_bytes,
+            "source_total_parameters": manifest["source"]["total_parameters"],
+            "tp_rank": rank,
+            "tp_world_size": DEFAULT_WORLD_SIZE,
+            "source_revision": SOURCE_REVISION,
+        },
+        "weight_map": {
+            name: filename for name, filename in sorted(expected_weight_map.items())
+        },
+    }
+    if not _same_json_contract(index, expected_index):
+        raise ConversionError(
+            f"{index_path}: rank-local weight index differs from the legacy manifest"
+        )
+    if _regular_file_identity(index_path) != observed[str(index_path)]:
+        raise ConversionError(f"{index_path}: index changed while it was validated")
+    return observed, combined_tensors
+
+
+def _authenticated_rank_weight_map(
+    source_index_path: Path,
+    config: Mapping,
+    contract: KimiK3ShardingContract,
+) -> tuple[dict[str, str], tuple[int, int, int, int, int, int]]:
+    """Return the complete non-excluded inventory from the pinned source index."""
+
+    identity_before = _regular_file_identity(source_index_path)
+    source_index_bytes = _read_regular_bytes(source_index_path)
+    checksum = _sha256_bytes(source_index_bytes)
+    if checksum != SOURCE_INDEX_SHA256:
+        raise ConversionError(
+            f"{source_index_path}: expected pinned SHA-256 {SOURCE_INDEX_SHA256}, "
+            f"got {checksum}"
+        )
+    source_index = _load_json_bytes(source_index_bytes, str(source_index_path))
+    _validate_pinned_metadata_objects(
+        dict(config),
+        source_index,
+        f"authenticated source index {source_index_path}",
+    )
+    weight_map = source_index["weight_map"]
+    expected: dict[str, str] = {}
+    for raw_name, raw_filename in weight_map.items():
+        if not isinstance(raw_name, str) or not raw_name:
+            raise ConversionError(
+                f"{source_index_path}: source index has an invalid tensor name"
+            )
+        filename = _upgrade_basename(
+            raw_filename,
+            f"authenticated source index weight_map[{raw_name!r}]",
+        )
+        if contract.classify(raw_name, 1).kind != "excluded":
+            expected[raw_name] = filename
+    if not expected:
+        raise ConversionError(
+            f"{source_index_path}: authenticated source index has no rank tensors"
+        )
+    identity_after = _regular_file_identity(source_index_path)
+    if identity_after != identity_before:
+        raise ConversionError(
+            f"{source_index_path}: authenticated source index changed while read"
+        )
+    return expected, identity_after
+
+
+def _validate_rank_symmetry(manifests: Sequence[dict]) -> None:
+    rank0, rank1 = manifests
+    if not _same_json_contract(rank0["source"], rank1["source"]):
+        raise ConversionError("legacy rank source contracts are not symmetric")
+    if not _same_json_contract(rank0["runtime"], rank1["runtime"]):
+        raise ConversionError("legacy rank runtime contracts are not symmetric")
+    if set(rank0["files"]) != set(rank1["files"]):
+        raise ConversionError("legacy rank shard inventories are not symmetric")
+    if set(rank0["tensors"]) != set(rank1["tensors"]):
+        raise ConversionError("legacy rank tensor inventories are not symmetric")
+    if rank0["rank_data_bytes"] != rank1["rank_data_bytes"]:
+        raise ConversionError("legacy rank data sizes are not symmetric")
+
+    common_tensor_fields = {
+        "source_file",
+        "dtype",
+        "source_shape",
+        "rule",
+        "resolved_axis",
+    }
+    for name in rank0["tensors"]:
+        left = rank0["tensors"][name]
+        right = rank1["tensors"][name]
+        if any(left[field] != right[field] for field in common_tensor_fields):
+            raise ConversionError(
+                f"legacy tensor {name!r} source contracts are not symmetric"
+            )
+    for filename in rank0["files"]:
+        left = rank0["files"][filename]
+        right = rank1["files"][filename]
+        if left["tensor_count"] != right["tensor_count"]:
+            raise ConversionError(
+                f"legacy shard {filename!r} tensor counts are not symmetric"
+            )
+        if left["bytes"] != right["bytes"]:
+            raise ConversionError(
+                f"legacy shard {filename!r} file sizes are not symmetric"
+            )
+        if set(left["tensors"]) != set(right["tensors"]):
+            raise ConversionError(
+                f"legacy shard {filename!r} tensor inventories are not symmetric"
+            )
+
+
+def _validate_upgrade_metadata(
+    rank_dirs: Sequence[Path],
+    manifests: Sequence[dict],
+) -> tuple[
+    dict[str, dict[str, int | str]],
+    dict[str, tuple[int, int, int, int, int, int]],
+]:
+    rank_records: list[dict[str, dict[str, int | str]]] = []
+    observed: dict[str, tuple[int, int, int, int, int, int]] = {}
+    for rank, (root, manifest) in enumerate(zip(rank_dirs, manifests, strict=True)):
+        weight_filenames = set(manifest["files"])
+        expected_non_metadata = weight_filenames | set(INTERNAL_CHECKPOINT_FILENAMES)
+        actual_entries: set[str] = set()
+        for child in root.iterdir():
+            identity = _regular_file_identity(child)
+            actual_entries.add(child.name)
+            observed[str(child)] = identity
+        metadata_names = actual_entries - expected_non_metadata
+        missing_internal = expected_non_metadata - actual_entries
+        if missing_internal:
+            raise ConversionError(
+                f"rank {rank} checkpoint is missing manifest-listed files: "
+                f"{sorted(missing_internal)}"
+            )
+        expected_metadata_names = set(PINNED_METADATA_FILES)
+        if metadata_names != expected_metadata_names:
+            raise ConversionError(
+                f"rank {rank} checkpoint metadata inventory differs from the "
+                f"authenticated source: extra={sorted(metadata_names - expected_metadata_names)}, "
+                f"missing={sorted(expected_metadata_names - metadata_names)}"
+            )
+
+        records: dict[str, dict[str, int | str]] = {}
+        for name in sorted(metadata_names):
+            path = root / name
+            identity_before = observed[str(path)]
+            expected_record = PINNED_METADATA_FILES[name]
+            if identity_before[3] != expected_record["bytes"]:
+                raise ConversionError(
+                    f"{path}: metadata size differs from the authenticated source"
+                )
+            checksum = _sha256_regular_file(path)
+            if checksum != expected_record["sha256"]:
+                raise ConversionError(
+                    f"{path}: metadata checksum differs from the authenticated source"
+                )
+            if _regular_file_identity(path) != identity_before:
+                raise ConversionError(
+                    f"{path}: metadata changed while it was being validated"
+                )
+            records[name] = {
+                "bytes": identity_before[3],
+                "sha256": checksum,
+            }
+        rank_records.append(records)
+
+    if rank_records[0] != rank_records[1]:
+        raise ConversionError("rank metadata files are not byte-identical")
+    records = rank_records[0]
+    if records != PINNED_METADATA_FILES:
+        raise ConversionError("rank metadata contract differs from the pinned source")
+    return records, observed
+
+
+def _encode_json(payload: Mapping) -> bytes:
+    return (
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    ).encode("utf-8")
+
+
+def _pinned_metadata_contract_sha256() -> str:
+    return hashlib.sha256(
+        json.dumps(
+            PINNED_METADATA_FILES,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _deterministic_upgraded_manifest(original: Mapping) -> dict:
+    upgraded = dict(original)
+    upgraded["schema"] = SCHEMA
+    upgraded["metadata_files"] = PINNED_METADATA_FILES
+    upgraded["metadata_contract_sha256"] = _pinned_metadata_contract_sha256()
+    return upgraded
+
+
+def _stage_upgrade_payload(path: Path, payload: bytes, suffix: str) -> Path:
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=suffix,
+        dir=path.parent,
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        return tmp
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
+
+
+def _upgrade_transaction_id(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None
+        or value in {".", ".."}
+    ):
+        raise ConversionError(
+            "manifest upgrade transaction ID must be a safe 1-128 character name"
+        )
+    return value
+
+
+@contextlib.contextmanager
+def _manifest_upgrade_lock(transaction_root: Path):
+    lock_path = transaction_root / ".manifest-upgrade.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise ConversionError(f"{lock_path}: cannot open upgrade lock") from exc
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConversionError(
+                f"{transaction_root}: another manifest upgrade is active"
+            ) from exc
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _write_upgrade_artifact(path: Path, payload: bytes) -> dict[str, int | str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise ConversionError(f"{path}: cannot create transaction artifact") from exc
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        raise
+    return {
+        "artifact": path.name,
+        "bytes": len(payload),
+        "sha256": _sha256_bytes(payload),
+    }
+
+
+def _manifest_identity(path: Path) -> dict[str, int | str]:
+    identity_before = _regular_file_identity(path)
+    checksum = _sha256_regular_file(path)
+    identity_after = _regular_file_identity(path)
+    if identity_after != identity_before:
+        raise ConversionError(f"{path}: manifest changed while it was hashed")
+    return {"bytes": identity_after[3], "sha256": checksum}
+
+
+def _create_manifest_upgrade_transaction(
+    *,
+    transaction_root: Path,
+    transaction_id: str,
+    roots: Sequence[Path],
+    root_identities: Sequence[tuple[int, int]],
+    source_index: Path,
+    source_index_identity: tuple[int, int, int, int, int, int],
+    originals: Sequence[bytes],
+    upgraded: Sequence[bytes],
+) -> tuple[Path, dict]:
+    transaction_id = _upgrade_transaction_id(transaction_id)
+    transaction = transaction_root / transaction_id
+    try:
+        transaction.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise ConversionError(
+            f"{transaction}: transaction already exists; recover it or choose a new ID"
+        ) from exc
+    created: list[Path] = []
+    try:
+        rank_records: list[dict] = []
+        for rank, (root, root_identity, original, new) in enumerate(
+            zip(roots, root_identities, originals, upgraded, strict=True)
+        ):
+            original_path = transaction / f"rank{rank}.original.json"
+            upgraded_path = transaction / f"rank{rank}.upgraded.json"
+            original_record = _write_upgrade_artifact(original_path, original)
+            created.append(original_path)
+            upgraded_record = _write_upgrade_artifact(upgraded_path, new)
+            created.append(upgraded_path)
+            rank_records.append(
+                {
+                    "rank": rank,
+                    "root": str(root),
+                    "root_identity": list(root_identity),
+                    "manifest": str(root / "tp_manifest.json"),
+                    "original": original_record,
+                    "upgraded": upgraded_record,
+                }
+            )
+        _fsync_dir(transaction)
+        journal = {
+            "schema": MANIFEST_UPGRADE_TRANSACTION_SCHEMA,
+            "transaction_id": transaction_id,
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "state": "prepared",
+            "source_index": {
+                "path": str(source_index),
+                "sha256": SOURCE_INDEX_SHA256,
+                "identity": list(source_index_identity),
+            },
+            "ranks": rank_records,
+        }
+        _atomic_json(transaction / "transaction.json", journal)
+        _fsync_dir(transaction_root)
+        return transaction, journal
+    except BaseException:
+        for path in reversed(created):
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+        with contextlib.suppress(FileNotFoundError):
+            (transaction / "transaction.json").unlink()
+        with contextlib.suppress(OSError):
+            transaction.rmdir()
+        raise
+
+
+def _validate_transaction_artifact(
+    transaction: Path,
+    raw_record: object,
+    field: str,
+) -> tuple[Path, dict[str, int | str], bytes]:
+    record = _upgrade_object(raw_record, {"artifact", "bytes", "sha256"}, field)
+    artifact_name = _upgrade_basename(record.get("artifact"), f"{field}.artifact")
+    byte_count = _upgrade_int(record.get("bytes"), f"{field}.bytes")
+    checksum = _upgrade_sha256(record.get("sha256"), f"{field}.sha256")
+    path = transaction / artifact_name
+    identity_before = _regular_file_identity(path)
+    payload = _read_regular_bytes(path)
+    identity_after = _regular_file_identity(path)
+    if (
+        identity_after != identity_before
+        or len(payload) != byte_count
+        or _sha256_bytes(payload) != checksum
+    ):
+        raise ConversionError(f"{path}: transaction artifact identity mismatch")
+    return (
+        path,
+        {"artifact": artifact_name, "bytes": byte_count, "sha256": checksum},
+        payload,
+    )
+
+
+def _load_manifest_upgrade_transaction(transaction: Path) -> tuple[dict, list[dict]]:
+    transaction = _resolved_real_directory(transaction, "transaction directory")
+    journal = _load_regular_json(transaction / "transaction.json")
+    _upgrade_object(
+        journal,
+        {"schema", "transaction_id", "created_at", "state", "source_index", "ranks"},
+        "upgrade transaction",
+    )
+    if journal.get("schema") != MANIFEST_UPGRADE_TRANSACTION_SCHEMA:
+        raise ConversionError(f"{transaction}: unsupported transaction schema")
+    if _upgrade_transaction_id(journal.get("transaction_id")) != transaction.name:
+        raise ConversionError(f"{transaction}: transaction ID differs from its path")
+    if not isinstance(journal.get("created_at"), str) or not isinstance(
+        journal.get("state"), str
+    ):
+        raise ConversionError(f"{transaction}: malformed transaction state")
+    if journal["state"] not in MANIFEST_UPGRADE_TRANSACTION_STATES:
+        raise ConversionError(
+            f"{transaction}: unrecognized transaction state {journal['state']!r}"
+        )
+    source = _upgrade_object(
+        journal.get("source_index"),
+        {"path", "sha256", "identity"},
+        "upgrade transaction.source_index",
+    )
+    if source.get("sha256") != SOURCE_INDEX_SHA256:
+        raise ConversionError(f"{transaction}: source index pin differs from runtime")
+    if (
+        not isinstance(source.get("path"), str)
+        or not Path(source["path"]).is_absolute()
+    ):
+        raise ConversionError(f"{transaction}: source index path is not absolute")
+    source_identity = source.get("identity")
+    if (
+        not isinstance(source_identity, list)
+        or len(source_identity) != 6
+        or any(type(item) is not int for item in source_identity)
+    ):
+        raise ConversionError(f"{transaction}: malformed source index identity")
+
+    raw_ranks = journal.get("ranks")
+    if not isinstance(raw_ranks, list) or len(raw_ranks) != DEFAULT_WORLD_SIZE:
+        raise ConversionError(f"{transaction}: malformed rank transaction records")
+    ranks: list[dict] = []
+    for expected_rank, raw_rank in enumerate(raw_ranks):
+        field = f"upgrade transaction.ranks[{expected_rank}]"
+        record = _upgrade_object(
+            raw_rank,
+            {"rank", "root", "root_identity", "manifest", "original", "upgraded"},
+            field,
+        )
+        if record.get("rank") != expected_rank:
+            raise ConversionError(f"{transaction}: transaction rank order is invalid")
+        if (
+            not isinstance(record.get("root"), str)
+            or not Path(record["root"]).is_absolute()
+        ):
+            raise ConversionError(f"{transaction}: malformed rank root")
+        root = _resolved_real_directory(Path(record["root"]), "rank root")
+        root_identity = record.get("root_identity")
+        if (
+            not isinstance(root_identity, list)
+            or len(root_identity) != 2
+            or any(type(item) is not int for item in root_identity)
+            or tuple(root_identity) != _directory_identity(root)
+        ):
+            raise ConversionError(f"{root}: rank root identity changed")
+        manifest = root / "tp_manifest.json"
+        if record.get("manifest") != str(manifest):
+            raise ConversionError(f"{transaction}: malformed manifest path")
+        original_path, original, original_payload = _validate_transaction_artifact(
+            transaction, record.get("original"), f"{field}.original"
+        )
+        if original["sha256"] != LEGACY_MANIFEST_SHA256[expected_rank]:
+            raise ConversionError(
+                f"{original_path}: original rank-{expected_rank} manifest does not "
+                "match the compiled legacy identity"
+            )
+        original_manifest = _load_json_bytes(original_payload, str(original_path))
+        _validate_legacy_root_contract(original_manifest, expected_rank)
+        expected_upgraded_manifest = _deterministic_upgraded_manifest(original_manifest)
+        expected_upgraded_payload = _encode_json(expected_upgraded_manifest)
+        upgraded_path, upgraded, upgraded_payload = _validate_transaction_artifact(
+            transaction, record.get("upgraded"), f"{field}.upgraded"
+        )
+        if (
+            upgraded["bytes"] != len(expected_upgraded_payload)
+            or upgraded["sha256"] != _sha256_bytes(expected_upgraded_payload)
+            or upgraded_payload != expected_upgraded_payload
+        ):
+            raise ConversionError(
+                f"{upgraded_path}: upgraded artifact differs from the deterministic "
+                "compiled v2 transformation"
+            )
+        ranks.append(
+            {
+                "rank": expected_rank,
+                "root": root,
+                "root_identity": tuple(root_identity),
+                "manifest": manifest,
+                "original_path": original_path,
+                "original": original,
+                "original_manifest": original_manifest,
+                "upgraded_path": upgraded_path,
+                "upgraded": upgraded,
+                "upgraded_manifest": expected_upgraded_manifest,
+            }
+        )
+    return journal, ranks
+
+
+def _set_upgrade_transaction_state(
+    transaction: Path,
+    journal: dict,
+    state: str,
+) -> None:
+    current = journal.get("state")
+    if current not in MANIFEST_UPGRADE_TRANSACTION_STATES:
+        raise ConversionError(f"{transaction}: current transaction state is invalid")
+    if state not in MANIFEST_UPGRADE_STATE_TRANSITIONS[current]:
+        raise ConversionError(
+            f"{transaction}: invalid transaction state transition "
+            f"{current!r} -> {state!r}"
+        )
+    journal["state"] = state
+    _atomic_json(transaction / "transaction.json", journal)
+
+
+def _publish_transaction_artifact(
+    rank_record: Mapping,
+    target: str,
+) -> bool:
+    root = rank_record["root"]
+    if _directory_identity(root) != rank_record["root_identity"]:
+        raise ConversionError(f"{root}: rank root identity changed before publication")
+    manifest = rank_record["manifest"]
+    desired = rank_record[target]
+    other = rank_record["original" if target == "upgraded" else "upgraded"]
+    current = _manifest_identity(manifest)
+    if current == {"bytes": desired["bytes"], "sha256": desired["sha256"]}:
+        return False
+    if current != {"bytes": other["bytes"], "sha256": other["sha256"]}:
+        raise ConversionError(
+            f"{manifest}: current manifest is neither authenticated transaction state"
+        )
+    payload = _read_regular_bytes(rank_record[f"{target}_path"])
+    if len(payload) != desired["bytes"] or _sha256_bytes(payload) != desired["sha256"]:
+        raise ConversionError(
+            f"{manifest}: transaction artifact changed before publish"
+        )
+    staged = _stage_upgrade_payload(manifest, payload, ".upgrade-transaction.partial")
+    try:
+        if _directory_identity(root) != rank_record["root_identity"]:
+            raise ConversionError(f"{root}: rank root identity changed before replace")
+        if _manifest_identity(manifest) != current:
+            raise ConversionError(f"{manifest}: manifest changed before replace")
+        os.replace(staged, manifest)
+        _fsync_dir(root)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            staged.unlink()
+    if _manifest_identity(manifest) != {
+        "bytes": desired["bytes"],
+        "sha256": desired["sha256"],
+    }:
+        raise ConversionError(f"{manifest}: published manifest identity mismatch")
+    return True
+
+
+def _preflight_transaction_states(ranks: Sequence[Mapping]) -> None:
+    for record in ranks:
+        current = _manifest_identity(record["manifest"])
+        allowed = {
+            (record["original"]["bytes"], record["original"]["sha256"]),
+            (record["upgraded"]["bytes"], record["upgraded"]["sha256"]),
+        }
+        if (current["bytes"], current["sha256"]) not in allowed:
+            raise ConversionError(
+                f"{record['manifest']}: refusing to clobber an unrecognized manifest"
+            )
+
+
+def _validate_manifest_upgrade_checkpoint(
+    journal: Mapping,
+    ranks: Sequence[Mapping],
+) -> None:
+    """Full-hash every immutable input needed to complete a recovery."""
+
+    roots = [record["root"] for record in ranks]
+    manifests = [record["original_manifest"] for record in ranks]
+    for record in ranks:
+        if _directory_identity(record["root"]) != record["root_identity"]:
+            raise ConversionError(
+                f"{record['root']}: rank root identity changed during recovery"
+            )
+
+    source_path = Path(journal["source_index"]["path"])
+    source_identity = tuple(journal["source_index"]["identity"])
+    if (
+        _regular_file_identity(source_path) != source_identity
+        or _sha256_regular_file(source_path) != SOURCE_INDEX_SHA256
+    ):
+        raise ConversionError(
+            f"{source_path}: authenticated source index is unavailable or changed"
+        )
+
+    config_paths = [root / "config.json" for root in roots]
+    if [_sha256_regular_file(path) for path in config_paths] != [
+        SOURCE_CONFIG_SHA256
+    ] * DEFAULT_WORLD_SIZE:
+        raise ConversionError("rank config.json files do not match the pinned source")
+    configs = [_load_regular_json(path) for path in config_paths]
+    if configs[0] != configs[1]:
+        raise ConversionError("rank config.json files are not byte-equivalent JSON")
+    contract = KimiK3ShardingContract(configs[0], DEFAULT_WORLD_SIZE)
+    expected_weight_map, refreshed_source_identity = _authenticated_rank_weight_map(
+        source_path,
+        configs[0],
+        contract,
+    )
+    if refreshed_source_identity != source_identity:
+        raise ConversionError(
+            f"{source_path}: authenticated source index identity changed"
+        )
+
+    for rank, (root, manifest) in enumerate(zip(roots, manifests, strict=True)):
+        _validate_legacy_rank(
+            root,
+            manifest,
+            contract,
+            rank,
+            expected_weight_map,
+        )
+    _validate_rank_symmetry(manifests)
+    metadata_files, _observed = _validate_upgrade_metadata(roots, manifests)
+    if metadata_files != PINNED_METADATA_FILES:
+        raise ConversionError("rank metadata differs from the compiled source contract")
+
+
+def _recover_manifest_upgrade_locked(
+    transaction: Path,
+    *,
+    action: str,
+) -> dict:
+    if action not in {"rollback", "complete"}:
+        raise ConversionError("manifest recovery action must be rollback or complete")
+    journal, ranks = _load_manifest_upgrade_transaction(transaction)
+    _preflight_transaction_states(ranks)
+    if action == "complete":
+        _validate_manifest_upgrade_checkpoint(journal, ranks)
+    _set_upgrade_transaction_state(
+        transaction,
+        journal,
+        f"recovering-{action}",
+    )
+    target = "upgraded" if action == "complete" else "original"
+    ordered = ranks if action == "complete" else list(reversed(ranks))
+    for record in ordered:
+        _publish_transaction_artifact(record, target)
+        _set_upgrade_transaction_state(
+            transaction,
+            journal,
+            f"{action}-rank-{record['rank']}-durable",
+        )
+    if action == "complete":
+        _validate_manifest_upgrade_checkpoint(journal, ranks)
+    final_state = "committed" if action == "complete" else "rolled-back"
+    _set_upgrade_transaction_state(transaction, journal, final_state)
+    _preflight_transaction_states(ranks)
+    for record in ranks:
+        expected = record[target]
+        if _manifest_identity(record["manifest"]) != {
+            "bytes": expected["bytes"],
+            "sha256": expected["sha256"],
+        }:
+            raise ConversionError(
+                f"{record['manifest']}: recovery did not reach the requested state"
+            )
+    return {
+        "schema": MANIFEST_UPGRADE_SCHEMA,
+        "transaction": str(transaction),
+        "transaction_id": journal["transaction_id"],
+        "action": action,
+        "state": final_state,
+    }
+
+
+def recover_manifest_upgrade(*, transaction: Path, action: str) -> dict:
+    transaction = _resolved_real_directory(transaction, "transaction directory")
+    transaction_root = _resolved_real_directory(transaction.parent, "transaction root")
+    with _manifest_upgrade_lock(transaction_root):
+        return _recover_manifest_upgrade_locked(transaction, action=action)
+
+
+def _upgrade_rank_local_manifests_locked(
+    *,
+    roots: Sequence[Path],
+    source_index: Path,
+    transaction_root: Path,
+    transaction_id: str,
+) -> dict:
+    """Upgrade an already-complete TP2 v1 pair without source weights.
+
+    The two legacy manifests are treated only as claims.  This routine proves
+    the pinned source/runtime/TP contract, every rank shard checksum and header,
+    the rank-local indexes, cross-rank symmetry, and the exact metadata
+    allowlist before publishing either v2 manifest.
+    """
+
+    root_identities = [_directory_identity(root) for root in roots]
+
+    manifest_paths = [root / "tp_manifest.json" for root in roots]
+    manifest_identities = {
+        str(path): _regular_file_identity(path) for path in manifest_paths
+    }
+    manifest_originals = [_read_regular_bytes(path) for path in manifest_paths]
+    for rank, original in enumerate(manifest_originals):
+        actual_sha256 = _sha256_bytes(original)
+        if actual_sha256 != LEGACY_MANIFEST_SHA256[rank]:
+            raise ConversionError(
+                f"{manifest_paths[rank]}: legacy manifest SHA-256 differs from the "
+                f"compiled rank-{rank} identity"
+            )
+    manifests = [
+        _load_json_bytes(original, str(path))
+        for path, original in zip(manifest_paths, manifest_originals, strict=True)
+    ]
+    for rank, manifest in enumerate(manifests):
+        _validate_legacy_root_contract(manifest, rank)
+
+    config_paths = [root / "config.json" for root in roots]
+    config_hashes = [_sha256_regular_file(path) for path in config_paths]
+    if config_hashes != [SOURCE_CONFIG_SHA256] * DEFAULT_WORLD_SIZE:
+        raise ConversionError("rank config.json files do not match the pinned source")
+    configs = [_load_regular_json(path) for path in config_paths]
+    if configs[0] != configs[1]:
+        raise ConversionError("rank config.json files are not byte-equivalent JSON")
+    contract = KimiK3ShardingContract(configs[0], DEFAULT_WORLD_SIZE)
+    expected_weight_map, source_index_identity = _authenticated_rank_weight_map(
+        source_index,
+        configs[0],
+        contract,
+    )
+
+    observed: dict[str, tuple[int, int, int, int, int, int]] = {}
+    for rank, (root, manifest) in enumerate(zip(roots, manifests, strict=True)):
+        rank_observed, _tensors = _validate_legacy_rank(
+            root,
+            manifest,
+            contract,
+            rank,
+            expected_weight_map,
+        )
+        observed.update(rank_observed)
+    _validate_rank_symmetry(manifests)
+    metadata_files, metadata_observed = _validate_upgrade_metadata(roots, manifests)
+    for path, identity in metadata_observed.items():
+        if path in observed and observed[path] != identity:
+            raise ConversionError(f"{path}: checkpoint changed during validation")
+        observed[path] = identity
+
+    metadata_contract_sha256 = _pinned_metadata_contract_sha256()
+    if metadata_files != PINNED_METADATA_FILES:
+        raise ConversionError("validated metadata differs from the compiled contract")
+    upgraded_manifests = [
+        _deterministic_upgraded_manifest(manifest) for manifest in manifests
+    ]
+
+    refreshed_metadata, refreshed_observed = _validate_upgrade_metadata(
+        roots,
+        manifests,
+    )
+    if refreshed_metadata != metadata_files or refreshed_observed != observed:
+        raise ConversionError("checkpoint inventory changed before publication")
+    for path, expected in observed.items():
+        if _regular_file_identity(Path(path)) != expected:
+            raise ConversionError(f"{path}: checkpoint changed before publication")
+    for path, expected in manifest_identities.items():
+        if _regular_file_identity(Path(path)) != expected:
+            raise ConversionError(f"{path}: manifest changed before publication")
+    if (
+        _regular_file_identity(source_index) != source_index_identity
+        or _sha256_regular_file(source_index) != SOURCE_INDEX_SHA256
+    ):
+        raise ConversionError(
+            f"{source_index}: authenticated source index changed before publication"
+        )
+    for root, expected in zip(roots, root_identities, strict=True):
+        if _directory_identity(root) != expected:
+            raise ConversionError(f"{root}: rank root changed before publication")
+
+    payloads = [_encode_json(manifest) for manifest in upgraded_manifests]
+    transaction, journal = _create_manifest_upgrade_transaction(
+        transaction_root=transaction_root,
+        transaction_id=transaction_id,
+        roots=roots,
+        root_identities=root_identities,
+        source_index=source_index,
+        source_index_identity=source_index_identity,
+        originals=manifest_originals,
+        upgraded=payloads,
+    )
+    try:
+        journal, transaction_ranks = _load_manifest_upgrade_transaction(transaction)
+        for record in transaction_ranks:
+            if _manifest_identity(record["manifest"]) != {
+                "bytes": record["original"]["bytes"],
+                "sha256": record["original"]["sha256"],
+            }:
+                raise ConversionError(
+                    f"{record['manifest']}: legacy manifest changed before publication"
+                )
+        for record in transaction_ranks:
+            _publish_transaction_artifact(record, "upgraded")
+            _set_upgrade_transaction_state(
+                transaction,
+                journal,
+                f"rank-{record['rank']}-published",
+            )
+        _set_upgrade_transaction_state(transaction, journal, "committed")
+    except Exception as exc:
+        try:
+            _recover_manifest_upgrade_locked(transaction, action="rollback")
+        except Exception as rollback_exc:
+            raise ConversionError(
+                f"manifest upgrade failed and durable rollback also failed; "
+                f"recover transaction {transaction}: {rollback_exc}"
+            ) from exc
+        raise
+
+    for path, expected in zip(manifest_paths, upgraded_manifests, strict=True):
+        if _load_regular_json(path) != expected:
+            raise ConversionError(f"{path}: published v2 manifest failed validation")
+    refreshed_metadata, post_publish_observed = _validate_upgrade_metadata(
+        roots,
+        manifests,
+    )
+    if refreshed_metadata != metadata_files:
+        raise ConversionError("checkpoint metadata changed during publication")
+    manifest_path_strings = {str(path) for path in manifest_paths}
+    for path, expected in observed.items():
+        if (
+            path not in manifest_path_strings
+            and post_publish_observed.get(path) != expected
+        ):
+            raise ConversionError(f"{path}: checkpoint changed during publication")
+    if (
+        _regular_file_identity(source_index) != source_index_identity
+        or _sha256_regular_file(source_index) != SOURCE_INDEX_SHA256
+    ):
+        raise ConversionError(
+            f"{source_index}: authenticated source index changed during publication"
+        )
+    for root, expected in zip(roots, root_identities, strict=True):
+        if _directory_identity(root) != expected:
+            raise ConversionError(f"{root}: rank root changed during publication")
+
+    return {
+        "schema": MANIFEST_UPGRADE_SCHEMA,
+        "from_schema": LEGACY_SCHEMA,
+        "to_schema": SCHEMA,
+        "source_repo": SOURCE_REPO,
+        "source_revision": SOURCE_REVISION,
+        "tp_world_size": DEFAULT_WORLD_SIZE,
+        "contract_digest": contract.contract_digest(),
+        "metadata_files": metadata_files,
+        "metadata_contract_sha256": metadata_contract_sha256,
+        "authenticated_source_index": {
+            "path": str(source_index),
+            "sha256": SOURCE_INDEX_SHA256,
+            "tensor_count": len(expected_weight_map),
+            "weight_file_count": len(set(expected_weight_map.values())),
+        },
+        "ranks": [
+            {
+                "rank": rank,
+                "root": str(root.resolve()),
+                "manifest_sha256": _sha256_file(root / "tp_manifest.json"),
+                "weight_file_count": len(manifests[rank]["files"]),
+                "tensor_count": len(manifests[rank]["tensors"]),
+                "rank_data_bytes": manifests[rank]["rank_data_bytes"],
+            }
+            for rank, root in enumerate(roots)
+        ],
+        "transaction": {
+            "id": transaction_id,
+            "path": str(transaction),
+            "state": "committed",
+            "source_weights_modified": False,
+            "metadata_files_modified": False,
+            "both_manifests_validated_before_publish": True,
+            "per_manifest_atomic_replace": True,
+            "durable_recovery": True,
+            "recovery_actions": ["rollback", "complete"],
+        },
+    }
+
+
+def upgrade_rank_local_manifests(
+    *,
+    rank_dirs: Sequence[Path],
+    source_index: Path,
+    transaction_dir: Path,
+    transaction_id: str,
+) -> dict:
+    """Upgrade a complete TP2 v1 pair using authenticated, recoverable inputs."""
+
+    if len(rank_dirs) != DEFAULT_WORLD_SIZE:
+        raise ConversionError(
+            f"--rank-dir must be supplied exactly {DEFAULT_WORLD_SIZE} times"
+        )
+    roots = [
+        _resolved_real_directory(Path(root), f"rank {rank} root")
+        for rank, root in enumerate(rank_dirs)
+    ]
+    if len(set(roots)) != DEFAULT_WORLD_SIZE:
+        raise ConversionError("rank roots must be distinct")
+    source_index = Path(source_index)
+    if source_index.is_symlink():
+        raise ConversionError(
+            f"{source_index}: authenticated source index cannot be a symlink"
+        )
+    try:
+        source_index = source_index.resolve(strict=True)
+    except OSError as exc:
+        raise ConversionError(
+            f"{source_index}: authenticated source index is unavailable"
+        ) from exc
+    _regular_file_identity(source_index)
+    transaction_root = _resolved_real_directory(
+        Path(transaction_dir), "transaction root"
+    )
+    if any(
+        transaction_root == root or transaction_root.is_relative_to(root)
+        for root in roots
+    ):
+        raise ConversionError("transaction root cannot be inside a rank checkpoint")
+    _upgrade_transaction_id(transaction_id)
+    with _manifest_upgrade_lock(transaction_root):
+        return _upgrade_rank_local_manifests_locked(
+            roots=roots,
+            source_index=source_index,
+            transaction_root=transaction_root,
+            transaction_id=transaction_id,
+        )
 
 
 def convert_checkpoint(
@@ -2087,6 +3603,44 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     convert.add_argument("--cache-dir", type=Path, required=True)
     convert.add_argument("--max-buffer-mib", type=int, default=64)
     convert.add_argument("--keep-source", action="store_true")
+    upgrade = sub.add_parser(
+        "upgrade-manifests",
+        help="source-free, fail-closed upgrade of a complete TP2 v1 rank pair",
+    )
+    upgrade.add_argument(
+        "--rank-dir",
+        type=Path,
+        action="append",
+        required=True,
+        help="repeat exactly twice, rank 0 then rank 1",
+    )
+    upgrade.add_argument(
+        "--source-index",
+        type=Path,
+        required=True,
+        help="immutable raw source model.safetensors.index.json",
+    )
+    upgrade.add_argument(
+        "--transaction-dir",
+        type=Path,
+        required=True,
+        help="existing local directory for durable recovery records",
+    )
+    upgrade.add_argument(
+        "--transaction-id",
+        required=True,
+        help="unique deterministic identifier for this publication attempt",
+    )
+    recover = sub.add_parser(
+        "recover-manifests",
+        help="recover an interrupted manifest upgrade without clobbering unknown state",
+    )
+    recover.add_argument("--transaction", type=Path, required=True)
+    recover.add_argument(
+        "--action",
+        choices=("rollback", "complete"),
+        required=True,
+    )
     return parser.parse_args(argv)
 
 
@@ -2129,6 +3683,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_buffer_bytes=args.max_buffer_mib << 20,
                 keep_source=args.keep_source,
             )
+        elif args.command == "upgrade-manifests":
+            report = upgrade_rank_local_manifests(
+                rank_dirs=args.rank_dir,
+                source_index=args.source_index,
+                transaction_dir=args.transaction_dir,
+                transaction_id=args.transaction_id,
+            )
+            print(json.dumps(report, indent=2, sort_keys=True))
+        elif args.command == "recover-manifests":
+            report = recover_manifest_upgrade(
+                transaction=args.transaction,
+                action=args.action,
+            )
+            print(json.dumps(report, indent=2, sort_keys=True))
         return 0
     except (ConversionError, OSError, urllib.error.URLError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
