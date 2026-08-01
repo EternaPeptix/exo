@@ -173,10 +173,15 @@ class GenerationStats(BaseModel):
     # comparing ordinary and speculative end-to-end generation.
     decode_elapsed_seconds: float | None = None
     effective_generation_tps: float | None = None
+    # Speculative counters describe complete target-committed rounds. They can
+    # exceed visible ``generation_tokens`` when a textual stop trims an already
+    # committed multi-token round from the response stream.
     speculative_rounds: int = 0
     speculative_drafted_tokens: int = 0
     speculative_accepted_tokens: int = 0
     speculative_committed_tokens: int = 0
+    speculative_fallback_rounds: int = 0
+    speculative_error_rounds: int = 0
 
 
 class ImageGenerationStats(BaseModel):

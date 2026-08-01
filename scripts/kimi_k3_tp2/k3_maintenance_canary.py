@@ -79,6 +79,7 @@ ACCEPTED_FLAGS: Final[dict[str, str]] = {
     "EXO_MLX_JACCL_FORCE_MESH": "1",
     "EXO_MLX_MAX_ATTENTION_CELLS_PER_CHUNK": "268435456",
     "EXO_MLX_K3_VOCAB_PARALLEL_HEAD": "1",
+    "EXO_MLX_K3_VOCAB_PARALLEL_GREEDY": "1",
     "EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4": "0",
     "EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4": "0",
     "MLX_METAL_FAST_SYNCH": "1",
@@ -334,8 +335,7 @@ for interface in ("en3", "en4", "en5", "en6"):
     result = run(["/sbin/ifconfig", interface])
     interfaces[interface] = {"exists": result["returncode"] == 0, "active": "status: active" in result["stdout"], "raw": result["stdout"]}
 thunderbolt = run(["/usr/sbin/system_profiler", "SPThunderboltDataType", "-json", "-detailLevel", "mini"])
-speed_text = interfaces["en5"]["raw"] + "\n" + thunderbolt["stdout"]
-en5_link_bps = 80_000_000_000 if re.search(r"(?:80\s*Gb/s|80\s*Gbps|80Gbase)", speed_text, re.IGNORECASE) else None
+global_tb5_80g_present = bool(re.search(r"(?:80\s*Gb/s|80\s*Gbps|80Gbase)", thunderbolt["stdout"], re.IGNORECASE))
 ram = run(["/usr/sbin/sysctl", "-n", "hw.memsize"])
 disk = shutil.disk_usage(paths["artifact_root"] if os.path.exists(paths["artifact_root"]) else pathlib.Path(paths["artifact_root"]).parent)
 generate_text = required["exo_generate"].read_text() if required["exo_generate"].is_file() else ""
@@ -360,7 +360,11 @@ facts = {
     "rank_manifest_sha256": digest(required["rank_manifest"]) if required["rank_manifest"].is_file() else None,
     "transport": transport,
     "interfaces": interfaces,
-    "en5_link_bps": en5_link_bps,
+    # system_profiler does not authoritatively correlate a Thunderbolt port to
+    # BSD interface en5. Keep global TB5 evidence separate and fail DSpark
+    # readiness until a correlated/manual-attested fact is available.
+    "global_tb5_80g_present": global_tb5_80g_present,
+    "en5_tb5_correlated": False,
     "ram_bytes": int(ram["stdout"]) if ram["returncode"] == 0 and ram["stdout"].isdigit() else None,
     "disk_free_bytes": disk.free,
     "adapter_wired": "kimi_k3_dspark" in generate_text,
@@ -485,8 +489,8 @@ def validate_facts(node: Node, facts: Mapping[str, object]) -> list[str]:
             errors.append(
                 f"{interface} must be {'active' if expected_active else 'inactive'}"
             )
-    if facts.get("en5_link_bps") != 80_000_000_000:
-        errors.append("en5 must report an 80 Gb/s Thunderbolt link")
+    if facts.get("global_tb5_80g_present") is not True:
+        errors.append("system_profiler must report at least one 80 Gb/s TB5 link")
     ram = facts.get("ram_bytes")
     if type(ram) is not int or ram < MIN_RAM_BYTES:
         errors.append(f"physical RAM must be at least {MIN_RAM_BYTES} bytes")
@@ -631,11 +635,15 @@ def build_plan(
     reports: list[dict[str, object]] = []
     all_errors: list[str] = []
     adapter_wired = True
+    en5_tb5_correlated = True
     for node in inventory.nodes:
         facts = facts_by_rank[node.rank]
         errors = validate_facts(node, facts)
         all_errors.extend(f"{node.name}: {error}" for error in errors)
         adapter_wired = adapter_wired and facts.get("adapter_wired") is True
+        en5_tb5_correlated = (
+            en5_tb5_correlated and facts.get("en5_tb5_correlated") is True
+        )
         reports.append(
             {"node": node.name, "rank": node.rank, "pass": not errors, "errors": errors}
         )
@@ -652,10 +660,16 @@ def build_plan(
         "start-baseline": not all_errors and configured("start-baseline"),
         "rollback": not all_errors and configured("rollback"),
         "start-dspark-width3": (
-            not all_errors and adapter_wired and configured("start-dspark-width3")
+            not all_errors
+            and adapter_wired
+            and en5_tb5_correlated
+            and configured("start-dspark-width3")
         ),
         "start-dspark-width8": (
-            not all_errors and adapter_wired and configured("start-dspark-width8")
+            not all_errors
+            and adapter_wired
+            and en5_tb5_correlated
+            and configured("start-dspark-width8")
         ),
         "start-factorized-off": (not all_errors and configured("start-factorized-off")),
         "start-factorized-on": (not all_errors and configured("start-factorized-on")),
@@ -683,6 +697,8 @@ def build_plan(
             "active_interface": "en5",
             "active_rail": "rdma_en5",
             "expected_link_bps": 80_000_000_000,
+            "global_tb5_80g_evidence_only": True,
+            "en5_tb5_correlation_required_for_dspark": True,
             "device_matrix": EXPECTED_TRANSPORT_MATRIX,
         },
         "preflight": {
@@ -690,6 +706,7 @@ def build_plan(
             "reports": reports,
             "errors": all_errors,
             "adapter_wired_on_both_ranks": adapter_wired,
+            "en5_tb5_correlated_on_both_ranks": en5_tb5_correlated,
         },
         "accepted_flags": ACCEPTED_FLAGS,
         "actions": action_contract,

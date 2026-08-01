@@ -82,11 +82,23 @@ def _dtype_fix_config() -> dict:
 
 def _checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict]:
     root = tmp_path / "rank0"
-    root.mkdir()
+    root.mkdir(parents=True)
     config = root / "config.json"
     config.write_text('{"model_type":"kimi_k3"}')
     config_sha = hashlib.sha256(config.read_bytes()).hexdigest()
     monkeypatch.setattr(loader, "SOURCE_CONFIG_SHA256", config_sha)
+    license_path = root / "LICENSE"
+    license_path.write_text("synthetic Kimi K3 license")
+    metadata_files = {
+        "LICENSE": {
+            "bytes": license_path.stat().st_size,
+            "sha256": hashlib.sha256(license_path.read_bytes()).hexdigest(),
+        },
+        "config.json": {
+            "bytes": config.stat().st_size,
+            "sha256": config_sha,
+        },
+    }
 
     weight_name = "language_model.model.embed_tokens.weight"
     filename = "model-00001-of-00185.safetensors"
@@ -123,6 +135,10 @@ def _checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, 
             "contract_digest": loader.CONTRACT_DIGEST,
         },
         "rank_data_bytes": 32,
+        "metadata_files": metadata_files,
+        "metadata_contract_sha256": loader._canonical_metadata_contract(
+            metadata_files
+        ),
         "files": {
             filename: {
                 "name": filename,
@@ -156,6 +172,112 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
         test_only_allow_unpinned=False,
     )
     assert result["rank_data_bytes"] == 32
+
+
+def test_manifest_always_hashes_tokenizer_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root, manifest = _checkpoint(tmp_path, monkeypatch)
+    tokenizer = root / "tokenizer.json"
+    tokenizer.write_text('{"version":"1"}')
+    metadata = manifest["metadata_files"]
+    metadata["tokenizer.json"] = {
+        "bytes": tokenizer.stat().st_size,
+        "sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
+    }
+    manifest["metadata_contract_sha256"] = loader._canonical_metadata_contract(
+        metadata
+    )
+    (root / "tp_manifest.json").write_text(json.dumps(manifest))
+
+    tokenizer.write_text('{"version":"2"}')
+    with pytest.raises(loader.RankLocalLoadError, match="metadata checksum mismatch"):
+        loader._verify_manifest(
+            root,
+            FakeGroup(),
+            verify_file_hashes=False,
+            test_only_allow_unpinned=False,
+        )
+
+
+def test_manifest_rejects_extra_unmanifested_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root, _manifest = _checkpoint(tmp_path, monkeypatch)
+    (root / "tokenization_kimi.py").write_text("raise RuntimeError('unreviewed')")
+
+    with pytest.raises(loader.RankLocalLoadError, match="file inventory differs"):
+        loader._verify_manifest(
+            root,
+            FakeGroup(),
+            verify_file_hashes=False,
+            test_only_allow_unpinned=False,
+        )
+
+
+def test_manifest_rejects_missing_metadata_and_contract_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root, manifest = _checkpoint(tmp_path, monkeypatch)
+    (root / "LICENSE").unlink()
+    with pytest.raises(loader.RankLocalLoadError, match="missing or truncated metadata"):
+        loader._verify_manifest(
+            root,
+            FakeGroup(),
+            verify_file_hashes=False,
+            test_only_allow_unpinned=False,
+        )
+
+    root, manifest = _checkpoint(tmp_path / "second", monkeypatch)
+    manifest["metadata_contract_sha256"] = "0" * 64
+    (root / "tp_manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(loader.RankLocalLoadError, match="contract digest mismatch"):
+        loader._verify_manifest(
+            root,
+            FakeGroup(),
+            verify_file_hashes=False,
+            test_only_allow_unpinned=False,
+        )
+
+
+class _Gathered:
+    def __init__(self, values: list[int]):
+        self._values = values
+
+    def tolist(self) -> list[int]:
+        return self._values
+
+
+class _FakeDistributed:
+    def __init__(self, peer_row: list[int]):
+        self.peer_row = peer_row
+
+    def all_gather(self, local: list[int], *, group: FakeGroup) -> _Gathered:
+        assert group.size() == 2
+        return _Gathered([*local, *self.peer_row])
+
+
+class _FakeMx:
+    int32 = "int32"
+
+    def __init__(self, peer_row: list[int]):
+        self.distributed = _FakeDistributed(peer_row)
+
+    @staticmethod
+    def array(values: tuple[int, ...], *, dtype: str) -> list[int]:
+        assert dtype == "int32"
+        return list(values)
+
+    @staticmethod
+    def eval(_value: object) -> None:
+        return None
+
+
+def test_metadata_digest_must_agree_across_ranks():
+    local = "11" * 32
+    peer = list(bytes.fromhex("22" * 32))
+    with pytest.raises(loader.RankLocalLoadError, match="differs across"):
+        loader._agree_metadata_contract(_FakeMx(peer), FakeGroup(), local)
 
 
 def test_runtime_source_verification_uses_execution_pin(

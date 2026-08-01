@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from collections import OrderedDict
@@ -8,12 +9,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import k3_tp_checkpoint as checkpoint  # noqa: E402
-
 from k3_tp_checkpoint import (  # noqa: E402
     ConversionError,
     KimiK3ShardingContract,
@@ -305,9 +304,11 @@ def test_safetensors_rejects_header_shape_byte_mismatch(tmp_path: Path):
     raw = json.dumps(header).encode()
     raw += b" " * ((-len(raw)) % 8)
     path.write_bytes(len(raw).to_bytes(8, "little") + raw + b"\0" * 8)
-    with pytest.raises(ConversionError, match="shape implies"):
-        with SafeTensorFile(path):
-            pass
+    with (
+        pytest.raises(ConversionError, match="shape implies"),
+        SafeTensorFile(path),
+    ):
+        pass
 
 
 def test_audit_shard_is_read_only_and_resolves_both_tp2_plans(
@@ -601,7 +602,15 @@ def test_copy_metadata_uses_allowlist_and_preserves_license(tmp_path: Path):
     (metadata / "unexpected.txt").write_text("not part of the allowlist")
     rank_dirs = [tmp_path / "rank0", tmp_path / "rank1"]
 
-    checkpoint._copy_metadata_files(metadata, rank_dirs)
+    records = checkpoint._copy_metadata_files(metadata, rank_dirs)
+
+    assert records == {
+        name: {
+            "bytes": (metadata / name).stat().st_size,
+            "sha256": hashlib.sha256((metadata / name).read_bytes()).hexdigest(),
+        }
+        for name in ("LICENSE", "config.json", "tokenizer.json")
+    }
 
     for rank_dir in rank_dirs:
         assert (rank_dir / "config.json").is_file()

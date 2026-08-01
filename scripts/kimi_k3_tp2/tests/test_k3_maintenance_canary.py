@@ -110,6 +110,7 @@ def _facts(
     *,
     adapter_wired: bool = False,
     factorized_wire_is_ancestor: bool = True,
+    en5_tb5_correlated: bool = False,
 ) -> dict[str, object]:
     return {
         "schema": canary.FACTS_SCHEMA,
@@ -158,7 +159,8 @@ def _facts(
             }
             for interface in ("en3", "en4", "en5", "en6")
         },
-        "en5_link_bps": 80_000_000_000,
+        "global_tb5_80g_present": True,
+        "en5_tb5_correlated": en5_tb5_correlated,
         "ram_bytes": canary.MIN_RAM_BYTES,
         "disk_free_bytes": canary.MIN_DISK_FREE_BYTES,
         "adapter_wired": adapter_wired,
@@ -200,11 +202,13 @@ def test_plan_pins_abba_gates_and_disabled_unwired_actions(
     preflight = _mapping(plan["preflight"])
     assert preflight["pass"] is True
     assert preflight["adapter_wired_on_both_ranks"] is False
+    assert preflight["en5_tb5_correlated_on_both_ranks"] is False
     readiness = _mapping(plan["action_readiness"])
     assert readiness["start-baseline"] is True
     assert readiness["start-dspark-width3"] is False
     assert readiness["start-dspark-width8"] is False
     accepted_flags = _mapping(plan["accepted_flags"])
+    assert accepted_flags["EXO_MLX_K3_VOCAB_PARALLEL_GREEDY"] == "1"
     assert accepted_flags["MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"] == "0"
     assert accepted_flags["MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE"] == "0"
 
@@ -260,6 +264,36 @@ def test_checked_in_inventory_is_candidate_pinned_and_legacy_actions_are_rollbac
         contract = _mapping(inventory.actions[action])
         assert contract["enabled"] is False
         assert "hardware canary" in str(contract["reason"]).lower()
+
+
+def test_dspark_readiness_requires_en5_to_tb5_correlation(tmp_path: Path) -> None:
+    data = _inventory_data()
+    actions = _mutable_mapping(data["actions"])
+    dspark = _mutable_mapping(actions["start-dspark-width3"])
+    dspark["enabled"] = True
+    dspark["steps"] = [{"argv": ["/usr/bin/true"], "environment": {}}]
+    inventory = canary.load_inventory(_write_inventory(tmp_path, data))
+    uncorrelated = {
+        node.rank: _facts(node, adapter_wired=True) for node in inventory.nodes
+    }
+    correlated = {
+        node.rank: _facts(
+            node,
+            adapter_wired=True,
+            en5_tb5_correlated=True,
+        )
+        for node in inventory.nodes
+    }
+
+    uncorrelated_readiness = _mapping(
+        canary.build_plan(inventory, uncorrelated)["action_readiness"]
+    )
+    correlated_readiness = _mapping(
+        canary.build_plan(inventory, correlated)["action_readiness"]
+    )
+
+    assert uncorrelated_readiness["start-dspark-width3"] is False
+    assert correlated_readiness["start-dspark-width3"] is True
 
 
 def test_preflight_rejects_missing_factorized_wire_ancestor(tmp_path: Path) -> None:

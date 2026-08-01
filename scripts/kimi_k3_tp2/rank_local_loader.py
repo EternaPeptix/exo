@@ -29,9 +29,9 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = "aa2e11efdfc33c3847c5594524e579199009931b"
+RUNTIME_MLX_LM_COMMIT = "1bcf43047a5a2c4a5be64f3c45ed33666981d1c1"
 MLX_LM_KIMI_K3_SHA256 = (
-    "571fe7e7cec44f9eeb34ab8d7ed3ec5f8e412f5cfbbbff3f95260221b72b901a"
+    "3e283240117d298d95e33f7238cb49abc5606aafdd26f70062e841518059088b"
 )
 MLX_LM_KIMI_K3_DSPARK_SHA256 = (
     "5ba010755e703f39b86aed1ad999576a18f2f93c041b502bbe3f57b197af2f01"
@@ -43,13 +43,48 @@ SOURCE_CONFIG_SHA256 = (
     "d041003554810a367bb600d18733976bdd21041bb46e75cc1e27c7b15fe034d0"
 )
 SOURCE_INDEX_SHA256 = "ac65bcb3cd9e07cab3e7942ff455dde33879a9e02211bae40938e22fc204ae09"
-SCHEMA = "k3-rank-local-tp/v1"
+SCHEMA = "k3-rank-local-tp/v2"
 CONTRACT_VERSION = "mlx-lm-kimi-k3-shard@7d505c2"
 CONTRACT_DIGEST = "1b7fdf1b28433fb08fff7e0e26a7bccc2ca0fcd51f29498ab611892c9fc48da5"
 DTYPE_FIX_CONTRACT = "kernelpool-k3-fp32-norm-conv-to-bf16/v1"
 DTYPE_FIX_TENSOR_COUNT = 138
 DTYPE_FIX_KDA_LAYER_COUNT = 69
 DTYPE_FIX_TP2_RANK_ELEMENTS = 5_096_064
+
+# This must remain byte-for-byte aligned with ``k3_tp_checkpoint.py``.  In
+# particular, do not accept arbitrary Python siblings when the tokenizer is
+# later loaded with ``trust_remote_code=True``.
+ALLOWED_METADATA_FILENAMES = frozenset(
+    {
+        "LICENSE",
+        "LICENSE.md",
+        "LICENSE.txt",
+        "README.md",
+        "added_tokens.json",
+        "chat_template.jinja",
+        "config.json",
+        "configuration_kimi_k3.py",
+        "encoding_k3.py",
+        "generation_config.json",
+        "kimi_k3_processor.py",
+        "kimi_k3_vision_processing.py",
+        "media_utils.py",
+        "merges.txt",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "special_tokens_map.json",
+        "tokenization_kimi.py",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "video_preprocessor_config.json",
+        "vocab.json",
+    }
+)
+REQUIRED_METADATA_FILENAMES = frozenset({"config.json"})
+LICENSE_FILENAMES = frozenset({"LICENSE", "LICENSE.md", "LICENSE.txt"})
+INTERNAL_CHECKPOINT_FILENAMES = frozenset(
+    {"model.safetensors.index.json", "tp_manifest.json"}
+)
 
 
 class RankLocalLoadError(RuntimeError):
@@ -89,6 +124,168 @@ def _load_json(path: Path) -> dict:
     if not isinstance(value, dict):
         raise RankLocalLoadError(f"{path}: expected a JSON object")
     return value
+
+
+def _canonical_metadata_contract(
+    metadata_files: Mapping[str, Mapping[str, int | str]],
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            metadata_files,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _verify_metadata_contract(
+    model_dir: Path,
+    manifest: Mapping[str, Any],
+    source: Mapping[str, Any],
+    weight_filenames: set[str],
+) -> str:
+    raw_metadata = manifest.get("metadata_files")
+    if not isinstance(raw_metadata, Mapping) or not raw_metadata:
+        raise RankLocalLoadError("rank-local manifest has no metadata_files")
+
+    normalized: dict[str, dict[str, int | str]] = {}
+    for raw_name, raw_record in raw_metadata.items():
+        if not isinstance(raw_name, str) or raw_name not in ALLOWED_METADATA_FILENAMES:
+            raise RankLocalLoadError(
+                f"rank-local manifest contains unallowlisted metadata {raw_name!r}"
+            )
+        name = _safe_checkpoint_relative(raw_name)
+        if name != raw_name or "/" in name or not isinstance(raw_record, Mapping):
+            raise RankLocalLoadError(
+                f"malformed rank-local metadata record for {raw_name!r}"
+            )
+        if set(raw_record) != {"bytes", "sha256"}:
+            raise RankLocalLoadError(
+                f"malformed rank-local metadata record for {name}"
+            )
+        byte_count = raw_record.get("bytes")
+        checksum = raw_record.get("sha256")
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count < 0
+            or not isinstance(checksum, str)
+            or SHA256_RE.fullmatch(checksum) is None
+        ):
+            raise RankLocalLoadError(
+                f"malformed rank-local metadata record for {name}"
+            )
+        path = model_dir / name
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size != byte_count
+        ):
+            raise RankLocalLoadError(f"missing or truncated metadata file {path}")
+        if _sha256_file(path) != checksum:
+            raise RankLocalLoadError(f"metadata checksum mismatch: {path}")
+        normalized[name] = {"bytes": byte_count, "sha256": checksum}
+
+    missing = REQUIRED_METADATA_FILENAMES - normalized.keys()
+    if missing:
+        raise RankLocalLoadError(
+            f"rank-local metadata is missing required files: {sorted(missing)}"
+        )
+    if not LICENSE_FILENAMES.intersection(normalized):
+        raise RankLocalLoadError("rank-local metadata is missing the Kimi K3 license")
+    if normalized["config.json"]["sha256"] != source.get("config_sha256"):
+        raise RankLocalLoadError(
+            "metadata config hash differs from the source manifest"
+        )
+
+    expected_digest = manifest.get("metadata_contract_sha256")
+    actual_digest = _canonical_metadata_contract(normalized)
+    if (
+        not isinstance(expected_digest, str)
+        or SHA256_RE.fullmatch(expected_digest) is None
+        or expected_digest != actual_digest
+    ):
+        raise RankLocalLoadError("rank-local metadata contract digest mismatch")
+
+    expected_entries = (
+        set(normalized) | weight_filenames | set(INTERNAL_CHECKPOINT_FILENAMES)
+    )
+    actual_entries: set[str] = set()
+    for child in model_dir.iterdir():
+        if child.is_symlink() or not child.is_file():
+            raise RankLocalLoadError(
+                f"rank-local checkpoint contains a non-regular entry: {child}"
+            )
+        actual_entries.add(child.name)
+    if actual_entries != expected_entries:
+        extra = sorted(actual_entries - expected_entries)
+        missing_entries = sorted(expected_entries - actual_entries)
+        raise RankLocalLoadError(
+            "rank-local checkpoint file inventory differs from the signed "
+            f"manifest: extra={extra}, missing={missing_entries}"
+        )
+    return actual_digest
+
+
+def _error_fingerprint(error: BaseException | None) -> int:
+    if error is None:
+        return 0
+    digest = hashlib.sha256(
+        f"{type(error).__name__}: {error}".encode("utf-8", errors="replace")
+    ).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+
+
+def _all_gather_rows(mx: Any, group: Any, row: tuple[int, ...]) -> list[list[int]]:
+    gathered = mx.distributed.all_gather(
+        mx.array(row, dtype=mx.int32),
+        group=group,
+    )
+    mx.eval(gathered)
+    values = list(gathered.tolist())
+    expected = group.size() * len(row)
+    if len(values) != expected:
+        raise RankLocalLoadError(
+            f"rank agreement returned {len(values)} values, expected {expected}"
+        )
+    return [
+        [int(value) for value in values[offset : offset + len(row)]]
+        for offset in range(0, len(values), len(row))
+    ]
+
+
+def _agree_local_validation(
+    mx: Any,
+    group: Any,
+    label: str,
+    local_error: BaseException | None,
+) -> None:
+    rows = _all_gather_rows(
+        mx,
+        group,
+        (int(local_error is None), _error_fingerprint(local_error)),
+    )
+    if all(row[0] == 1 and row[1] == 0 for row in rows):
+        return
+    if local_error is not None:
+        raise RankLocalLoadError(f"{label} failed locally: {local_error}") from local_error
+    failures = [
+        f"rank {rank} fingerprint {row[1]}"
+        for rank, row in enumerate(rows)
+        if row[0] != 1 or row[1] != 0
+    ]
+    raise RankLocalLoadError(f"{label} failed on peer: {', '.join(failures)}")
+
+
+def _agree_metadata_contract(mx: Any, group: Any, digest: str) -> None:
+    if SHA256_RE.fullmatch(digest) is None:
+        raise RankLocalLoadError("invalid local metadata contract digest")
+    local_bytes = bytes.fromhex(digest)
+    rows = _all_gather_rows(mx, group, tuple(local_bytes))
+    if any(row != rows[0] for row in rows[1:]):
+        raise RankLocalLoadError(
+            "rank-local metadata contract differs across tensor-parallel ranks"
+        )
 
 
 def _verify_runtime_source() -> None:
@@ -284,6 +481,12 @@ def _verify_manifest(
             raise RankLocalLoadError(f"missing or truncated rank file {path}")
         if verify_file_hashes and _sha256_file(path) != record["sha256"]:
             raise RankLocalLoadError(f"rank file checksum mismatch: {path}")
+    _verify_metadata_contract(
+        model_dir,
+        manifest,
+        source,
+        set(normalized_files),
+    )
     return manifest
 
 
@@ -418,8 +621,9 @@ def load_rank_local_model(
 ):
     """Load a rank-local K3 TP checkpoint without materializing full weights.
 
-    File checksums are optional because hashing ~400 GB adds a complete disk
-    pass.  File sizes, manifest/config pins, rank/world, model source hash, and
+    Weight checksums are optional because hashing ~400 GB adds a complete disk
+    pass.  Every small metadata file is always hashed and agreed across ranks;
+    weight sizes, manifest/config pins, rank/world, model source hash, and
     strict parameter names/shapes are always checked.
     """
 
@@ -440,13 +644,32 @@ def load_rank_local_model(
 
     model_dir = Path(model_dir).resolve()
     group = tensor_group or mx.distributed.init()
-    _verify_runtime_source()
-    manifest = _verify_manifest(
-        model_dir,
-        group,
-        verify_file_hashes=verify_file_hashes,
-        test_only_allow_unpinned=test_only_allow_unpinned,
-    )
+    runtime_error: Exception | None = None
+    try:
+        _verify_runtime_source()
+    except Exception as exc:
+        runtime_error = exc
+    _agree_local_validation(mx, group, "execution runtime validation", runtime_error)
+
+    manifest: dict[str, Any] | None = None
+    manifest_error: Exception | None = None
+    try:
+        manifest = _verify_manifest(
+            model_dir,
+            group,
+            verify_file_hashes=verify_file_hashes,
+            test_only_allow_unpinned=test_only_allow_unpinned,
+        )
+    except Exception as exc:
+        manifest_error = exc
+    _agree_local_validation(mx, group, "checkpoint validation", manifest_error)
+    if manifest is None:
+        raise RankLocalLoadError("checkpoint validation produced no manifest")
+    metadata_digest = manifest.get("metadata_contract_sha256")
+    if not isinstance(metadata_digest, str):
+        raise RankLocalLoadError("checkpoint has no metadata contract digest")
+    _agree_metadata_contract(mx, group, metadata_digest)
+
     config = load_config(model_dir)
     if config.get("model_type") != "kimi_k3":
         raise RankLocalLoadError("rank-local config is not Kimi K3")

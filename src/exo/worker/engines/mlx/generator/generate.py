@@ -112,6 +112,8 @@ class _PromptLookupTelemetry:
     drafted_tokens: int = 0
     accepted_tokens: int = 0
     committed_tokens: int = 0
+    fallback_rounds: int = 0
+    error_rounds: int = 0
 
     def observe(self, stats: "_SpeculativeRoundStatsLike") -> None:
         self.rounds += 1
@@ -120,12 +122,20 @@ class _PromptLookupTelemetry:
         self.committed_tokens += int(stats.committed_tokens)
 
     def observe_dspark_round(self, stats: DSparkRoundTelemetry) -> None:
+        """Account committed speculative work at the target transaction boundary.
+
+        A textual stop can end response iteration partway through an already
+        committed multi-token round.  These counters intentionally describe
+        internal speculative decisions, while public completion_tokens remains
+        the number of visible response tokens.
+        """
+
         self.rounds += 1
         self.drafted_tokens += stats.proposed
-
-    def observe_dspark_token(self, accepted_draft: bool) -> None:
-        self.committed_tokens += 1
-        self.accepted_tokens += int(accepted_draft)
+        self.accepted_tokens += stats.accepted
+        self.committed_tokens += stats.emitted
+        self.fallback_rounds += int(stats.fallback)
+        self.error_rounds += int(stats.error is not None)
 
 
 class _SpeculativeRoundStatsLike(Protocol):
@@ -143,6 +153,10 @@ class _PromptLookupStreamKwargs(TypedDict):
     prompt_lookup_max_ngram_size: int
     prompt_lookup_history: mx.array
     speculative_round_callback: Callable[[_SpeculativeRoundStatsLike], None] | None
+
+
+class _GreedyVocabParallelStreamKwargs(TypedDict, total=False):
+    greedy_vocab_parallel_no_logprobs: bool
 
 
 class _PromptLookupStreamGenerate(Protocol):
@@ -182,6 +196,32 @@ def _strict_env_flag(name: str, value: str) -> bool:
     if value not in {"0", "1"}:
         raise ValueError(f"{name} must be 0 or 1")
     return value == "1"
+
+
+def greedy_vocab_parallel_stream_kwargs(
+    *,
+    temperature: float,
+    logprobs: bool,
+    has_logits_processors: bool,
+    is_pipeline: bool,
+    speculative: bool,
+) -> _GreedyVocabParallelStreamKwargs:
+    """Enable compact TP argmax only for the exact request shape it supports."""
+
+    enabled = _strict_env_flag(
+        "EXO_MLX_K3_VOCAB_PARALLEL_GREEDY",
+        os.environ.get("EXO_MLX_K3_VOCAB_PARALLEL_GREEDY", "0"),
+    )
+    if (
+        not enabled
+        or temperature != 0.0
+        or logprobs
+        or has_logits_processors
+        or is_pipeline
+        or speculative
+    ):
+        return {}
+    return {"greedy_vocab_parallel_no_logprobs": True}
 
 
 def prompt_lookup_config(
@@ -842,12 +882,15 @@ def warmup_inference(
         raise ValueError("EXO_MLX_WARMUP_OUTPUT_TOKENS must be an integer") from error
     if not 1 <= warmup_tokens <= 256:
         raise ValueError("EXO_MLX_WARMUP_OUTPUT_TOKENS must be between 1 and 256")
+    if dspark is not None:
+        warmup_tokens = max(warmup_tokens, 2 * dspark.verify_width)
 
     warmup_task_params = TextGenerationTaskParams(
         model=model_id,
         input=[InputMessage(role="user", content=content)],
         max_output_tokens=warmup_tokens,
         temperature=0.0,
+        bench=dspark is not None,
     )
 
     warmup_prompt = apply_chat_template(
@@ -856,6 +899,7 @@ def warmup_inference(
     )
 
     tokens_generated = 0
+    final_stats: GenerationStats | None = None
 
     mx_barrier(group)
 
@@ -863,7 +907,7 @@ def warmup_inference(
 
     t = time.monotonic()
 
-    for _r in mlx_generate(
+    for response in mlx_generate(
         model=model,
         tokenizer=tokenizer,
         task=warmup_task_params,
@@ -873,6 +917,24 @@ def warmup_inference(
         dspark=dspark,
     ):
         tokens_generated += 1
+        if response.stats is not None:
+            final_stats = response.stats
+
+    if dspark is not None:
+        required_drafted = 2 * (dspark.verify_width - 1)
+        if tokens_generated < 2 * dspark.verify_width or final_stats is None:
+            raise RuntimeError(
+                "Kimi K3 DSpark warmup did not complete its two-round output budget"
+            )
+        if (
+            final_stats.speculative_rounds < 2
+            or final_stats.speculative_drafted_tokens < required_drafted
+            or final_stats.speculative_fallback_rounds != 0
+            or final_stats.speculative_error_rounds != 0
+        ):
+            raise RuntimeError(
+                "Kimi K3 DSpark warmup did not complete two clean speculative rounds"
+            )
 
     check_for_cancel_every = min(
         math.ceil(tokens_generated / min(time.monotonic() - t, 0.001)), 100
@@ -983,7 +1045,6 @@ def _dspark_mlx_responses(
             max_tokens=max_tokens,
             eos_token_ids=eos_token_ids,
             round_observer=telemetry.observe_dspark_round,
-            token_observer=telemetry.observe_dspark_token,
         ),
         start=1,
     ):
@@ -1212,6 +1273,15 @@ def mlx_generate(
             eos_token_ids = tuple(eos_ids_from_tokenizer(tokenizer))
             banned_token_ids = eos_token_ids if is_bench else ()
             terminal_token_ids = () if is_bench else eos_token_ids
+            compact_greedy = bool(
+                greedy_vocab_parallel_stream_kwargs(
+                    temperature=0.0,
+                    logprobs=False,
+                    has_logits_processors=False,
+                    is_pipeline=False,
+                    speculative=False,
+                )
+            )
             dspark_runtime = KimiK3DSparkRequestRuntime.create(
                 dspark,
                 model,
@@ -1224,6 +1294,7 @@ def mlx_generate(
                 ),
                 banned_token_ids=banned_token_ids,
                 terminal_token_ids=terminal_token_ids,
+                compact_greedy=compact_greedy,
             )
             mx_barrier(group)
             prefill_tps, prefill_tokens = dspark_runtime.seed_prompt(
@@ -1337,6 +1408,13 @@ def mlx_generate(
             all_prompt_tokens,
             prompt_lookup_telemetry,
         )
+        greedy_vocab_parallel_kwargs = greedy_vocab_parallel_stream_kwargs(
+            temperature=task.temperature if task.temperature is not None else 0.7,
+            logprobs=task.logprobs,
+            has_logits_processors=bool(logits_processors),
+            is_pipeline=is_pipeline,
+            speculative=prompt_lookup_kwargs is not None or dspark_runtime is not None,
+        )
         # MLX-LM normally launches token N+1 before yielding token N. If token N
         # is EOS (or EXO matches a stop sequence), abandoning that lookahead
         # leaves pipeline rank zero in an unmatched send while the final rank
@@ -1364,6 +1442,7 @@ def mlx_generate(
                 prefill_step_size=1,
                 kv_group_size=KV_GROUP_SIZE,
                 kv_bits=KV_BITS,
+                **greedy_vocab_parallel_kwargs,
             )
         else:
             prompt_lookup_generate = cast(
@@ -1444,6 +1523,10 @@ def mlx_generate(
                     speculative_committed_tokens=(
                         prompt_lookup_telemetry.committed_tokens
                     ),
+                    speculative_fallback_rounds=(
+                        prompt_lookup_telemetry.fallback_rounds
+                    ),
+                    speculative_error_rounds=prompt_lookup_telemetry.error_rounds,
                 )
                 if not stop_matched and out.finish_reason not in get_args(FinishReason):
                     logger.warning(

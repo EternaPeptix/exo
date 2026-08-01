@@ -119,6 +119,18 @@ def _rank_checkpoint(root: Path, *, manifest_rank: int = 1) -> tuple[Path, Path]
     config = root / "config.json"
     config.write_text(TEST_CONFIG, encoding="utf-8")
     config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    license_path = root / "LICENSE"
+    license_path.write_text("synthetic Kimi K3 license", encoding="utf-8")
+    metadata_files: dict[str, dict[str, object]] = {
+        "LICENSE": {
+            "bytes": license_path.stat().st_size,
+            "sha256": hashlib.sha256(license_path.read_bytes()).hexdigest(),
+        },
+        "config.json": {
+            "bytes": config.stat().st_size,
+            "sha256": config_sha256,
+        },
+    }
 
     weight = root / "model-00001-of-00185.safetensors"
     weight.write_bytes(b"rank-local-weight")
@@ -133,7 +145,7 @@ def _rank_checkpoint(root: Path, *, manifest_rank: int = 1) -> tuple[Path, Path]
         json.dumps(index), encoding="utf-8"
     )
     manifest = {
-        "schema": "k3-rank-local-tp/v1",
+        "schema": "k3-rank-local-tp/v2",
         "complete": True,
         "source": {
             "repo": str(MODEL_ID),
@@ -152,6 +164,10 @@ def _rank_checkpoint(root: Path, *, manifest_rank: int = 1) -> tuple[Path, Path]
             "contract_digest": download_utils.SUPPORTED_TP_CONTRACT_DIGEST,
         },
         "rank_data_bytes": tensor_bytes,
+        "metadata_files": metadata_files,
+        "metadata_contract_sha256": (
+            download_utils._rank_local_metadata_contract_sha256(metadata_files)
+        ),
         "files": {
             weight.name: {
                 "name": weight.name,
@@ -375,7 +391,46 @@ def test_weight_payload_is_size_checked_not_hashed_during_readiness(
     monkeypatch.setattr(download_utils, "_rank_local_sha256", record_small_hash)
 
     assert resolve_existing_model_for_shard(MODEL_ID, _tensor_shard()) == checkpoint
-    assert hashed_paths == [checkpoint / "config.json"]
+    assert hashed_paths == [checkpoint / "LICENSE", checkpoint / "config.json"]
+
+
+def test_metadata_payload_is_always_hashed_during_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _set_rank_template(monkeypatch, tmp_path)
+    _rank_checkpoint(checkpoint)
+    manifest_path = checkpoint / "tp_manifest.json"
+    manifest = _json_object(manifest_path)
+    metadata_files = _object(manifest["metadata_files"])
+    tokenizer = checkpoint / "tokenizer.json"
+    tokenizer.write_text('{"version":"1"}', encoding="utf-8")
+    metadata_files[tokenizer.name] = {
+        "bytes": tokenizer.stat().st_size,
+        "sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
+    }
+    manifest["metadata_contract_sha256"] = (
+        download_utils._rank_local_metadata_contract_sha256(
+            cast(dict[str, dict[str, object]], metadata_files)
+        )
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    tokenizer.write_text('{"version":"2"}', encoding="utf-8")
+
+    with pytest.raises(RankLocalConfigurationError, match="metadata checksum"):
+        resolve_existing_model_for_shard(MODEL_ID, _tensor_shard())
+
+
+def test_unmanifested_remote_code_is_rejected_during_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _set_rank_template(monkeypatch, tmp_path)
+    _rank_checkpoint(checkpoint)
+    (checkpoint / "tokenization_kimi.py").write_text(
+        "raise RuntimeError('unreviewed')", encoding="utf-8"
+    )
+
+    with pytest.raises(RankLocalConfigurationError, match="file inventory differs"):
+        resolve_existing_model_for_shard(MODEL_ID, _tensor_shard())
 
 
 def test_missing_rank_local_loader_fails_readiness(

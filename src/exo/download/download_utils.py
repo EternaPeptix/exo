@@ -55,6 +55,9 @@ from exo.shared.types.worker.shards import (
     TensorShardMetadata,
 )
 from exo.worker.engines.mlx.rank_local_checkpoint import (
+    ALLOWED_RANK_LOCAL_METADATA_FILENAMES,
+    RANK_LOCAL_LICENSE_FILENAMES,
+    REQUIRED_RANK_LOCAL_METADATA_FILENAMES,
     SUPPORTED_LOADER_SCHEMA,
     SUPPORTED_MLX_LM_COMMIT,
     SUPPORTED_MLX_LM_KIMI_K3_SHA256,
@@ -1325,6 +1328,126 @@ def _rank_local_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _rank_local_metadata_contract_sha256(
+    metadata_files: Mapping[str, Mapping[str, object]],
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            metadata_files,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_rank_local_metadata(
+    checkpoint: Path,
+    manifest: Mapping[str, object],
+    source: Mapping[str, object],
+    weight_filenames: set[str],
+) -> None:
+    raw_metadata = _rank_local_object(
+        manifest.get("metadata_files"), "manifest metadata_files"
+    )
+    if not raw_metadata:
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint manifest lists no metadata files"
+        )
+
+    normalized: dict[str, dict[str, object]] = {}
+    for filename, raw_record in raw_metadata.items():
+        if filename not in ALLOWED_RANK_LOCAL_METADATA_FILENAMES:
+            raise RankLocalConfigurationError(
+                f"rank-local checkpoint metadata is not allowlisted: {filename}"
+            )
+        safe_name = _safe_rank_local_relative_path(filename)
+        if safe_name != filename or "/" in filename:
+            raise RankLocalConfigurationError(
+                f"non-canonical rank-local metadata filename {filename!r}"
+            )
+        record = _rank_local_object(
+            raw_record, f"manifest metadata record {filename}"
+        )
+        if set(record) != {"bytes", "sha256"}:
+            raise RankLocalConfigurationError(
+                f"malformed rank-local metadata record for {filename}"
+            )
+        byte_count = record.get("bytes")
+        checksum = record.get("sha256")
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count < 0
+            or not isinstance(checksum, str)
+            or len(checksum) != 64
+            or any(character not in "0123456789abcdef" for character in checksum)
+        ):
+            raise RankLocalConfigurationError(
+                f"malformed rank-local metadata record for {filename}"
+            )
+        path = checkpoint / filename
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size != byte_count
+        ):
+            raise RankLocalConfigurationError(
+                f"rank-local metadata is missing or truncated: {path}"
+            )
+        if _rank_local_sha256(path) != checksum:
+            raise RankLocalConfigurationError(
+                f"rank-local metadata checksum mismatch: {path}"
+            )
+        normalized[filename] = {"bytes": byte_count, "sha256": checksum}
+
+    missing = REQUIRED_RANK_LOCAL_METADATA_FILENAMES - normalized.keys()
+    if missing:
+        raise RankLocalConfigurationError(
+            f"rank-local checkpoint metadata is missing required files: "
+            f"{sorted(missing)}"
+        )
+    if not RANK_LOCAL_LICENSE_FILENAMES.intersection(normalized):
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint metadata is missing the Kimi K3 license"
+        )
+    if normalized["config.json"]["sha256"] != source.get("config_sha256"):
+        raise RankLocalConfigurationError(
+            "rank-local metadata config hash differs from the source contract"
+        )
+
+    contract_digest = manifest.get("metadata_contract_sha256")
+    actual_digest = _rank_local_metadata_contract_sha256(normalized)
+    if (
+        not isinstance(contract_digest, str)
+        or len(contract_digest) != 64
+        or any(character not in "0123456789abcdef" for character in contract_digest)
+        or contract_digest != actual_digest
+    ):
+        raise RankLocalConfigurationError(
+            "rank-local metadata contract digest mismatch"
+        )
+
+    expected_entries = (
+        set(normalized)
+        | weight_filenames
+        | {"model.safetensors.index.json", "tp_manifest.json"}
+    )
+    actual_entries: set[str] = set()
+    for child in checkpoint.iterdir():
+        if child.is_symlink() or not child.is_file():
+            raise RankLocalConfigurationError(
+                f"rank-local checkpoint contains a non-regular entry: {child}"
+            )
+        actual_entries.add(child.name)
+    if actual_entries != expected_entries:
+        extra = sorted(actual_entries - expected_entries)
+        missing_entries = sorted(expected_entries - actual_entries)
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint file inventory differs from its manifest: "
+            f"extra={extra}, missing={missing_entries}"
+        )
+
+
 def _validate_rank_local_checkpoint(
     checkpoint: Path,
     model_id: ModelId,
@@ -1398,16 +1521,6 @@ def _validate_rank_local_checkpoint(
             "rank-local checkpoint manifest has invalid rank_data_bytes"
         )
 
-    config_path = checkpoint / "config.json"
-    if config_path.is_symlink() or not config_path.is_file():
-        raise RankLocalConfigurationError(
-            "rank-local checkpoint is missing regular config.json"
-        )
-    if _rank_local_sha256(config_path) != config_sha256:
-        raise RankLocalConfigurationError(
-            "rank-local checkpoint config.json hash does not match its manifest"
-        )
-
     files = _rank_local_object(manifest.get("files"), "manifest files")
     if not files:
         raise RankLocalConfigurationError(
@@ -1455,6 +1568,13 @@ def _validate_rank_local_checkpoint(
                 f"rank-local checkpoint file is missing or truncated: {weight_path}"
             )
         manifest_filenames.add(filename)
+
+    _validate_rank_local_metadata(
+        checkpoint,
+        manifest,
+        source,
+        manifest_filenames,
+    )
 
     index = _read_rank_local_json(
         checkpoint / "model.safetensors.index.json",

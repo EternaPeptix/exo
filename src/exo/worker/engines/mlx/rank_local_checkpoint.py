@@ -28,7 +28,7 @@ RANK_LOCAL_LOADER_ENV = "EXO_MLX_RANK_LOCAL_LOADER"
 RANK_LOCAL_VERIFY_HASHES_ENV = "EXO_MLX_RANK_LOCAL_VERIFY_HASHES"
 
 SUPPORTED_MODEL_ID = "kernelpool/Kimi-K3-2bit-UVMAX"
-SUPPORTED_LOADER_SCHEMA = "k3-rank-local-tp/v1"
+SUPPORTED_LOADER_SCHEMA = "k3-rank-local-tp/v2"
 SUPPORTED_SOURCE_REVISION = "edb5113218df612f4a92f95145680f3f8eacd375"
 SUPPORTED_SOURCE_CONFIG_SHA256 = (
     "d041003554810a367bb600d18733976bdd21041bb46e75cc1e27c7b15fe034d0"
@@ -45,7 +45,37 @@ SUPPORTED_TP_CONTRACT_DIGEST = (
     "1b7fdf1b28433fb08fff7e0e26a7bccc2ca0fcd51f29498ab611892c9fc48da5"
 )
 SUPPORTED_LOADER_SHA256 = (
-    "94461efd31f160c8cbad0f872fe796ef3ed67bd0c5b289b6c78d9691c5ae56df"
+    "2add4bc5405201437b0f3e0df968532ed717bdf7bff0587ba94d00d0811eb557"
+)
+ALLOWED_RANK_LOCAL_METADATA_FILENAMES = frozenset(
+    {
+        "LICENSE",
+        "LICENSE.md",
+        "LICENSE.txt",
+        "README.md",
+        "added_tokens.json",
+        "chat_template.jinja",
+        "config.json",
+        "configuration_kimi_k3.py",
+        "encoding_k3.py",
+        "generation_config.json",
+        "kimi_k3_processor.py",
+        "kimi_k3_vision_processing.py",
+        "media_utils.py",
+        "merges.txt",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "special_tokens_map.json",
+        "tokenization_kimi.py",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "video_preprocessor_config.json",
+        "vocab.json",
+    }
+)
+REQUIRED_RANK_LOCAL_METADATA_FILENAMES = frozenset({"config.json"})
+RANK_LOCAL_LICENSE_FILENAMES = frozenset(
+    {"LICENSE", "LICENSE.md", "LICENSE.txt"}
 )
 _ALLOWED_CHECKPOINT_TEMPLATE_FIELDS = frozenset({"rank", "world_size"})
 

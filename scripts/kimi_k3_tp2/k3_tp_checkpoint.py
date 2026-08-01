@@ -47,7 +47,6 @@ from typing import BinaryIO, Mapping, Sequence
 
 import numpy as np
 
-
 SOURCE_REPO = "kernelpool/Kimi-K3-2bit-UVMAX"
 SOURCE_REVISION = "edb5113218df612f4a92f95145680f3f8eacd375"
 MLX_LM_PR = "https://github.com/ml-explore/mlx-lm/pull/1626"
@@ -61,7 +60,7 @@ SOURCE_CONFIG_SHA256 = (
 SOURCE_INDEX_SHA256 = (
     "ac65bcb3cd9e07cab3e7942ff455dde33879a9e02211bae40938e22fc204ae09"
 )
-SCHEMA = "k3-rank-local-tp/v1"
+SCHEMA = "k3-rank-local-tp/v2"
 SHARD_AUDIT_SCHEMA = "k3-rank-local-tp-shard-audit/v1"
 SHARD_CONVERSION_SCHEMA = "k3-rank-local-tp-shard-conversion/v1"
 CONTRACT_VERSION = "mlx-lm-kimi-k3-shard@7d505c2"
@@ -927,7 +926,10 @@ def _stage_metadata_file(
         raise
 
 
-def _copy_metadata_files(metadata_dir: Path, rank_dirs: Sequence[Path]) -> None:
+def _copy_metadata_files(
+    metadata_dir: Path,
+    rank_dirs: Sequence[Path],
+) -> dict[str, dict[str, int | str]]:
     metadata_dir = Path(metadata_dir)
     if metadata_dir.is_symlink() or not metadata_dir.is_dir():
         raise ConversionError(
@@ -1013,6 +1015,20 @@ def _copy_metadata_files(metadata_dir: Path, rank_dirs: Sequence[Path]) -> None:
             with contextlib.suppress(OSError):
                 _fsync_dir(root)
 
+    records: dict[str, dict[str, int | str]] = {}
+    for name, expected_sha256 in sorted(source_hashes.items()):
+        sizes = {(root / name).stat().st_size for root in roots}
+        hashes = {_sha256_regular_file(root / name) for root in roots}
+        if len(sizes) != 1 or hashes != {expected_sha256}:
+            raise ConversionError(
+                f"rank metadata copies diverged after publication: {name}"
+            )
+        records[name] = {
+            "bytes": sizes.pop(),
+            "sha256": expected_sha256,
+        }
+    return records
+
 
 def _existing_output_valid(
     path: Path,
@@ -1083,7 +1099,14 @@ def convert_checkpoint(
     contract = KimiK3ShardingContract(config, world_size)
     config_sha = _sha256_file(config_path)
     index_sha = _sha256_file(index_path)
-    _copy_metadata_files(metadata_dir, rank_dirs)
+    metadata_files = _copy_metadata_files(metadata_dir, rank_dirs)
+    metadata_contract_sha256 = hashlib.sha256(
+        json.dumps(
+            metadata_files,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
     weight_map: dict[str, str] = source_index["weight_map"]
     keys_by_file: dict[str, set[str]] = defaultdict(set)
@@ -1207,7 +1230,9 @@ def convert_checkpoint(
                 "excluded": all(not plans for plans in plans_by_rank),
                 "committed": False,
             }
-            for rank, (root, plans) in enumerate(zip(rank_dirs, plans_by_rank)):
+            for rank, (root, plans) in enumerate(
+                zip(rank_dirs, plans_by_rank, strict=True)
+            ):
                 if not plans:
                     continue
                 destination = root / filename
@@ -1295,6 +1320,8 @@ def convert_checkpoint(
                 "contract_digest": contract.contract_digest(),
             },
             "rank_data_bytes": rank_total_data[rank],
+            "metadata_files": metadata_files,
+            "metadata_contract_sha256": metadata_contract_sha256,
             "files": dict(sorted(rank_files[rank].items())),
             "tensors": dict(sorted(rank_tensors[rank].items())),
         }
@@ -1665,7 +1692,11 @@ def convert_shard(
 
         # Hard-link publication is atomic and no-clobber for each destination.
         # Staging and final names share a directory, hence a filesystem.
-        for stage_path, final_path in zip(stage_paths, final_paths):
+        for stage_path, final_path in zip(
+            stage_paths,
+            final_paths,
+            strict=True,
+        ):
             os.link(stage_path, final_path, follow_symlinks=False)
             published_paths.append(final_path)
         for directory in set(path.parent for path in final_paths):

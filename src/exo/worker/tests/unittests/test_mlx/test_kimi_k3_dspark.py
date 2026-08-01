@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 
 import mlx.core as mx
 import pytest
@@ -33,8 +33,10 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     LoadedMlxDSpark,
     MlxDSparkFeatures,
     MlxDSparkRequestDraft,
+    OrdinaryDecodePlan,
     ReplaySSMTargetAdapter,
     TargetPosterior,
+    TargetVerificationPlan,
     accepted_draft_prefix,
     detect_mlx_dspark_features,
     dspark_context_capacity_hint,
@@ -249,18 +251,54 @@ class _FakeDraft:
     rounds: list[_FakeDraftRound] = field(default_factory=list)
     fail_commit: bool = False
     fail_cancel: bool = False
+    fail_preflight: bool = False
+    fail_build: bool = False
+    fail_materialize: bool = False
 
-    def begin_round(self, anchor_token: int, num_proposals: int) -> _FakeDraftRound:
-        self.events.append("draft")
+    def preflight_round(self, anchor_token: int, num_proposals: int) -> int:
+        self.events.append("draft_preflight")
         assert num_proposals == self.verify_width - 1
-        round_state = _FakeDraftRound(
-            self.proposal_tokens,
-            self.events,
-            fail_commit=self.fail_commit,
-            fail_cancel=self.fail_cancel,
+        if self.fail_preflight:
+            raise RuntimeError("injected draft preflight failure")
+        return 5
+
+    def prepare_round(
+        self,
+        anchor_token: int,
+        num_proposals: int,
+    ) -> _FakePreparedDraft:
+        self.events.append("draft_build")
+        assert num_proposals == self.verify_width - 1
+        if self.fail_build:
+            raise RuntimeError("injected draft graph-build failure")
+        return _FakePreparedDraft(
+            owner=self,
+            fail_materialize=self.fail_materialize,
         )
-        self.rounds.append(round_state)
+
+
+@dataclass
+class _FakePreparedDraft:
+    owner: _FakeDraft
+    fail_materialize: bool = False
+    cancelled: bool = False
+
+    def materialize(self) -> _FakeDraftRound:
+        self.owner.events.append("draft_materialize")
+        if self.fail_materialize:
+            raise RuntimeError("injected draft materialization failure")
+        round_state = _FakeDraftRound(
+            self.owner.proposal_tokens,
+            self.owner.events,
+            fail_commit=self.owner.fail_commit,
+            fail_cancel=self.owner.fail_cancel,
+        )
+        self.owner.rounds.append(round_state)
         return round_state
+
+    def cancel(self) -> None:
+        self.owner.events.append("draft_graph_cancel")
+        self.cancelled = True
 
 
 @dataclass
@@ -290,21 +328,103 @@ class _FakeTarget:
     rounds: list[_FakeTargetRound] = field(default_factory=list)
     ordinary_anchors: list[int] = field(default_factory=list)
     fail_commit: bool = False
+    fail_prepare: bool = False
+    fail_build: bool = False
+    fail_verify: bool = False
+    fail_ordinary_preflight: bool = False
+    fail_ordinary_build: bool = False
+    fail_ordinary_materialize: bool = False
+    ordinary_mode: Literal["full", "compact"] = "full"
+    verification_mode_code: int = 0
 
-    def begin_verification(self, proposal_block: tuple[int, ...]) -> _FakeTargetRound:
-        self.events.append("target_verify")
-        round_state = _FakeTargetRound(
-            TargetPosterior(tuple(self.posterior_tokens), ("hidden-taps",)),
-            self.events,
-            fail_commit=self.fail_commit,
+    def prepare_verification(
+        self,
+        proposal_block: tuple[int, ...],
+    ) -> _FakePreparedTarget:
+        self.events.append("target_prepare")
+        if self.fail_prepare:
+            raise RuntimeError("injected target prepare failure")
+        return _FakePreparedTarget(
+            owner=self,
+            proposal_block=proposal_block,
+            initial_offset=5,
+            mode_code=self.verification_mode_code,
         )
-        self.rounds.append(round_state)
+
+    def preflight_ordinary(self, anchor_token: int) -> OrdinaryDecodePlan:
+        self.events.append("ordinary_preflight")
+        if self.fail_ordinary_preflight:
+            raise RuntimeError("injected ordinary preflight failure")
+        return OrdinaryDecodePlan(
+            5,
+            self.ordinary_mode,
+        )
+
+    def prepare_ordinary(
+        self,
+        anchor_token: int,
+        plan: OrdinaryDecodePlan,
+    ) -> _FakePreparedOrdinary:
+        self.events.append("ordinary_build")
+        if self.fail_ordinary_build:
+            raise RuntimeError("injected ordinary build failure")
+        return _FakePreparedOrdinary(self, anchor_token, plan)
+
+
+@dataclass
+class _FakePreparedTarget:
+    owner: _FakeTarget
+    proposal_block: tuple[int, ...]
+    initial_offset: int
+    mode_code: int
+    cancelled: bool = False
+
+    def build(self) -> _FakeBuiltTarget:
+        self.owner.events.append("target_build")
+        if self.owner.fail_build:
+            raise RuntimeError("injected target graph-build failure")
+        return _FakeBuiltTarget(self.owner, self.proposal_block)
+
+    def cancel(self) -> None:
+        self.owner.events.append("target_cancel")
+        self.cancelled = True
+
+
+@dataclass
+class _FakeBuiltTarget:
+    owner: _FakeTarget
+    proposal_block: tuple[int, ...]
+    cancelled: bool = False
+
+    def materialize(self) -> _FakeTargetRound:
+        self.owner.events.append("target_verify")
+        if self.owner.fail_verify:
+            raise RuntimeError("injected target verification failure")
+        round_state = _FakeTargetRound(
+            TargetPosterior(tuple(self.owner.posterior_tokens), ("hidden-taps",)),
+            self.owner.events,
+            fail_commit=self.owner.fail_commit,
+        )
+        self.owner.rounds.append(round_state)
         return round_state
 
-    def ordinary_decode(self, anchor_token: int) -> int:
-        self.events.append("ordinary_decode")
-        self.ordinary_anchors.append(anchor_token)
-        return self.ordinary_token
+    def cancel(self) -> None:
+        self.owner.events.append("target_cancel")
+        self.cancelled = True
+
+
+@dataclass
+class _FakePreparedOrdinary:
+    owner: _FakeTarget
+    anchor_token: int
+    plan: OrdinaryDecodePlan
+
+    def materialize(self) -> int:
+        self.owner.events.append("ordinary_decode")
+        if self.owner.fail_ordinary_materialize:
+            raise RuntimeError("injected ordinary materialization failure")
+        self.owner.ordinary_anchors.append(self.anchor_token)
+        return self.owner.ordinary_token
 
 
 @dataclass
@@ -411,8 +531,16 @@ def test_width_eight_accepts_seven_proposals_and_bonus_target_token(
     assert target.rounds[0].commits == [8]
     assert draft.rounds[0].commits == [(7, 18, posterior)]
     assert events == [
-        "draft",
+        "draft_preflight",
+        "agree_stage_1",
+        "draft_build",
+        "agree_stage_1",
+        "draft_materialize",
         "agree_proposal",
+        "target_prepare",
+        "agree_stage_1",
+        "target_build",
+        "agree_stage_1",
         "target_verify",
         "agree_acceptance",
         "target_commit",
@@ -495,6 +623,179 @@ def test_proposal_disagreement_cancels_draft_and_falls_back_permanently(
     assert target.ordinary_anchors == [10, 999]
 
 
+def test_peer_draft_preflight_failure_never_builds_or_materializes_tp_graph(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(events, stage_outcomes=[None, None])
+    engine, _draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="readiness"):
+        engine.decode_round(10)
+
+    assert "draft_build" not in events
+    assert "draft_materialize" not in events
+    assert "ordinary_build" not in events
+    assert "ordinary_decode" not in events
+    assert target.rounds == []
+
+
+def test_decode_anchor_disagreement_prevents_every_lazy_tp_graph(tmp_path: Path) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(events, agreed_tokens=[None])
+    engine, _draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="anchor disagreed"):
+        engine.decode_round(10)
+
+    assert events == []
+    assert target.rounds == []
+    assert target.ordinary_anchors == []
+
+
+def test_peer_draft_graph_build_failure_cancels_before_lazy_tp_materialization(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(events, stage_outcomes=[True, None, True])
+    engine, _draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+
+    result = engine.decode_round(10)
+
+    assert result.emitted_tokens == (999,)
+    assert "draft_graph_cancel" in events
+    assert "draft_materialize" not in events
+    assert "target_prepare" not in events
+    assert target.ordinary_anchors == [10]
+
+
+def test_peer_target_prepare_failure_cancels_open_transaction_before_forward(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(
+        events,
+        stage_outcomes=[True, True, None, True],
+    )
+    engine, draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+
+    result = engine.decode_round(10)
+
+    assert result.emitted_tokens == (999,)
+    assert "target_cancel" in events
+    assert draft.rounds[0].cancelled is True
+    assert "target_build" not in events
+    assert "target_verify" not in events
+
+
+def test_target_verifier_mode_disagreement_cancels_before_graph_build(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(
+        events,
+        agreed_tokens=[10, 0, 5, 0, 0, 5, None],
+    )
+    engine, draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+
+    result = engine.decode_round(10)
+
+    assert result.emitted_tokens == (999,)
+    assert "target_cancel" in events
+    assert draft.rounds[0].cancelled is True
+    assert "target_build" not in events
+    assert "target_verify" not in events
+
+
+def test_peer_target_graph_build_failure_cancels_before_target_materialization(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(
+        events,
+        stage_outcomes=[True, True, True, None, True],
+    )
+    engine, draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+
+    result = engine.decode_round(10)
+
+    assert result.emitted_tokens == (999,)
+    assert "target_cancel" in events
+    assert draft.rounds[0].cancelled is True
+    assert "target_verify" not in events
+    assert target.rounds == []
+
+
+def test_ordinary_mode_disagreement_never_builds_target_tp_graph(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(events, agreed_tokens=[10, 0, None])
+    engine, _draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="readiness"):
+        engine.decode_ordinary_tail(10)
+
+    assert "ordinary_build" not in events
+    assert "ordinary_decode" not in events
+    assert target.ordinary_anchors == []
+
+
+def test_peer_ordinary_graph_build_failure_never_materializes_target_tp_graph(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(events, stage_outcomes=[True, None])
+    engine, _draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="graph build"):
+        engine.decode_ordinary_tail(10)
+
+    assert "ordinary_build" in events
+    assert "ordinary_decode" not in events
+    assert target.ordinary_anchors == []
+
+
 def test_cancel_failure_is_rank_agreed_and_never_enters_fallback(
     tmp_path: Path,
 ) -> None:
@@ -520,8 +821,9 @@ def test_ordinary_fallback_token_disagreement_is_fail_stop(tmp_path: Path) -> No
     agreement = _FakeAgreement(
         events,
         reject_proposal=True,
-        # cancellation fingerprint, ordinary-error fingerprint, token agreement
-        agreed_tokens=[0, 0, None],
+        # Decode anchor; draft gates; cancellation; ordinary anchor, plan/build,
+        # materialization; then inject final token disagreement.
+        agreed_tokens=[10, 0, 5, 0, 0, 10, 0, 10, 0, 0, None],
     )
     engine, _draft, target, _collective, _events = _engine(
         tmp_path,
@@ -545,10 +847,10 @@ def test_uncertain_target_verification_cancel_is_fail_stop(tmp_path: Path) -> No
         agreement=_FakeAgreement(events),
     )
 
-    def uncertain(_proposal_block: tuple[int, ...]) -> _FakeTargetRound:
+    def uncertain(_proposal_block: tuple[int, ...]) -> _FakePreparedTarget:
         raise DSparkCancellationError("target cancellation is uncertain")
 
-    target.begin_verification = uncertain  # type: ignore[method-assign]
+    target.prepare_verification = uncertain  # type: ignore[method-assign]
 
     with pytest.raises(DSparkDistributedStateError, match="cancellation failed"):
         engine.decode_round(10)
@@ -576,12 +878,24 @@ def test_acceptance_disagreement_rolls_back_both_caches_before_fallback(
     assert draft.rounds[0].cancelled is True
     assert target.rounds[0].cancelled is True
     assert events == [
-        "draft",
+        "draft_preflight",
+        "agree_stage_1",
+        "draft_build",
+        "agree_stage_1",
+        "draft_materialize",
         "agree_proposal",
+        "target_prepare",
+        "agree_stage_1",
+        "target_build",
+        "agree_stage_1",
         "target_verify",
         "agree_acceptance",
         "target_cancel",
         "draft_cancel",
+        "agree_stage_1",
+        "ordinary_preflight",
+        "agree_stage_1",
+        "ordinary_build",
         "agree_stage_1",
         "ordinary_decode",
         "agree_stage_1",
@@ -590,7 +904,10 @@ def test_acceptance_disagreement_rolls_back_both_caches_before_fallback(
 
 def test_target_commit_outcome_disagreement_is_fail_stop(tmp_path: Path) -> None:
     events: list[str] = []
-    agreement = _FakeAgreement(events, stage_outcomes=[None])
+    agreement = _FakeAgreement(
+        events,
+        stage_outcomes=[True, True, True, True, None],
+    )
     engine, draft, target, _collective, _events = _engine(
         tmp_path,
         proposals=(11, 12),
@@ -628,7 +945,10 @@ def test_draft_commit_disagreement_disables_draft_on_every_rank(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
-    agreement = _FakeAgreement(events, stage_outcomes=[True, None])
+    agreement = _FakeAgreement(
+        events,
+        stage_outcomes=[True, True, True, True, True, None],
+    )
     engine, draft, target, _collective, _events = _engine(
         tmp_path,
         proposals=(11, 12),
@@ -679,39 +999,67 @@ class _FakeHookTarget:
         transaction.active = False
 
 
+@dataclass(frozen=True)
+class _FakePosteriorGraph:
+    operation: object
+
+    def materialize(self) -> TargetPosterior:
+        callback = cast("Callable[[], TargetPosterior]", self.operation)
+        return callback()
+
+
+@dataclass(frozen=True)
+class _FakeOrdinaryGraph:
+    anchor: int
+
+    def materialize(self) -> int:
+        return self.anchor + 1
+
+
 def test_replayssm_adapter_feature_detects_and_commits_accepted_prefix() -> None:
     target = _FakeHookTarget()
     adapter = ReplaySSMTargetAdapter(
         target,
         target_cache=object(),
-        verify=lambda block: TargetPosterior(tuple(range(20, 20 + len(block)))),
-        ordinary_decode=lambda anchor: anchor + 1,
+        verification_plan=lambda _block: TargetVerificationPlan("full"),
+        build_verify=lambda block, _plan: _FakePosteriorGraph(
+            lambda: TargetPosterior(tuple(range(20, 20 + len(block))))
+        ),
+        preflight_ordinary=lambda _anchor: OrdinaryDecodePlan(0, "full"),
+        prepare_ordinary=lambda anchor, _plan: _FakeOrdinaryGraph(anchor),
     )
 
     assert has_replayssm_target_hooks(target)
-    transaction = adapter.begin_verification((10, 11, 12))
+    prepared = adapter.prepare_verification((10, 11, 12))
+    transaction = prepared.build().materialize()
     transaction.commit(2)
 
     assert transaction.posterior.tokens == (20, 21, 22)
     assert target.events == [("begin", 3), ("resolve", 2)]
-    assert adapter.ordinary_decode(30) == 31
+    plan = adapter.preflight_ordinary(30)
+    assert adapter.prepare_ordinary(30, plan).materialize() == 31
 
 
 def test_replayssm_adapter_cancels_when_target_verification_raises() -> None:
     target = _FakeHookTarget()
 
-    def fail(_block: tuple[int, ...]) -> TargetPosterior:
+    def fail(
+        _block: tuple[int, ...],
+        _plan: TargetVerificationPlan,
+    ) -> _FakePosteriorGraph:
         raise RuntimeError("verification failed")
 
     adapter = ReplaySSMTargetAdapter(
         target,
         target_cache=object(),
-        verify=fail,
-        ordinary_decode=lambda anchor: anchor + 1,
+        verification_plan=lambda _block: TargetVerificationPlan("full"),
+        build_verify=fail,
+        preflight_ordinary=lambda _anchor: OrdinaryDecodePlan(0, "full"),
+        prepare_ordinary=lambda anchor, _plan: _FakeOrdinaryGraph(anchor),
     )
 
     with pytest.raises(RuntimeError, match="verification failed"):
-        adapter.begin_verification((10, 11, 12))
+        adapter.prepare_verification((10, 11, 12)).build()
     assert target.events == [("begin", 3), ("cancel", 0)]
 
 
@@ -723,18 +1071,25 @@ def test_replayssm_adapter_surfaces_uncertain_cancel() -> None:
 
     target = Target()
 
-    def fail(_block: tuple[int, ...]) -> TargetPosterior:
-        raise RuntimeError("verify failed")
+    def fail(
+        _block: tuple[int, ...],
+        _plan: TargetVerificationPlan,
+    ) -> _FakePosteriorGraph:
+        return _FakePosteriorGraph(
+            lambda: (_ for _ in ()).throw(RuntimeError("verify failed"))
+        )
 
     adapter = ReplaySSMTargetAdapter(
         target,
         target_cache=object(),
-        verify=fail,
-        ordinary_decode=lambda anchor: anchor + 1,
+        verification_plan=lambda _block: TargetVerificationPlan("full"),
+        build_verify=fail,
+        preflight_ordinary=lambda _anchor: OrdinaryDecodePlan(0, "full"),
+        prepare_ordinary=lambda anchor, _plan: _FakeOrdinaryGraph(anchor),
     )
 
     with pytest.raises(DSparkCancellationError, match="could not be cancelled"):
-        adapter.begin_verification((10, 11, 12))
+        adapter.prepare_verification((10, 11, 12)).build().materialize()
 
 
 def test_replayssm_adapter_rejects_incomplete_target_api() -> None:
@@ -742,14 +1097,22 @@ def test_replayssm_adapter_rejects_incomplete_target_api() -> None:
         ReplaySSMTargetAdapter(
             object(),
             target_cache=object(),
-            verify=lambda _block: TargetPosterior((1, 2, 3)),
-            ordinary_decode=lambda anchor: anchor + 1,
+            verification_plan=lambda _block: TargetVerificationPlan("full"),
+            build_verify=lambda _block, _plan: _FakePosteriorGraph(
+                lambda: TargetPosterior((1, 2, 3))
+            ),
+            preflight_ordinary=lambda _anchor: OrdinaryDecodePlan(0, "full"),
+            prepare_ordinary=lambda anchor, _plan: _FakeOrdinaryGraph(anchor),
         )
 
 
 @dataclass(frozen=True)
 class _FakeTokenArray:
     rows: list[list[int]]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (len(self.rows), len(self.rows[0]) if self.rows else 0)
 
     def tolist(self) -> object:
         return self.rows
@@ -915,7 +1278,9 @@ def test_replicated_loader_uses_exact_mlx_signatures_and_proposer_context(
 
 def test_replicated_draft_flattens_proposals_and_appends_only_committed_context(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
     calls: list[tuple[object, ...]] = []
     loaded = load_replicated_mlx_dspark(
         _config(tmp_path, 3),
@@ -931,7 +1296,8 @@ def test_replicated_draft_flattens_proposals_and_appends_only_committed_context(
         entry.keys = object()
         entry.values = object()
 
-    round_state = request.begin_round(10, 2)
+    request.preflight_round(10, 2)
+    round_state = request.prepare_round(10, 2).materialize()
     assert tuple(round_state.proposal_tokens) == (11, 12)
     round_state.commit(
         1,
@@ -1017,7 +1383,7 @@ def test_replicated_draft_rejects_malformed_mlx_proposals(
     request = loaded.new_request(capacity_hint=100)
 
     with pytest.raises((TypeError, ValueError)):
-        request.begin_round(10, 2)
+        request.prepare_round(10, 2).materialize()
 
 
 @pytest.mark.parametrize(
@@ -1131,11 +1497,11 @@ def test_greedy_sampling_rejects_ignored_nondefault_filters(
         )
 
 
-def test_context_capacity_reserves_tail_at_exact_model_limit() -> None:
+def test_context_capacity_uses_exact_prompt_prefix_and_output_limit() -> None:
     assert (
         dspark_context_capacity_hint(
             prompt_tokens=1_048_500,
-            max_tokens=68,
+            max_tokens=77,
             verify_width=8,
         )
         == 1_048_576
@@ -1143,7 +1509,7 @@ def test_context_capacity_reserves_tail_at_exact_model_limit() -> None:
     with pytest.raises(ValueError, match="context limit"):
         dspark_context_capacity_hint(
             prompt_tokens=1_048_500,
-            max_tokens=69,
+            max_tokens=78,
             verify_width=8,
         )
 
@@ -1296,6 +1662,10 @@ class _FakeTargetLogits:
 class _FakeGreedyTokens:
     values: tuple[int, ...]
 
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (len(self.values),)
+
     def astype(self, _dtype: object) -> _FakeGreedyTokens:
         return self
 
@@ -1341,6 +1711,9 @@ class _FakePromptArray:
     def __len__(self) -> int:
         return len(self.values)
 
+    def tolist(self) -> list[int]:
+        return list(self.values)
+
     def __getitem__(self, key: slice | None) -> _FakePromptArray | _FakePromptBatch:
         if key is None:
             return _FakePromptBatch(self.values)
@@ -1351,6 +1724,32 @@ class _FakePromptArray:
 class _FakePromptBatch:
     values: tuple[int, ...]
 
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (1, len(self.values))
+
+
+@dataclass(frozen=True)
+class _FakePendingForward:
+    forward: object
+
+    def materialize(self) -> object:
+        return self.forward
+
+
+@dataclass(frozen=True)
+class _TrackingPendingForward:
+    forward: object
+    materializations: list[None]
+
+    def materialize(self) -> object:
+        self.materializations.append(None)
+        return self.forward
+
 
 @dataclass
 class _FakeTargetCache:
@@ -1359,8 +1758,21 @@ class _FakeTargetCache:
 
 
 @dataclass
+class _FakeKDATargetCache:
+    cache: list[object | None] = field(default_factory=lambda: [None, None])
+    speculative_width: int = 0
+    speculative_ready: bool = False
+
+    @property
+    def state(self) -> object:
+        return self.cache
+
+
+@dataclass
 class _FakeRuntimeTarget(_FakeHookTarget):
-    layers: tuple[object, ...] = field(default_factory=lambda: (object(),))
+    layers: tuple[object, ...] = field(
+        default_factory=lambda: (object(), object())
+    )
 
 
 def test_prompt_prefix_is_chunk_seeded_into_fresh_target_and_draft_context(
@@ -1369,7 +1781,7 @@ def test_prompt_prefix_is_chunk_seeded_into_fresh_target_and_draft_context(
 ) -> None:
     calls: list[tuple[object, ...]] = []
     target_model = _FakeRuntimeTarget()
-    target_cache = [_FakeTargetCache()]
+    target_cache = [_FakeTargetCache(), _FakeKDATargetCache()]
     proposer = _FakeMlxProposer(3, calls, [[11, 12]])
     context_cache = [_FakeContextCache(), _FakeContextCache()]
     draft = MlxDSparkRequestDraft(
@@ -1396,17 +1808,27 @@ def test_prompt_prefix_is_chunk_seeded_into_fresh_target_and_draft_context(
     )
     seeded_chunks: list[tuple[int, ...]] = []
 
-    def forward(chunk: _FakePromptBatch) -> object:
+    def forward(
+        chunk: _FakePromptBatch,
+        *,
+        initial_offset: int,
+        speculative_width: int | None = None,
+    ) -> _FakePendingForward:
+        assert initial_offset == target_cache[0].offset
+        assert speculative_width is None
         seeded_chunks.append(chunk.values)
         target_cache[0].offset += len(chunk.values)
-        return SimpleNamespace(
-            aux_hidden_states=tuple(
-                _FakeHidden((1, len(chunk.values), 7168), f"tap-{index}")
-                for index in range(5)
+        target_cache[1].cache = [object(), object()]
+        return _FakePendingForward(
+            SimpleNamespace(
+                aux_hidden_states=tuple(
+                    _FakeHidden((1, len(chunk.values), 7168), f"tap-{index}")
+                    for index in range(5)
+                )
             )
         )
 
-    monkeypatch.setattr(runtime, "_forward_with_taps", forward)
+    monkeypatch.setattr(runtime, "_build_forward_with_taps", forward)
     monkeypatch.setattr(dspark_module.mx, "clear_cache", lambda: None, raising=False)
     progress: list[tuple[int, int]] = []
     distributed_progress: list[None] = []
@@ -1426,3 +1848,496 @@ def test_prompt_prefix_is_chunk_seeded_into_fresh_target_and_draft_context(
     assert [entry.length for entry in context_cache] == [5, 5]
     assert progress == [(0, 5), (2, 5), (4, 5), (5, 5)]
     assert len(distributed_progress) == 3
+
+
+def test_prompt_content_disagreement_prevents_target_graph_build(
+    tmp_path: Path,
+) -> None:
+    target_model = _FakeRuntimeTarget()
+    target_cache = [_FakeTargetCache(), _FakeKDATargetCache()]
+    proposer = _FakeMlxProposer(3, [], [[11, 12]])
+    draft = MlxDSparkRequestDraft(
+        proposer=proposer,
+        context_cache=[_FakeContextCache(), _FakeContextCache()],
+        verify_width=3,
+        evaluate=lambda *_values: None,
+    )
+    runtime = KimiK3DSparkRequestRuntime(
+        loaded=LoadedMlxDSpark(
+            config=_config(tmp_path, 3),
+            target_model=target_model,
+            drafter=object(),
+            proposer=proposer,
+            evaluate=lambda *_values: None,
+        ),
+        target_model=target_model,
+        target_cache=target_cache,
+        draft=draft,
+        # Operation fingerprint and length agree; a prompt digest word does not.
+        collective=_FakeAgreement([], agreed_tokens=[0, 2, None]),
+        evaluate=lambda *_values: None,
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="prompt/tokenizer"):
+        runtime.seed_prompt(
+            cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
+            prefill_step_size=2,
+            progress_callback=lambda _done, _total: None,
+            distributed_progress_callback=None,
+        )
+
+    assert target_cache[0].offset == 0
+    assert target_cache[1].cache == [None, None]
+
+
+def test_peer_prompt_graph_build_failure_never_materializes_lazy_target_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_model = _FakeRuntimeTarget()
+    target_cache = [_FakeTargetCache(), _FakeKDATargetCache()]
+    proposer = _FakeMlxProposer(3, [], [[11, 12]])
+    draft = MlxDSparkRequestDraft(
+        proposer=proposer,
+        context_cache=[_FakeContextCache(), _FakeContextCache()],
+        verify_width=3,
+        evaluate=lambda *_values: None,
+    )
+    runtime = KimiK3DSparkRequestRuntime(
+        loaded=LoadedMlxDSpark(
+            config=_config(tmp_path, 3),
+            target_model=target_model,
+            drafter=object(),
+            proposer=proposer,
+            evaluate=lambda *_values: None,
+        ),
+        target_model=target_model,
+        target_cache=target_cache,
+        draft=draft,
+        collective=_FakeAgreement([], stage_outcomes=[True, True, None]),
+        evaluate=lambda *_values: None,
+    )
+    materializations: list[None] = []
+
+    def build(
+        chunk: _FakePromptBatch,
+        *,
+        initial_offset: int,
+        speculative_width: int | None = None,
+    ) -> _TrackingPendingForward:
+        assert initial_offset == 0
+        assert speculative_width is None
+        target_cache[0].offset += len(chunk.values)
+        target_cache[1].cache = [object(), object()]
+        return _TrackingPendingForward(
+            SimpleNamespace(
+                aux_hidden_states=tuple(
+                    _FakeHidden((1, len(chunk.values), 7168), f"tap-{index}")
+                    for index in range(5)
+                )
+            ),
+            materializations,
+        )
+
+    monkeypatch.setattr(runtime, "_build_forward_with_taps", build)
+
+    with pytest.raises(DSparkDistributedStateError, match="graph build"):
+        runtime.seed_prompt(
+            cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
+            prefill_step_size=2,
+            progress_callback=lambda _done, _total: None,
+            distributed_progress_callback=None,
+        )
+
+    assert materializations == []
+
+
+@dataclass(frozen=True)
+class _FaithfulVerifyInput:
+    values: tuple[int, ...]
+
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (1, len(self.values))
+
+
+@dataclass
+class _FaithfulTransaction:
+    width: int
+    initial_offset: int
+    initial_kda: list[object]
+    active: bool = True
+
+
+@dataclass(frozen=True)
+class _FakeCompactToken:
+    value: int
+    shape: tuple[int, ...] = (1,)
+
+    def item(self) -> int:
+        return self.value
+
+
+@dataclass
+class _FaithfulReplayTarget:
+    posterior_tokens: tuple[int, ...]
+    layers: tuple[object, ...] = field(
+        default_factory=lambda: (object(), object())
+    )
+    events: list[tuple[str, int]] = field(default_factory=list)
+    ordinary_token: int = 77
+    compact_verifier_banned: list[tuple[int, ...]] = field(default_factory=list)
+
+    def _ordinary_cache_step(self, cache: object, event: str) -> None:
+        entries = cast(list[object], cache)
+        mla = cast(_FakeTargetCache, entries[0])
+        kda = cast(_FakeKDATargetCache, entries[1])
+        assert kda.speculative_width == 0
+        assert not kda.speculative_ready
+        mla.offset += 1
+        kda.cache = [f"{event}-conv", f"{event}-ssm"]
+        self.events.append((event, 1))
+
+    def __call__(self, inputs: _FaithfulVerifyInput, *, cache: object) -> object:
+        self._ordinary_cache_step(cache, "full")
+        return _FakeTargetLogits(_FakeTokenLogits((inputs.shape[1], 128)))
+
+    def supports_vocab_parallel_greedy(self) -> bool:
+        return True
+
+    def vocab_parallel_greedy(
+        self,
+        inputs: _FaithfulVerifyInput,
+        cache: object,
+    ) -> _FakeCompactToken:
+        self._ordinary_cache_step(cache, "compact")
+        assert inputs.shape == (1, 1)
+        return _FakeCompactToken(self.ordinary_token)
+
+    def begin_speculative_cache(
+        self,
+        cache: object,
+        width: int,
+    ) -> _FaithfulTransaction:
+        entries = cast(list[object], cache)
+        mla = cast(_FakeTargetCache, entries[0])
+        kda = cast(_FakeKDATargetCache, entries[1])
+        assert kda.speculative_width == 0
+        assert not kda.speculative_ready
+        assert all(value is not None for value in kda.cache)
+        kda.speculative_width = width
+        self.events.append(("begin", width))
+        return _FaithfulTransaction(width, mla.offset, cast(list[object], kda.cache[:]))
+
+    def forward_with_aux_hidden_states(
+        self,
+        inputs: _FaithfulVerifyInput,
+        cache: object,
+        layer_ids: tuple[int, ...],
+    ) -> object:
+        entries = cast(list[object], cache)
+        mla = cast(_FakeTargetCache, entries[0])
+        kda = cast(_FakeKDATargetCache, entries[1])
+        width = inputs.shape[1]
+        assert layer_ids == (7, 23, 51, 67, 83)
+        assert kda.speculative_width == width
+        assert not kda.speculative_ready
+        mla.offset += width
+        kda.cache = [f"wide-{width}-conv", f"wide-{width}-ssm"]
+        kda.speculative_ready = True
+        self.events.append(("forward", width))
+        return SimpleNamespace(
+            logits=_FakeTargetLogits(_FakeTokenLogits((width, 128))),
+            aux_hidden_states=tuple(
+                _FakeHidden((1, width, 7168), f"tap-{index}")
+                for index in range(5)
+            ),
+        )
+
+    def forward_with_aux_hidden_states_greedy(
+        self,
+        inputs: _FaithfulVerifyInput,
+        cache: object,
+        layer_ids: tuple[int, ...],
+        banned_token_ids: tuple[int, ...] = (),
+    ) -> object:
+        entries = cast(list[object], cache)
+        mla = cast(_FakeTargetCache, entries[0])
+        kda = cast(_FakeKDATargetCache, entries[1])
+        width = inputs.shape[1]
+        assert layer_ids == (7, 23, 51, 67, 83)
+        assert kda.speculative_width == width
+        assert not kda.speculative_ready
+        mla.offset += width
+        kda.cache = [f"compact-wide-{width}-conv", f"compact-wide-{width}-ssm"]
+        kda.speculative_ready = True
+        self.compact_verifier_banned.append(banned_token_ids)
+        self.events.append(("compact_verify", width))
+        return SimpleNamespace(
+            tokens=_FakeTokenArray([list(self.posterior_tokens)]),
+            aux_hidden_states=tuple(
+                _FakeHidden((1, width, 7168), f"tap-{index}")
+                for index in range(5)
+            ),
+        )
+
+    def resolve_speculative_cache(
+        self,
+        transaction: object,
+        consumed: int,
+    ) -> None:
+        assert isinstance(transaction, _FaithfulTransaction)
+        assert transaction.active
+        # The real hook commits the selected KDA checkpoint and rewinds the MLA
+        # logical offset from the full verification width to the consumed width.
+        transaction_cache = self._active_cache
+        mla = transaction_cache[0]
+        kda = transaction_cache[1]
+        mla.offset = transaction.initial_offset + consumed
+        kda.cache = [f"commit-{consumed}-conv", f"commit-{consumed}-ssm"]
+        kda.speculative_width = 0
+        kda.speculative_ready = False
+        transaction.active = False
+        self.events.append(("resolve", consumed))
+
+    def cancel_speculative_cache(self, transaction: object) -> None:
+        assert isinstance(transaction, _FaithfulTransaction)
+        if not transaction.active:
+            return
+        mla = self._active_cache[0]
+        kda = self._active_cache[1]
+        mla.offset = transaction.initial_offset
+        kda.cache = transaction.initial_kda[:]
+        kda.speculative_width = 0
+        kda.speculative_ready = False
+        transaction.active = False
+        self.events.append(("cancel", 0))
+
+    @property
+    def _active_cache(self) -> list[_FakeTargetCache | _FakeKDATargetCache]:
+        return self.__dict__["active_cache"]
+
+    @_active_cache.setter
+    def _active_cache(
+        self,
+        value: list[_FakeTargetCache | _FakeKDATargetCache],
+    ) -> None:
+        self.__dict__["active_cache"] = value
+
+
+def _faithful_request_runtime(
+    tmp_path: Path,
+    posterior: tuple[int, ...],
+    *,
+    compact_greedy: bool = False,
+    banned_token_ids: tuple[int, ...] = (),
+) -> tuple[
+    KimiK3DSparkRequestRuntime,
+    _FaithfulReplayTarget,
+    list[_FakeTargetCache | _FakeKDATargetCache],
+    list[_FakeContextCache],
+]:
+    calls: list[tuple[object, ...]] = []
+    target = _FaithfulReplayTarget(posterior)
+    target_cache: list[_FakeTargetCache | _FakeKDATargetCache] = [
+        _FakeTargetCache(),
+        _FakeKDATargetCache(),
+    ]
+    target._active_cache = target_cache
+    proposer = _FakeMlxProposer(3, calls, [[11, 12]])
+    context_cache = [_FakeContextCache(), _FakeContextCache()]
+    draft = MlxDSparkRequestDraft(
+        proposer=proposer,
+        context_cache=context_cache,
+        verify_width=3,
+        evaluate=lambda *_values: None,
+    )
+    loaded = LoadedMlxDSpark(
+        config=_config(tmp_path, 3),
+        target_model=target,
+        drafter=object(),
+        proposer=proposer,
+        evaluate=lambda *_values: None,
+    )
+    runtime = KimiK3DSparkRequestRuntime(
+        loaded=loaded,
+        target_model=target,
+        target_cache=target_cache,
+        draft=draft,
+        collective=_FakeAgreement([]),
+        banned_token_ids=banned_token_ids,
+        compact_greedy=compact_greedy,
+        evaluate=lambda *_values: None,
+    )
+    target_cache[0].offset = 5
+    target_cache[1].cache = ["initial-conv", "initial-ssm"]
+    for entry in context_cache:
+        entry.length = 5
+        entry.keys = object()
+        entry.values = object()
+    return runtime, target, target_cache, context_cache
+
+
+def _patch_faithful_verification_mlx(
+    monkeypatch: pytest.MonkeyPatch,
+    target: _FaithfulReplayTarget,
+) -> None:
+    monkeypatch.setattr(
+        dspark_module.mx,
+        "array",
+        lambda rows, **_kwargs: _FaithfulVerifyInput(tuple(rows[0])),
+        raising=False,
+    )
+    monkeypatch.setattr(dspark_module.mx, "int32", object(), raising=False)
+    monkeypatch.setattr(
+        dspark_module,
+        "_build_greedy_dspark_posterior_tokens",
+        lambda _logits, **_kwargs: _FakeGreedyTokens(target.posterior_tokens),
+    )
+
+
+@pytest.mark.parametrize(
+    ("posterior", "expected_tokens", "consumed"),
+    [
+        ((11, 12, 13), (11, 12, 13), 3),
+        ((99, 100, 101), (99,), 1),
+    ],
+)
+def test_request_runtime_verification_allows_only_exact_staged_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    posterior: tuple[int, ...],
+    expected_tokens: tuple[int, ...],
+    consumed: int,
+) -> None:
+    runtime, target, target_cache, context_cache = _faithful_request_runtime(
+        tmp_path,
+        posterior,
+    )
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+    _patch_faithful_verification_mlx(monkeypatch, target)
+
+    result = runtime.make_round_engine().decode_round(10)
+
+    assert result.emitted_tokens == expected_tokens
+    assert target.events == [("begin", 3), ("forward", 3), ("resolve", consumed)]
+    assert target_cache[0].offset == 5 + consumed
+    assert target_cache[1].speculative_width == 0
+    assert target_cache[1].speculative_ready is False
+    assert [entry.length for entry in context_cache] == [5 + consumed, 5 + consumed]
+
+
+def test_request_runtime_uses_compact_verifier_with_exact_banned_mask(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, target, target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=True,
+        banned_token_ids=(2, 7),
+    )
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+
+    result = runtime.make_round_engine().decode_round(10)
+
+    assert result.emitted_tokens == (11, 12, 13)
+    assert target.events == [
+        ("begin", 3),
+        ("compact_verify", 3),
+        ("resolve", 3),
+    ]
+    assert target.compact_verifier_banned == [(2, 7)]
+    assert target_cache[0].offset == 8
+
+
+def test_requested_compact_verifier_missing_capability_never_opens_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, target, _target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=True,
+    )
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+    monkeypatch.setattr(
+        target,
+        "forward_with_aux_hidden_states_greedy",
+        None,
+    )
+
+    result = runtime.make_round_engine().decode_round(10)
+
+    assert result.emitted_tokens == (77,)
+    assert ("begin", 3) not in target.events
+    assert ("forward", 3) not in target.events
+    assert target.events == [("compact", 1)]
+
+
+def test_request_runtime_cancel_restores_clean_target_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, target, target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+    )
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    target_adapter = runtime.make_round_engine().target
+
+    prepared = target_adapter.prepare_verification((10, 11, 12))
+    transaction = prepared.build().materialize()
+    assert target_cache[0].offset == 8
+    assert target_cache[1].speculative_width == 3
+    assert target_cache[1].speculative_ready is True
+    transaction.cancel()
+
+    assert target.events == [("begin", 3), ("forward", 3), ("cancel", 0)]
+    assert target_cache[0].offset == 5
+    assert target_cache[1].cache == ["initial-conv", "initial-ssm"]
+    assert target_cache[1].speculative_width == 0
+    assert target_cache[1].speculative_ready is False
+
+
+@pytest.mark.parametrize(
+    ("compact_greedy", "banned_token_ids", "expected_path"),
+    [
+        (False, (), "full"),
+        (True, (), "compact"),
+        (True, (2,), "full"),
+    ],
+)
+def test_target_only_fallback_compact_greedy_matches_full_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compact_greedy: bool,
+    banned_token_ids: tuple[int, ...],
+    expected_path: str,
+) -> None:
+    runtime, target, target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=compact_greedy,
+        banned_token_ids=banned_token_ids,
+    )
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setattr(
+        dspark_module,
+        "_build_greedy_dspark_posterior_tokens",
+        lambda _logits, **_kwargs: _FakeGreedyTokens((target.ordinary_token,)),
+    )
+
+    result = runtime.make_round_engine().decode_ordinary_tail(10)
+
+    assert result.emitted_tokens == (77,)
+    assert target.events == [(expected_path, 1)]
+    assert target_cache[0].offset == 6
+    assert target_cache[1].speculative_width == 0
+    assert target_cache[1].speculative_ready is False

@@ -36,6 +36,7 @@ DSPARK_TELEMETRY_ENV = "EXO_MLX_KIMI_K3_DSPARK_ROUND_TELEMETRY"
 MLX_DSPARK_PROPOSER_ENV = "MLX_LM_KIMI_K3_DSPARK_PROPOSER"
 MLX_REPLAYSSM_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
 MLX_DSPARK_SEGMENTED_SDPA_ENV = "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"
+EXO_VOCAB_PARALLEL_GREEDY_ENV = "EXO_MLX_K3_VOCAB_PARALLEL_GREEDY"
 
 RADIXARK_KIMI_K3_DSPARK_MODEL = "RadixArk/Kimi-K3-DSpark"
 RADIXARK_KIMI_K3_DSPARK_REVISION = "eb03982e58d4fb79bcfc099e902158f562e2e27b"
@@ -177,7 +178,13 @@ def dspark_context_capacity_hint(
     max_tokens: int,
     verify_width: int,
 ) -> int:
-    """Return bounded request context including one speculative tail round."""
+    """Return the exact maximum logical cache offset for this request.
+
+    Prompt seeding consumes ``prompt_tokens - 1`` because the final prompt
+    token is the decode anchor. A width-N verifier starts only when at least N
+    output slots remain, so neither its temporary nor committed cache offset
+    can exceed that prefix plus ``max_tokens``.
+    """
 
     if type(prompt_tokens) is not int or prompt_tokens < 2:
         raise ValueError("Kimi K3 DSpark requires at least two prompt tokens")
@@ -185,10 +192,10 @@ def dspark_context_capacity_hint(
         raise ValueError("Kimi K3 DSpark max tokens must be positive")
     if verify_width not in DSPARK_ALLOWED_VERIFY_WIDTHS:
         raise ValueError("Kimi K3 DSpark verify width must be 3 or 8")
-    capacity_hint = prompt_tokens + max_tokens + verify_width
+    capacity_hint = prompt_tokens - 1 + max_tokens
     if capacity_hint > KIMI_K3_MAX_CONTEXT_LENGTH:
         raise ValueError(
-            "Kimi K3 DSpark prompt, output, and speculative tail exceed the "
+            "Kimi K3 DSpark prompt prefix and output exceed the "
             f"{KIMI_K3_MAX_CONTEXT_LENGTH}-token context limit"
         )
     return capacity_hint
@@ -338,6 +345,14 @@ class DraftRound(Protocol):
     def cancel(self) -> None: ...
 
 
+class PreparedDraftRound(Protocol):
+    """A rank-local lazy proposal graph that has not entered TP collectives."""
+
+    def materialize(self) -> DraftRound: ...
+
+    def cancel(self) -> None: ...
+
+
 class ReplicatedDraft(Protocol):
     """Adapter implemented independently by every target TP rank."""
 
@@ -347,7 +362,13 @@ class ReplicatedDraft(Protocol):
     @property
     def verify_width(self) -> int: ...
 
-    def begin_round(self, anchor_token: int, num_proposals: int) -> DraftRound: ...
+    def preflight_round(self, anchor_token: int, num_proposals: int) -> int: ...
+
+    def prepare_round(
+        self,
+        anchor_token: int,
+        num_proposals: int,
+    ) -> PreparedDraftRound: ...
 
 
 class TargetRound(Protocol):
@@ -361,12 +382,72 @@ class TargetRound(Protocol):
     def cancel(self) -> None: ...
 
 
+class PreparedTargetVerification(Protocol):
+    """Locally opened target transaction, before any target TP forward."""
+
+    @property
+    def initial_offset(self) -> int: ...
+
+    @property
+    def mode_code(self) -> int: ...
+
+    def build(self) -> BuiltTargetVerification: ...
+
+    def cancel(self) -> None: ...
+
+
+class BuiltTargetVerification(Protocol):
+    """A shape-checked target graph whose TP collectives are still lazy."""
+
+    def materialize(self) -> TargetRound: ...
+
+    def cancel(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class TargetVerificationPlan:
+    """Feature-detected target verifier payload agreed before graph build."""
+
+    mode: Literal["full", "compact"]
+
+    @property
+    def agreement_code(self) -> int:
+        return int(self.mode == "compact")
+
+
+@dataclass(frozen=True)
+class OrdinaryDecodePlan:
+    """Rank-agreed target-only cache boundary and collective payload mode."""
+
+    initial_offset: int
+    mode: Literal["full", "compact"]
+
+    @property
+    def agreement_code(self) -> int:
+        return self.initial_offset * 2 + int(self.mode == "compact")
+
+
+class PreparedOrdinaryDecode(Protocol):
+    """A shape-checked ordinary target graph before TP materialization."""
+
+    def materialize(self) -> int: ...
+
+
 class WidthNTarget(Protocol):
     """Transactional target verification plus the unchanged one-token path."""
 
-    def begin_verification(self, proposal_block: tuple[int, ...]) -> TargetRound: ...
+    def prepare_verification(
+        self,
+        proposal_block: tuple[int, ...],
+    ) -> PreparedTargetVerification: ...
 
-    def ordinary_decode(self, anchor_token: int) -> int: ...
+    def preflight_ordinary(self, anchor_token: int) -> OrdinaryDecodePlan: ...
+
+    def prepare_ordinary(
+        self,
+        anchor_token: int,
+        plan: OrdinaryDecodePlan,
+    ) -> PreparedOrdinaryDecode: ...
 
 
 class RankAgreement(Protocol):
@@ -537,6 +618,12 @@ def _token_tuple(tokens: Sequence[int], *, expected: int, name: str) -> tuple[in
     return values
 
 
+def _shape_tuple(value: object) -> tuple[object, ...] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    return tuple(cast(Sequence[object], value))
+
+
 def accepted_draft_prefix(
     proposal_block: tuple[int, ...],
     target_posterior: tuple[int, ...],
@@ -562,6 +649,23 @@ def _error_fingerprint(error: str | None) -> int:
         return 0
     return (
         int.from_bytes(hashlib.sha256(error.encode()).digest()[:4], "big") & 0x7FFFFFFF
+    )
+
+
+def _token_contract_fingerprint(*sequences: Sequence[int]) -> tuple[int, ...]:
+    """Return four int32-safe words binding ordered request token contracts."""
+
+    digest = hashlib.sha256()
+    for sequence in sequences:
+        digest.update(len(sequence).to_bytes(8, "big"))
+        for token in sequence:
+            if type(token) is not int or not 0 <= token <= 0x7FFFFFFF:
+                raise ValueError("Kimi K3 request token ids must fit non-negative int32")
+            digest.update(token.to_bytes(4, "big"))
+    raw = digest.digest()
+    return tuple(
+        int.from_bytes(raw[offset : offset + 4], "big") & 0x7FFFFFFF
+        for offset in range(0, 16, 4)
     )
 
 
@@ -624,8 +728,13 @@ class KimiK3DSparkRoundEngine:
     def _cancel_before_fallback(
         self,
         *,
-        draft_round: DraftRound | None,
-        target_round: TargetRound | None,
+        draft_round: DraftRound | PreparedDraftRound | None,
+        target_round: (
+            TargetRound
+            | PreparedTargetVerification
+            | BuiltTargetVerification
+            | None
+        ),
         already_uncertain: bool,
     ) -> float:
         errors: list[str] = []
@@ -690,10 +799,120 @@ class KimiK3DSparkRoundEngine:
     ) -> DSparkRoundResult:
         self._disabled_reason = error
         fallback_error = None if planned_tail else error
+
+        anchor_started = self.clock()
+        agreed_anchor = self.collective.agree_token(anchor_token)
+        collective_ms += (self.clock() - anchor_started) * 1000.0
+        if agreed_anchor != anchor_token:
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark ordinary fallback anchor disagreed across ranks; "
+                "no target TP graph was built"
+            ) from None
+
+        local_plan: OrdinaryDecodePlan | None = None
+        local_preflight_error: str | None = None
+        try:
+            local_plan = self.target.preflight_ordinary(anchor_token)
+        except Exception as preflight_error:
+            local_preflight_error = (
+                "ordinary target preflight failed: "
+                f"{type(preflight_error).__name__}: {preflight_error}"
+            )
+
+        preflight_outcome, preflight_fingerprint, agreement_ms = self._agree_stage(
+            local_preflight_error is None,
+            local_preflight_error,
+        )
+        collective_ms += agreement_ms
+        plan_started = self.clock()
+        agreed_plan = self.collective.agree_token(
+            None if local_plan is None else local_plan.agreement_code
+        )
+        collective_ms += (self.clock() - plan_started) * 1000.0
+        if (
+            preflight_outcome is not True
+            or preflight_fingerprint != 0
+            or agreed_plan is None
+            or local_plan is None
+            or agreed_plan != local_plan.agreement_code
+        ):
+            fallback_error = (
+                f"{error}; "
+                f"{local_preflight_error or 'ordinary target plan disagreed across ranks'}"
+            )
+            telemetry = DSparkRoundTelemetry(
+                round_index=self._round_index,
+                rank=self.collective.rank,
+                draft_ms=draft_ms,
+                target_verify_ms=target_verify_ms,
+                target_commit_ms=target_commit_ms,
+                draft_commit_ms=draft_commit_ms,
+                collective_ms=collective_ms,
+                proposed=proposed,
+                accepted=0,
+                emitted=0,
+                fallback=not planned_tail,
+                error=fallback_error,
+            )
+            self._publish(telemetry)
+            self._round_index += 1
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark ordinary fallback readiness disagreed or failed; "
+                "no target TP graph was executed"
+            ) from None
+
+        prepared: PreparedOrdinaryDecode | None = None
+        local_build_error: str | None = None
+        try:
+            prepared = self.target.prepare_ordinary(anchor_token, local_plan)
+        except Exception as build_error:
+            local_build_error = (
+                "ordinary target graph build failed: "
+                f"{type(build_error).__name__}: {build_error}"
+            )
+
+        build_outcome, build_fingerprint, agreement_ms = self._agree_stage(
+            local_build_error is None,
+            local_build_error,
+        )
+        collective_ms += agreement_ms
+        if (
+            build_outcome is not True
+            or build_fingerprint != 0
+            or prepared is None
+        ):
+            fallback_error = (
+                f"{error}; "
+                f"{local_build_error or 'ordinary target graph build disagreed'}"
+            )
+            telemetry = DSparkRoundTelemetry(
+                round_index=self._round_index,
+                rank=self.collective.rank,
+                draft_ms=draft_ms,
+                target_verify_ms=target_verify_ms,
+                target_commit_ms=target_commit_ms,
+                draft_commit_ms=draft_commit_ms,
+                collective_ms=collective_ms,
+                proposed=proposed,
+                accepted=0,
+                emitted=0,
+                fallback=not planned_tail,
+                error=fallback_error,
+            )
+            self._publish(telemetry)
+            self._round_index += 1
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark ordinary fallback graph build disagreed or failed; "
+                "request-local target cache state cannot continue safely"
+            ) from None
+
         local_token: int | None = None
         local_decode_error: str | None = None
         try:
-            local_token = self.target.ordinary_decode(anchor_token)
+            # Every rank has now built and shape-checked the same collective
+            # graph. Materialization is the first point at which MLX may enter
+            # the target TP all-gather.
+            local_token = prepared.materialize()
         except Exception as decode_error:
             local_decode_error = (
                 "ordinary target fallback failed: "
@@ -816,12 +1035,94 @@ class KimiK3DSparkRoundEngine:
 
         gamma = self.config.gamma
         collective_ms = 0.0
+        anchor_started = self.clock()
+        agreed_anchor = self.collective.agree_token(anchor_token)
+        collective_ms += (self.clock() - anchor_started) * 1000.0
+        if agreed_anchor != anchor_token:
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark decode anchor disagreed across ranks; "
+                "no proposer or target TP graph was built"
+            ) from None
+        draft_start = self.clock()
+        local_context_offset: int | None = None
+        local_error: str | None = None
+        try:
+            local_context_offset = self.draft.preflight_round(anchor_token, gamma)
+        except Exception as error:
+            local_error = f"draft preflight failed: {type(error).__name__}: {error}"
+
+        preflight_outcome, preflight_fingerprint, agreement_ms = self._agree_stage(
+            local_error is None,
+            local_error,
+        )
+        collective_ms += agreement_ms
+        offset_started = self.clock()
+        agreed_context_offset = self.collective.agree_token(local_context_offset)
+        collective_ms += (self.clock() - offset_started) * 1000.0
+        if (
+            preflight_outcome is not True
+            or preflight_fingerprint != 0
+            or agreed_context_offset is None
+            or local_context_offset is None
+            or agreed_context_offset != local_context_offset
+        ):
+            draft_ms = (self.clock() - draft_start) * 1000.0
+            return self._ordinary_fallback(
+                anchor_token,
+                draft_ms=draft_ms,
+                target_verify_ms=0.0,
+                target_commit_ms=0.0,
+                draft_commit_ms=0.0,
+                collective_ms=collective_ms,
+                proposed=0,
+                error=local_error or "DSpark draft readiness disagreed across ranks",
+            )
+
+        prepared_draft: PreparedDraftRound | None = None
+        graph_error: str | None = None
+        try:
+            # MLX is lazy: this constructs the proposer and borrowed target-head
+            # graph, but must not call mx.eval()/tolist() yet.
+            prepared_draft = self.draft.prepare_round(anchor_token, gamma)
+        except Exception as error:
+            graph_error = (
+                f"draft graph build failed: {type(error).__name__}: {error}"
+            )
+
+        graph_outcome, graph_fingerprint, agreement_ms = self._agree_stage(
+            graph_error is None,
+            graph_error,
+        )
+        collective_ms += agreement_ms
+        if (
+            graph_outcome is not True
+            or graph_fingerprint != 0
+            or prepared_draft is None
+        ):
+            collective_ms += self._cancel_before_fallback(
+                draft_round=prepared_draft,
+                target_round=None,
+                already_uncertain=False,
+            )
+            draft_ms = (self.clock() - draft_start) * 1000.0
+            return self._ordinary_fallback(
+                anchor_token,
+                draft_ms=draft_ms,
+                target_verify_ms=0.0,
+                target_commit_ms=0.0,
+                draft_commit_ms=0.0,
+                collective_ms=collective_ms,
+                proposed=0,
+                error=graph_error or "DSpark draft graph build disagreed across ranks",
+            )
+
         draft_round: DraftRound | None = None
         local_block: tuple[int, ...] | None = None
-        local_error: str | None = None
-        draft_start = self.clock()
+        local_error = None
         try:
-            draft_round = self.draft.begin_round(anchor_token, gamma)
+            # This is the first operation allowed to materialize the borrowed
+            # target vocabulary head and therefore enter its TP all-gather.
+            draft_round = prepared_draft.materialize()
             proposals = _token_tuple(
                 draft_round.proposal_tokens,
                 expected=gamma,
@@ -840,7 +1141,7 @@ class KimiK3DSparkRoundEngine:
         collective_ms += (self.clock() - proposal_agreement_started) * 1000.0
         if agreed_block is None:
             collective_ms += self._cancel_before_fallback(
-                draft_round=draft_round,
+                draft_round=draft_round or prepared_draft,
                 target_round=None,
                 already_uncertain=False,
             )
@@ -855,15 +1156,107 @@ class KimiK3DSparkRoundEngine:
                 error=local_error or "DSpark proposal tokens disagreed across ranks",
             )
 
+        target_start = self.clock()
+        prepared_target: PreparedTargetVerification | None = None
+        target_error: str | None = None
+        target_cancel_uncertain = False
+        try:
+            prepared_target = self.target.prepare_verification(agreed_block)
+        except Exception as error:
+            target_error = (
+                f"target transaction prepare failed: {type(error).__name__}: {error}"
+            )
+            target_cancel_uncertain = isinstance(error, DSparkCancellationError)
+
+        prepare_outcome, prepare_fingerprint, agreement_ms = self._agree_stage(
+            target_error is None,
+            target_error,
+        )
+        collective_ms += agreement_ms
+        offset_started = self.clock()
+        agreed_target_offset = self.collective.agree_token(
+            None if prepared_target is None else prepared_target.initial_offset
+        )
+        agreed_target_mode = self.collective.agree_token(
+            None if prepared_target is None else prepared_target.mode_code
+        )
+        collective_ms += (self.clock() - offset_started) * 1000.0
+        if (
+            prepare_outcome is not True
+            or prepare_fingerprint != 0
+            or agreed_target_offset is None
+            or prepared_target is None
+            or agreed_target_offset != prepared_target.initial_offset
+            or agreed_target_mode != prepared_target.mode_code
+        ):
+            collective_ms += self._cancel_before_fallback(
+                draft_round=draft_round,
+                target_round=prepared_target,
+                already_uncertain=target_cancel_uncertain,
+            )
+            target_verify_ms = (self.clock() - target_start) * 1000.0
+            return self._ordinary_fallback(
+                anchor_token,
+                draft_ms=draft_ms,
+                target_verify_ms=target_verify_ms,
+                target_commit_ms=0.0,
+                draft_commit_ms=0.0,
+                collective_ms=collective_ms,
+                proposed=gamma,
+                error=target_error
+                or "DSpark target transaction readiness disagreed across ranks",
+            )
+
+        built_target: BuiltTargetVerification | None = None
+        target_error = None
+        try:
+            # Build the lazy target graph and validate all output shapes before
+            # any rank is allowed to materialize its target TP collectives.
+            built_target = prepared_target.build()
+        except Exception as error:
+            target_error = (
+                f"target verification graph build failed: "
+                f"{type(error).__name__}: {error}"
+            )
+            target_cancel_uncertain = isinstance(error, DSparkCancellationError)
+
+        build_outcome, build_fingerprint, agreement_ms = self._agree_stage(
+            target_error is None,
+            target_error,
+        )
+        collective_ms += agreement_ms
+        if (
+            build_outcome is not True
+            or build_fingerprint != 0
+            or built_target is None
+        ):
+            collective_ms += self._cancel_before_fallback(
+                draft_round=draft_round,
+                target_round=built_target or prepared_target,
+                already_uncertain=target_cancel_uncertain,
+            )
+            target_verify_ms = (self.clock() - target_start) * 1000.0
+            return self._ordinary_fallback(
+                anchor_token,
+                draft_ms=draft_ms,
+                target_verify_ms=target_verify_ms,
+                target_commit_ms=0.0,
+                draft_commit_ms=0.0,
+                collective_ms=collective_ms,
+                proposed=gamma,
+                error=target_error
+                or "DSpark target graph build disagreed across ranks",
+            )
+
         target_round: TargetRound | None = None
         posterior: TargetPosterior | None = None
         local_boundary: int | None = None
         local_next_token: int | None = None
-        target_error: str | None = None
-        target_cancel_uncertain = False
-        target_start = self.clock()
+        target_error = None
         try:
-            target_round = self.target.begin_verification(agreed_block)
+            # All ranks have agreed on a valid graph. This materialization is
+            # the first target-verification TP collective boundary.
+            target_round = built_target.materialize()
             posterior_tokens = _token_tuple(
                 target_round.posterior.tokens,
                 expected=self.config.verify_width,
@@ -909,7 +1302,7 @@ class KimiK3DSparkRoundEngine:
         if agreed_acceptance is None:
             collective_ms += self._cancel_before_fallback(
                 draft_round=draft_round,
-                target_round=target_round,
+                target_round=target_round or built_target,
                 already_uncertain=target_cancel_uncertain,
             )
             return self._ordinary_fallback(
@@ -1034,6 +1427,12 @@ class _SpeculativeCacheHooks(Protocol):
     def cancel_speculative_cache(self, transaction: object) -> None: ...
 
 
+class _TargetPosteriorGraph(Protocol):
+    """Lazy target verification graph, validated but not materialized."""
+
+    def materialize(self) -> TargetPosterior: ...
+
+
 def has_replayssm_target_hooks(target_model: object) -> bool:
     """Feature-detect the exact MLX-LM accepted-prefix transaction surface."""
 
@@ -1053,10 +1452,14 @@ class _ReplaySSMTargetRound:
         hooks: _SpeculativeCacheHooks,
         transaction: object,
         posterior: TargetPosterior,
+        initial_offset: int | None,
+        validate_closed: Callable[[int], None] | None,
     ):
         self._hooks = hooks
         self._transaction = transaction
         self._posterior = posterior
+        self._initial_offset = initial_offset
+        self._validate_closed = validate_closed
         self._active = True
 
     @property
@@ -1071,6 +1474,9 @@ class _ReplaySSMTargetRound:
                 self._transaction,
                 consumed_input_tokens,
             )
+            if self._validate_closed is not None:
+                assert self._initial_offset is not None
+                self._validate_closed(self._initial_offset + consumed_input_tokens)
         finally:
             # MLX-LM's hook either commits or cancels on failure.
             self._active = bool(getattr(self._transaction, "active", False))
@@ -1078,9 +1484,169 @@ class _ReplaySSMTargetRound:
     def cancel(self) -> None:
         if not self._active:
             return
-        if bool(getattr(self._transaction, "active", True)):
-            self._hooks.cancel_speculative_cache(self._transaction)
+        try:
+            if bool(getattr(self._transaction, "active", True)):
+                self._hooks.cancel_speculative_cache(self._transaction)
+            if self._validate_closed is not None:
+                assert self._initial_offset is not None
+                self._validate_closed(self._initial_offset)
+        finally:
+            self._active = False
+
+
+def _cancel_replayssm_transaction(
+    hooks: _SpeculativeCacheHooks,
+    transaction: object,
+    *,
+    initial_offset: int,
+    validate_closed: Callable[[int], None] | None,
+) -> None:
+    if bool(getattr(transaction, "active", True)):
+        hooks.cancel_speculative_cache(transaction)
+    if validate_closed is not None:
+        validate_closed(initial_offset)
+
+
+@final
+class _BuiltReplaySSMVerification:
+    """Own an open transaction and a rank-agreed lazy target graph."""
+
+    def __init__(
+        self,
+        hooks: _SpeculativeCacheHooks,
+        transaction: object,
+        graph: _TargetPosteriorGraph,
+        initial_offset: int,
+        validate_closed: Callable[[int], None] | None,
+    ):
+        self._hooks = hooks
+        self._transaction = transaction
+        self._graph = graph
+        self._initial_offset = initial_offset
+        self._validate_closed = validate_closed
+        self._active = True
+
+    def materialize(self) -> TargetRound:
+        if not self._active:
+            raise RuntimeError("target verification graph is no longer active")
+        try:
+            posterior = self._graph.materialize()
+        except BaseException as verify_error:
+            try:
+                _cancel_replayssm_transaction(
+                    self._hooks,
+                    self._transaction,
+                    initial_offset=self._initial_offset,
+                    validate_closed=self._validate_closed,
+                )
+            except BaseException as cancel_error:
+                raise DSparkCancellationError(
+                    "target verification failed and its speculative transaction "
+                    f"could not be cancelled: {type(cancel_error).__name__}: "
+                    f"{cancel_error}"
+                ) from verify_error
+            finally:
+                self._active = False
+            raise
         self._active = False
+        return _ReplaySSMTargetRound(
+            self._hooks,
+            self._transaction,
+            posterior,
+            self._initial_offset,
+            self._validate_closed,
+        )
+
+    def cancel(self) -> None:
+        if not self._active:
+            return
+        try:
+            _cancel_replayssm_transaction(
+                self._hooks,
+                self._transaction,
+                initial_offset=self._initial_offset,
+                validate_closed=self._validate_closed,
+            )
+        finally:
+            self._active = False
+
+
+@final
+class _PreparedReplaySSMVerification:
+    """Own an open local transaction before the target graph is constructed."""
+
+    def __init__(
+        self,
+        hooks: _SpeculativeCacheHooks,
+        transaction: object,
+        proposal_block: tuple[int, ...],
+        plan: TargetVerificationPlan,
+        build_verify: Callable[
+            [tuple[int, ...], TargetVerificationPlan], _TargetPosteriorGraph
+        ],
+        initial_offset: int,
+        validate_closed: Callable[[int], None] | None,
+    ):
+        self._hooks = hooks
+        self._transaction = transaction
+        self._proposal_block = proposal_block
+        self._plan = plan
+        self._build_verify = build_verify
+        self._initial_offset = initial_offset
+        self._validate_closed = validate_closed
+        self._active = True
+
+    @property
+    def initial_offset(self) -> int:
+        return self._initial_offset
+
+    @property
+    def mode_code(self) -> int:
+        return self._plan.agreement_code
+
+    def build(self) -> BuiltTargetVerification:
+        if not self._active:
+            raise RuntimeError("target speculative transaction is no longer active")
+        try:
+            graph = self._build_verify(self._proposal_block, self._plan)
+        except BaseException as build_error:
+            try:
+                _cancel_replayssm_transaction(
+                    self._hooks,
+                    self._transaction,
+                    initial_offset=self._initial_offset,
+                    validate_closed=self._validate_closed,
+                )
+            except BaseException as cancel_error:
+                raise DSparkCancellationError(
+                    "target graph build failed and its speculative transaction "
+                    f"could not be cancelled: {type(cancel_error).__name__}: "
+                    f"{cancel_error}"
+                ) from build_error
+            finally:
+                self._active = False
+            raise
+        self._active = False
+        return _BuiltReplaySSMVerification(
+            self._hooks,
+            self._transaction,
+            graph,
+            self._initial_offset,
+            self._validate_closed,
+        )
+
+    def cancel(self) -> None:
+        if not self._active:
+            return
+        try:
+            _cancel_replayssm_transaction(
+                self._hooks,
+                self._transaction,
+                initial_offset=self._initial_offset,
+                validate_closed=self._validate_closed,
+            )
+        finally:
+            self._active = False
 
 
 @final
@@ -1091,8 +1657,16 @@ class ReplaySSMTargetAdapter:
         self,
         target_model: object,
         target_cache: object,
-        verify: Callable[[tuple[int, ...]], TargetPosterior],
-        ordinary_decode: Callable[[int], int],
+        verification_plan: Callable[[tuple[int, ...]], TargetVerificationPlan],
+        build_verify: Callable[
+            [tuple[int, ...], TargetVerificationPlan], _TargetPosteriorGraph
+        ],
+        preflight_ordinary: Callable[[int], OrdinaryDecodePlan],
+        prepare_ordinary: Callable[
+            [int, OrdinaryDecodePlan], PreparedOrdinaryDecode
+        ],
+        validate_closed: Callable[[int], None] | None = None,
+        validate_open: Callable[[int, int], None] | None = None,
     ):
         if not has_replayssm_target_hooks(target_model):
             raise DSparkFeatureUnavailableError(
@@ -1100,31 +1674,72 @@ class ReplaySSMTargetAdapter:
             )
         self._hooks = cast(_SpeculativeCacheHooks, target_model)
         self._target_cache = target_cache
-        self._verify = verify
-        self._ordinary_decode = ordinary_decode
+        self._verification_plan = verification_plan
+        self._build_verify = build_verify
+        self._preflight_ordinary = preflight_ordinary
+        self._prepare_ordinary = prepare_ordinary
+        self._validate_closed = validate_closed
+        self._validate_open = validate_open
 
-    def begin_verification(self, proposal_block: tuple[int, ...]) -> TargetRound:
-        transaction = self._hooks.begin_speculative_cache(
-            self._target_cache,
-            len(proposal_block),
+    def prepare_verification(
+        self,
+        proposal_block: tuple[int, ...],
+    ) -> PreparedTargetVerification:
+        plan = self._verification_plan(proposal_block)
+        initial_offset = (
+            _target_cache_offset(self._target_cache)
+            if self._validate_closed is not None
+            else 0
         )
+        if self._validate_closed is not None:
+            self._validate_closed(initial_offset)
+        transaction: object | None = None
         try:
-            posterior = self._verify(proposal_block)
-        except BaseException as verify_error:
+            transaction = self._hooks.begin_speculative_cache(
+                self._target_cache,
+                len(proposal_block),
+            )
+            if self._validate_open is not None:
+                self._validate_open(initial_offset, len(proposal_block))
+        except BaseException as begin_error:
             try:
-                if bool(getattr(transaction, "active", True)):
-                    self._hooks.cancel_speculative_cache(transaction)
+                if transaction is not None:
+                    _cancel_replayssm_transaction(
+                        self._hooks,
+                        transaction,
+                        initial_offset=initial_offset,
+                        validate_closed=self._validate_closed,
+                    )
+                elif self._validate_closed is not None:
+                    self._validate_closed(initial_offset)
             except BaseException as cancel_error:
                 raise DSparkCancellationError(
-                    "target verification failed and its speculative transaction "
-                    f"could not be cancelled: {type(cancel_error).__name__}: "
-                    f"{cancel_error}"
-                ) from verify_error
+                    "target speculative begin failed and cache cleanup could "
+                    f"not be attested: {type(cancel_error).__name__}: {cancel_error}"
+                ) from begin_error
             raise
-        return _ReplaySSMTargetRound(self._hooks, transaction, posterior)
+        return _PreparedReplaySSMVerification(
+            self._hooks,
+            transaction,
+            proposal_block,
+            plan,
+            self._build_verify,
+            initial_offset,
+            self._validate_closed,
+        )
 
-    def ordinary_decode(self, anchor_token: int) -> int:
-        return self._ordinary_decode(anchor_token)
+    def preflight_ordinary(self, anchor_token: int) -> OrdinaryDecodePlan:
+        return self._preflight_ordinary(anchor_token)
+
+    def prepare_ordinary(
+        self,
+        anchor_token: int,
+        plan: OrdinaryDecodePlan,
+    ) -> PreparedOrdinaryDecode:
+        return self._prepare_ordinary(
+            anchor_token,
+            plan,
+        )
 
 
 @dataclass(frozen=True)
@@ -1196,6 +1811,9 @@ def preflight_mlx_dspark_segmented_sdpa(
 
 
 class _ProposalTokenArray(Protocol):
+    @property
+    def shape(self) -> Sequence[int]: ...
+
     def tolist(self) -> object: ...
 
 
@@ -1221,20 +1839,34 @@ class _MlxDSparkProposer(Protocol):
     def propose(self, anchor_token: int, context_cache: object) -> object: ...
 
 
-def _flatten_mlx_proposal_tokens(
+def _validate_mlx_proposal_graph(
     proposal: object,
     *,
     expected: int,
     verify_width: int,
-) -> tuple[int, ...]:
+) -> _ProposalTokenArray:
     proposal_width = getattr(proposal, "verify_width", None)
     if type(proposal_width) is not int or proposal_width != verify_width:
         raise ValueError("MLX-LM DSpark proposal verify width does not match")
     raw_tokens = getattr(proposal, "tokens", None)
+    shape = getattr(raw_tokens, "shape", None)
+    if _shape_tuple(shape) != (1, expected):
+        raise ValueError(
+            "MLX-LM DSpark proposal token graph must have shape "
+            f"[1, {expected}]"
+        )
     tolist = getattr(raw_tokens, "tolist", None)
     if not callable(tolist):
         raise TypeError("MLX-LM DSpark proposal tokens must be an MLX array")
-    rows = cast(_ProposalTokenArray, raw_tokens).tolist()
+    return cast(_ProposalTokenArray, raw_tokens)
+
+
+def _materialize_mlx_proposal_tokens(
+    raw_tokens: _ProposalTokenArray,
+    *,
+    expected: int,
+) -> tuple[int, ...]:
+    rows = raw_tokens.tolist()
     if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
         raise ValueError("MLX-LM DSpark proposal tokens must have batch size one")
     row_values = cast(Sequence[object], rows)
@@ -1412,6 +2044,50 @@ class _MlxDSparkDraftRound:
         self._active = False
 
 
+@final
+class _PreparedMlxDSparkRound:
+    """Hold a validated lazy proposal until rank agreement permits evaluation."""
+
+    def __init__(
+        self,
+        proposer: _MlxDSparkProposer,
+        context_cache: object,
+        proposal_tokens: _ProposalTokenArray,
+        proposal_count: int,
+        verify_width: int,
+        evaluate: Callable[..., None],
+    ):
+        self._proposer = proposer
+        self._context_cache = context_cache
+        self._proposal_tokens = proposal_tokens
+        self._proposal_count = proposal_count
+        self._verify_width = verify_width
+        self._evaluate = evaluate
+        self._active = True
+
+    def materialize(self) -> DraftRound:
+        if not self._active:
+            raise RuntimeError("MLX-LM DSpark proposal graph is no longer active")
+        try:
+            proposal_tokens = _materialize_mlx_proposal_tokens(
+                self._proposal_tokens,
+                expected=self._proposal_count,
+            )
+        finally:
+            self._active = False
+        return _MlxDSparkDraftRound(
+            self._proposer,
+            self._context_cache,
+            proposal_tokens,
+            self._verify_width,
+            self._evaluate,
+        )
+
+    def cancel(self) -> None:
+        # Proposal construction is lazy and does not mutate target context.
+        self._active = False
+
+
 @dataclass(frozen=True)
 class MlxDSparkRequestDraft:
     """Fresh per-request context bound to one rank-local loaded proposer."""
@@ -1421,6 +2097,21 @@ class MlxDSparkRequestDraft:
     verify_width: int
     evaluate: Callable[..., None] = mx.eval
     placement: Literal["replicated"] = "replicated"
+
+    def preflight_round(self, anchor_token: int, num_proposals: int) -> int:
+        """Validate replicated draft state before its borrowed TP head runs."""
+
+        if type(anchor_token) is not int or anchor_token < 0:
+            raise ValueError("anchor_token must be a non-negative integer")
+        if num_proposals != self.verify_width - 1:
+            raise ValueError("requested DSpark proposal count does not match its width")
+        if os.environ.get(MLX_DSPARK_PROPOSER_ENV) != "1":
+            raise ValueError("MLX-LM DSpark proposer became disabled during the request")
+        context_offset = _context_cache_offset(self.context_cache)
+        if context_offset <= 0:
+            raise ValueError("MLX-LM DSpark proposal requires populated context")
+        _materialize_context_cache(self.context_cache, self.evaluate)
+        return context_offset
 
     def seed_target_context(
         self,
@@ -1443,22 +2134,27 @@ class MlxDSparkRequestDraft:
         if _context_cache_offset(self.context_cache) != context_offset + expected_width:
             raise ValueError("MLX-LM DSpark seeded context offset does not match")
 
-    def begin_round(self, anchor_token: int, num_proposals: int) -> DraftRound:
+    def prepare_round(
+        self,
+        anchor_token: int,
+        num_proposals: int,
+    ) -> PreparedDraftRound:
         if type(anchor_token) is not int or anchor_token < 0:
             raise ValueError("anchor_token must be a non-negative integer")
         if num_proposals != self.verify_width - 1:
             raise ValueError("requested DSpark proposal count does not match its width")
         proposer = cast(_MlxDSparkProposer, self.proposer)
         proposal = proposer.propose(anchor_token, self.context_cache)
-        proposal_tokens = _flatten_mlx_proposal_tokens(
+        proposal_tokens = _validate_mlx_proposal_graph(
             proposal,
             expected=num_proposals,
             verify_width=self.verify_width,
         )
-        return _MlxDSparkDraftRound(
+        return _PreparedMlxDSparkRound(
             proposer,
             self.context_cache,
             proposal_tokens,
+            num_proposals,
             self.verify_width,
             self.evaluate,
         )
@@ -1558,6 +2254,11 @@ class _TargetForwardResult(Protocol):
     aux_hidden_states: Sequence[object]
 
 
+class _CompactTargetForwardResult(Protocol):
+    tokens: object
+    aux_hidden_states: Sequence[object]
+
+
 class _TargetCacheEntry(Protocol):
     @property
     def state(self) -> object: ...
@@ -1570,6 +2271,40 @@ class _TargetWithAuxForward(Protocol):
         cache: object,
         layer_ids: tuple[int, ...],
     ) -> object: ...
+
+
+class _TargetWithAuxGreedyForward(Protocol):
+    def forward_with_aux_hidden_states_greedy(
+        self,
+        inputs: mx.array,
+        cache: object,
+        layer_ids: tuple[int, ...],
+        banned_token_ids: tuple[int, ...] = (),
+    ) -> object: ...
+
+
+class _CompactGreedyTarget(Protocol):
+    def supports_vocab_parallel_greedy(self) -> bool: ...
+
+    def vocab_parallel_greedy(
+        self,
+        inputs: mx.array,
+        cache: object,
+    ) -> object: ...
+
+
+class _GreedyTokenArray(Protocol):
+    @property
+    def shape(self) -> Sequence[int]: ...
+
+    def tolist(self) -> object: ...
+
+
+class _BatchedGreedyTokenArray(Protocol):
+    @property
+    def shape(self) -> Sequence[int]: ...
+
+    def tolist(self) -> object: ...
 
 
 def _target_cache_offset(target_cache: object) -> int:
@@ -1610,23 +2345,45 @@ def _validate_target_cache(
     *,
     expected_offset: int,
     require_kda_state: bool,
+    speculative_phase: Literal["closed", "open", "staged"] = "closed",
+    speculative_width: int | None = None,
 ) -> None:
+    if speculative_phase == "closed":
+        if speculative_width is not None:
+            raise ValueError("closed Kimi K3 target cache cannot have a width")
+    elif type(speculative_width) is not int or speculative_width <= 1:
+        raise ValueError("active Kimi K3 target cache requires an exact width")
     if _target_cache_offset(target_cache) != expected_offset:
         raise ValueError(f"Kimi K3 target cache must be at offset {expected_offset}")
+    kda_entries = 0
     for entry in cast(Sequence[object], target_cache):
         values: object = getattr(entry, "cache", None)
         if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
             continue
+        kda_entries += 1
         cache_values = cast(Sequence[object], values)
         populated = tuple(value is not None for value in cache_values)
         if require_kda_state and (not populated or not all(populated)):
             raise ValueError("Kimi K3 target KDA cache is not fully populated")
         if not require_kda_state and any(populated):
             raise ValueError("Kimi K3 target cache must be fresh for each request")
-        if bool(getattr(entry, "speculative_ready", False)) or int(
-            getattr(entry, "speculative_width", 0)
-        ):
-            raise ValueError("Kimi K3 target cache has a stale speculative transaction")
+        width = getattr(entry, "speculative_width", 0)
+        ready = getattr(entry, "speculative_ready", False)
+        if type(width) is not int or type(ready) is not bool:
+            raise ValueError("Kimi K3 target speculative cache markers are invalid")
+        if speculative_phase == "closed":
+            if width != 0 or ready:
+                raise ValueError(
+                    "Kimi K3 target cache has a stale speculative transaction"
+                )
+        elif width != speculative_width:
+            raise ValueError("Kimi K3 target speculative width does not match")
+        elif speculative_phase == "open" and ready:
+            raise ValueError("Kimi K3 target speculative cache staged too early")
+        elif speculative_phase == "staged" and not ready:
+            raise ValueError("Kimi K3 target speculative checkpoints are incomplete")
+    if kda_entries == 0:
+        raise ValueError("Kimi K3 target cache contains no KDA state")
 
 
 def _target_cache_states(target_cache: object) -> tuple[object, ...]:
@@ -1653,13 +2410,12 @@ def _validate_target_logits(logits: object, *, expected_width: int) -> None:
         )
 
 
-def greedy_dspark_posterior_tokens(
+def _build_greedy_dspark_posterior_tokens(
     logits: object,
     *,
     expected_width: int,
     banned_token_ids: Sequence[int],
-    evaluate: Callable[..., None],
-) -> tuple[int, ...]:
+) -> _GreedyTokenArray:
     _validate_target_logits(logits, expected_width=expected_width)
     logits_array = cast(mx.array, logits)
     token_logits = logits_array[0]
@@ -1669,13 +2425,246 @@ def greedy_dspark_posterior_tokens(
             raise ValueError("Kimi K3 DSpark banned token id is out of range")
         token_logits[..., token_id] = float("-inf")
     tokens = mx.argmax(token_logits, axis=-1).astype(mx.int32)
-    evaluate(tokens)
+    shape = getattr(tokens, "shape", None)
+    if _shape_tuple(shape) != (expected_width,):
+        raise ValueError("Kimi K3 target posterior graph has an invalid shape")
+    if not callable(getattr(tokens, "tolist", None)):
+        raise TypeError("Kimi K3 target posterior must be an MLX array")
+    return cast(_GreedyTokenArray, tokens)
+
+
+def _materialize_greedy_dspark_posterior_tokens(
+    tokens: _GreedyTokenArray,
+    *,
+    expected_width: int,
+) -> tuple[int, ...]:
     values = cast(Sequence[int], tokens.tolist())
     return _token_tuple(
         values,
         expected=expected_width,
         name="Kimi K3 target posterior",
     )
+
+
+def _validate_batched_greedy_tokens(
+    tokens: object,
+    *,
+    expected_width: int,
+) -> _BatchedGreedyTokenArray:
+    shape = getattr(tokens, "shape", None)
+    if _shape_tuple(shape) != (1, expected_width):
+        raise ValueError(
+            "Kimi K3 compact verifier tokens must have shape "
+            f"[1, {expected_width}]"
+        )
+    if not callable(getattr(tokens, "tolist", None)):
+        raise TypeError("Kimi K3 compact verifier tokens must be an MLX array")
+    return cast(_BatchedGreedyTokenArray, tokens)
+
+
+def _materialize_batched_greedy_tokens(
+    tokens: _BatchedGreedyTokenArray,
+    *,
+    expected_width: int,
+) -> tuple[int, ...]:
+    rows = tokens.tolist()
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        raise ValueError("Kimi K3 compact verifier tokens must have batch size one")
+    row_values = cast(Sequence[object], rows)
+    if len(row_values) != 1:
+        raise ValueError("Kimi K3 compact verifier tokens must have batch size one")
+    first_row = row_values[0]
+    if not isinstance(first_row, Sequence) or isinstance(first_row, (str, bytes)):
+        raise ValueError("Kimi K3 compact verifier tokens must have batch size one")
+    return _token_tuple(
+        cast(Sequence[int], first_row),
+        expected=expected_width,
+        name="Kimi K3 compact target posterior",
+    )
+
+
+def greedy_dspark_posterior_tokens(
+    logits: object,
+    *,
+    expected_width: int,
+    banned_token_ids: Sequence[int],
+    evaluate: Callable[..., None],
+) -> tuple[int, ...]:
+    """Build and materialize a greedy posterior outside rank-gated paths."""
+
+    tokens = _build_greedy_dspark_posterior_tokens(
+        logits,
+        expected_width=expected_width,
+        banned_token_ids=banned_token_ids,
+    )
+    evaluate(tokens)
+    return _materialize_greedy_dspark_posterior_tokens(
+        tokens,
+        expected_width=expected_width,
+    )
+
+
+@final
+class _BuiltKimiK3TargetForward:
+    """Shape-checked lazy target forward, before any MLX evaluation."""
+
+    def __init__(
+        self,
+        *,
+        forward: _TargetForwardResult,
+        validated_aux_hidden_states: tuple[object, ...],
+        target_cache: object,
+        initial_offset: int,
+        width: int,
+        speculative_width: int | None,
+        evaluate: Callable[..., None],
+    ):
+        self.forward = forward
+        self.validated_aux_hidden_states = validated_aux_hidden_states
+        self._target_cache = target_cache
+        self._initial_offset = initial_offset
+        self._width = width
+        self._speculative_width = speculative_width
+        self._evaluate = evaluate
+        self._materialized = False
+
+    def materialize(self, *extra_values: object) -> _TargetForwardResult:
+        if self._materialized:
+            raise RuntimeError("Kimi K3 target graph was already materialized")
+        self._evaluate(
+            self.forward.logits,
+            self.validated_aux_hidden_states,
+            _target_cache_states(self._target_cache),
+            *extra_values,
+        )
+        _validate_target_cache(
+            self._target_cache,
+            expected_offset=self._initial_offset + self._width,
+            require_kda_state=True,
+            speculative_phase=(
+                "staged" if self._speculative_width is not None else "closed"
+            ),
+            speculative_width=self._speculative_width,
+        )
+        self._materialized = True
+        return self.forward
+
+
+@final
+class _BuiltKimiK3TargetPosterior:
+    """Lazy verifier graph whose materialization may enter target TP."""
+
+    def __init__(
+        self,
+        forward: _BuiltKimiK3TargetForward,
+        tokens: _GreedyTokenArray,
+        expected_width: int,
+    ):
+        self._forward = forward
+        self._tokens = tokens
+        self._expected_width = expected_width
+
+    def materialize(self) -> TargetPosterior:
+        self._forward.materialize(self._tokens)
+        tokens = _materialize_greedy_dspark_posterior_tokens(
+            self._tokens,
+            expected_width=self._expected_width,
+        )
+        return TargetPosterior(
+            tokens,
+            tuple(self._forward.validated_aux_hidden_states),
+        )
+
+
+@final
+class _BuiltKimiK3CompactTargetPosterior:
+    """Compact verifier graph carrying tokens instead of full-vocab logits."""
+
+    def __init__(
+        self,
+        *,
+        tokens: _BatchedGreedyTokenArray,
+        aux_hidden_states: tuple[object, ...],
+        target_cache: object,
+        initial_offset: int,
+        width: int,
+        evaluate: Callable[..., None],
+    ):
+        self._tokens = tokens
+        self._aux_hidden_states = aux_hidden_states
+        self._target_cache = target_cache
+        self._initial_offset = initial_offset
+        self._width = width
+        self._evaluate = evaluate
+        self._materialized = False
+
+    def materialize(self) -> TargetPosterior:
+        if self._materialized:
+            raise RuntimeError("Kimi K3 compact verifier graph was already materialized")
+        self._evaluate(
+            self._tokens,
+            self._aux_hidden_states,
+            _target_cache_states(self._target_cache),
+        )
+        _validate_target_cache(
+            self._target_cache,
+            expected_offset=self._initial_offset + self._width,
+            require_kda_state=True,
+            speculative_phase="staged",
+            speculative_width=self._width,
+        )
+        self._materialized = True
+        return TargetPosterior(
+            _materialize_batched_greedy_tokens(
+                self._tokens,
+                expected_width=self._width,
+            ),
+            self._aux_hidden_states,
+        )
+
+
+@final
+class _BuiltKimiK3OrdinaryDecode:
+    """Lazy one-token full/compact target graph after rank-agreed mode."""
+
+    def __init__(
+        self,
+        *,
+        output: object,
+        mode: Literal["full", "compact"],
+        target_cache: object,
+        expected_offset: int,
+        evaluate: Callable[..., None],
+    ):
+        self._output = output
+        self._mode = mode
+        self._target_cache = target_cache
+        self._expected_offset = expected_offset
+        self._evaluate = evaluate
+        self._materialized = False
+
+    def materialize(self) -> int:
+        if self._materialized:
+            raise RuntimeError("Kimi K3 ordinary target graph was already materialized")
+        self._evaluate(self._output, _target_cache_states(self._target_cache))
+        _validate_target_cache(
+            self._target_cache,
+            expected_offset=self._expected_offset,
+            require_kda_state=True,
+        )
+        self._materialized = True
+        if self._mode == "compact":
+            item = getattr(self._output, "item", None)
+            if not callable(item):
+                raise TypeError("Kimi K3 compact greedy token is not materializable")
+            token = item()
+            if type(token) is not int or token < 0:
+                raise ValueError("Kimi K3 compact greedy target token is invalid")
+            return token
+        return _materialize_greedy_dspark_posterior_tokens(
+            cast(_GreedyTokenArray, self._output),
+            expected_width=1,
+        )[0]
 
 
 @dataclass
@@ -1689,6 +2678,7 @@ class KimiK3DSparkRequestRuntime:
     collective: RankAgreement
     banned_token_ids: tuple[int, ...] = ()
     terminal_token_ids: tuple[int, ...] = ()
+    compact_greedy: bool = False
     evaluate: Callable[..., None] = mx.eval
     clock: Callable[[], float] = time.perf_counter
 
@@ -1747,6 +2737,7 @@ class KimiK3DSparkRequestRuntime:
         capacity_hint: int,
         banned_token_ids: Sequence[int] = (),
         terminal_token_ids: Sequence[int] = (),
+        compact_greedy: bool = False,
         evaluate: Callable[..., None] = mx.eval,
     ) -> "KimiK3DSparkRequestRuntime":
         draft = loaded.new_request(capacity_hint=capacity_hint)
@@ -1758,6 +2749,7 @@ class KimiK3DSparkRequestRuntime:
             collective=collective,
             banned_token_ids=tuple(banned_token_ids),
             terminal_token_ids=tuple(terminal_token_ids),
+            compact_greedy=compact_greedy,
             evaluate=evaluate,
         )
 
@@ -1782,11 +2774,45 @@ class KimiK3DSparkRequestRuntime:
             ) from None
         return cast(T, result)
 
-    def _forward_with_taps(self, inputs: mx.array) -> _TargetForwardResult:
+    def _validate_forward_readiness(
+        self,
+        inputs: mx.array,
+        *,
+        speculative_width: int | None = None,
+    ) -> int:
         if inputs.ndim != 2 or inputs.shape[0] != 1 or inputs.shape[1] <= 0:
             raise ValueError("Kimi K3 DSpark target input must be non-empty batch one")
         width = int(inputs.shape[1])
+        if speculative_width is not None and speculative_width != width:
+            raise ValueError(
+                "Kimi K3 target verification width does not match its input"
+            )
         initial_offset = _target_cache_offset(self.target_cache)
+        _validate_target_cache(
+            self.target_cache,
+            expected_offset=initial_offset,
+            require_kda_state=speculative_width is not None or initial_offset > 0,
+            speculative_phase="open" if speculative_width is not None else "closed",
+            speculative_width=speculative_width,
+        )
+        return initial_offset
+
+    def _build_forward_with_taps(
+        self,
+        inputs: mx.array,
+        *,
+        initial_offset: int,
+        speculative_width: int | None = None,
+    ) -> _BuiltKimiK3TargetForward:
+        if inputs.ndim != 2 or inputs.shape[0] != 1 or inputs.shape[1] <= 0:
+            raise ValueError("Kimi K3 DSpark target input must be non-empty batch one")
+        width = int(inputs.shape[1])
+        if speculative_width is not None and speculative_width != width:
+            raise ValueError(
+                "Kimi K3 target verification width does not match its input"
+            )
+        if _target_cache_offset(self.target_cache) != initial_offset:
+            raise ValueError("Kimi K3 target cache moved after its readiness gate")
         forward = cast(
             _TargetWithAuxForward,
             self.target_model,
@@ -1806,17 +2832,40 @@ class KimiK3DSparkRequestRuntime:
             expected_width=width,
         )
         _validate_target_logits(logits, expected_width=width)
-        self.evaluate(
-            logits,
-            validated,
-            _target_cache_states(self.target_cache),
+        return _BuiltKimiK3TargetForward(
+            forward=cast(_TargetForwardResult, forward),
+            validated_aux_hidden_states=validated,
+            target_cache=self.target_cache,
+            initial_offset=initial_offset,
+            width=width,
+            speculative_width=speculative_width,
+            evaluate=self.evaluate,
         )
-        _validate_target_cache(
-            self.target_cache,
-            expected_offset=initial_offset + width,
-            require_kda_state=True,
+
+    def _prompt_contract(
+        self,
+        prompt_prefix: mx.array,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        tolist = getattr(prompt_prefix, "tolist", None)
+        if not callable(tolist):
+            raise TypeError("Kimi K3 prompt prefix must be an MLX token array")
+        raw_tokens = tolist()
+        if not isinstance(raw_tokens, Sequence) or isinstance(
+            raw_tokens, (str, bytes)
+        ):
+            raise ValueError("Kimi K3 prompt prefix must be one-dimensional")
+        tokens = _token_tuple(
+            cast(Sequence[int], raw_tokens),
+            expected=len(prompt_prefix),
+            name="Kimi K3 prompt prefix",
         )
-        return cast(_TargetForwardResult, forward)
+        fingerprint = _token_contract_fingerprint(
+            tokens,
+            self.banned_token_ids,
+            self.terminal_token_ids,
+            (int(self.compact_greedy),),
+        )
+        return tokens, fingerprint
 
     def seed_prompt(
         self,
@@ -1833,15 +2882,43 @@ class KimiK3DSparkRequestRuntime:
         if prefill_step_size <= 0:
             raise ValueError("Kimi K3 DSpark prefill step size must be positive")
         total = len(prompt_prefix)
+        prompt_tokens, prompt_fingerprint = self._agreed_operation(
+            "prompt contract validation",
+            lambda: self._prompt_contract(prompt_prefix),
+        )
+        contract_values = (len(prompt_tokens), *prompt_fingerprint)
+        for contract_value in contract_values:
+            if self.collective.agree_token(contract_value) != contract_value:
+                raise DSparkDistributedStateError(
+                    "Kimi K3 DSpark prompt/tokenizer contract disagreed across ranks; "
+                    "no target TP graph was built"
+                ) from None
         processed = 0
         started = self.clock()
         progress_callback(0, total)
         while processed < total:
             chunk_size = min(prefill_step_size, total - processed)
             chunk = prompt_prefix[processed : processed + chunk_size][None]
+            initial_offset = self._agreed_operation(
+                "target prompt readiness",
+                lambda chunk=chunk: self._validate_forward_readiness(chunk),
+            )
+            if self.collective.agree_token(initial_offset) != initial_offset:
+                raise DSparkDistributedStateError(
+                    "Kimi K3 DSpark target prompt offsets disagreed across ranks; "
+                    "no target TP graph was built"
+                ) from None
+            pending_forward = self._agreed_operation(
+                "target prompt graph build",
+                lambda chunk=chunk,
+                initial_offset=initial_offset: self._build_forward_with_taps(
+                    chunk,
+                    initial_offset=initial_offset,
+                ),
+            )
             forward = self._agreed_operation(
-                "target prompt seeding",
-                lambda chunk=chunk: self._forward_with_taps(chunk),
+                "target prompt materialization",
+                pending_forward.materialize,
             )
             self._agreed_operation(
                 "draft prompt projection",
@@ -1868,38 +2945,177 @@ class KimiK3DSparkRequestRuntime:
         elapsed = self.clock() - started
         return (total / elapsed if elapsed > 0 else 0.0), total
 
-    def _verify(self, proposal_block: tuple[int, ...]) -> TargetPosterior:
+    def _verification_plan(
+        self,
+        proposal_block: tuple[int, ...],
+    ) -> TargetVerificationPlan:
+        _token_tuple(
+            proposal_block,
+            expected=self.loaded.verify_width,
+            name="Kimi K3 target verification input",
+        )
+        supports_compact = getattr(
+            self.target_model,
+            "supports_vocab_parallel_greedy",
+            None,
+        )
+        compact_verify = getattr(
+            self.target_model,
+            "forward_with_aux_hidden_states_greedy",
+            None,
+        )
+        compact_available = (
+            callable(supports_compact)
+            and bool(supports_compact())
+            and callable(compact_verify)
+        )
+        if self.compact_greedy and not compact_available:
+            raise DSparkFeatureUnavailableError(
+                "Kimi K3 compact verifier was requested but the target rank "
+                "does not expose its exact vocab-parallel greedy API"
+            )
+        return TargetVerificationPlan("compact" if self.compact_greedy else "full")
+
+    def _build_verification(
+        self,
+        proposal_block: tuple[int, ...],
+        plan: TargetVerificationPlan,
+    ) -> _TargetPosteriorGraph:
+        proposal_block = _token_tuple(
+            proposal_block,
+            expected=self.loaded.verify_width,
+            name="Kimi K3 target verification input",
+        )
+        if self._verification_plan(proposal_block) != plan:
+            raise ValueError("Kimi K3 target verifier mode changed after agreement")
         input_ids = mx.array([proposal_block], dtype=mx.int32)
-        forward = self._forward_with_taps(input_ids)
-        tokens = greedy_dspark_posterior_tokens(
-            forward.logits,
+        initial_offset = self._validate_forward_readiness(
+            input_ids,
+            speculative_width=len(proposal_block),
+        )
+        if plan.mode == "compact":
+            forward = cast(
+                _CompactTargetForwardResult,
+                cast(
+                    _TargetWithAuxGreedyForward,
+                    self.target_model,
+                ).forward_with_aux_hidden_states_greedy(
+                    input_ids,
+                    self.target_cache,
+                    self.loaded.config.target_hidden_state_indices,
+                    self.banned_token_ids,
+                ),
+            )
+            validated_aux = _validated_aux_hidden_states(
+                forward.aux_hidden_states,
+                expected_width=len(proposal_block),
+            )
+            tokens = _validate_batched_greedy_tokens(
+                forward.tokens,
+                expected_width=len(proposal_block),
+            )
+            return _BuiltKimiK3CompactTargetPosterior(
+                tokens=tokens,
+                aux_hidden_states=validated_aux,
+                target_cache=self.target_cache,
+                initial_offset=initial_offset,
+                width=len(proposal_block),
+                evaluate=self.evaluate,
+            )
+        forward = self._build_forward_with_taps(
+            input_ids,
+            initial_offset=initial_offset,
+            speculative_width=len(proposal_block),
+        )
+        tokens = _build_greedy_dspark_posterior_tokens(
+            forward.forward.logits,
             expected_width=len(proposal_block),
             banned_token_ids=self.banned_token_ids,
-            evaluate=self.evaluate,
         )
-        # The five exact taps and the target cache were materialized and checked
-        # in _forward_with_taps before this posterior becomes committable.
-        return TargetPosterior(tokens, tuple(forward.aux_hidden_states))
+        return _BuiltKimiK3TargetPosterior(
+            forward,
+            tokens,
+            len(proposal_block),
+        )
 
-    def _ordinary_decode(self, anchor_token: int) -> int:
+    def _preflight_ordinary(self, anchor_token: int) -> OrdinaryDecodePlan:
+        if type(anchor_token) is not int or not 0 <= anchor_token <= 0x7FFFFFFF:
+            raise ValueError("Kimi K3 ordinary anchor must fit non-negative int32")
         initial_offset = _target_cache_offset(self.target_cache)
+        _validate_target_cache(
+            self.target_cache,
+            expected_offset=initial_offset,
+            require_kda_state=True,
+        )
+        supports_compact = getattr(
+            self.target_model,
+            "supports_vocab_parallel_greedy",
+            None,
+        )
+        compact_greedy = getattr(self.target_model, "vocab_parallel_greedy", None)
+        compact_requested = self.compact_greedy and not self.banned_token_ids
+        if compact_requested and (
+            not callable(supports_compact)
+            or not bool(supports_compact())
+            or not callable(compact_greedy)
+        ):
+            raise DSparkFeatureUnavailableError(
+                "Kimi K3 compact vocab-parallel greedy was requested but the "
+                "target rank does not support it"
+            )
+        mode: Literal["full", "compact"] = (
+            "compact" if compact_requested else "full"
+        )
+        if mode == "full" and not callable(self.target_model):
+            raise DSparkFeatureUnavailableError(
+                "Kimi K3 target does not expose the ordinary full-logits path"
+            )
+        return OrdinaryDecodePlan(initial_offset, mode)
+
+    def _prepare_ordinary(
+        self,
+        anchor_token: int,
+        plan: OrdinaryDecodePlan,
+    ) -> PreparedOrdinaryDecode:
+        local_plan = self._preflight_ordinary(anchor_token)
+        if local_plan != plan:
+            raise ValueError("Kimi K3 ordinary decode plan changed after agreement")
+        input_ids = mx.array([[anchor_token]], dtype=mx.int32)
+        if plan.mode == "compact":
+            sampled = cast(_CompactGreedyTarget, self.target_model).vocab_parallel_greedy(
+                input_ids,
+                cache=self.target_cache,
+            )
+            shape = getattr(sampled, "shape", None)
+            item = getattr(sampled, "item", None)
+            if _shape_tuple(shape) != (1,) or not callable(item):
+                raise ValueError(
+                    "Kimi K3 compact greedy target must return one token"
+                )
+            return _BuiltKimiK3OrdinaryDecode(
+                output=sampled,
+                mode="compact",
+                target_cache=self.target_cache,
+                expected_offset=plan.initial_offset + 1,
+                evaluate=self.evaluate,
+            )
         logits = cast(Callable[..., object], self.target_model)(
-            mx.array([[anchor_token]], dtype=mx.int32),
+            input_ids,
             cache=self.target_cache,
         )
         _validate_target_logits(logits, expected_width=1)
-        self.evaluate(logits, _target_cache_states(self.target_cache))
-        _validate_target_cache(
-            self.target_cache,
-            expected_offset=initial_offset + 1,
-            require_kda_state=True,
-        )
-        return greedy_dspark_posterior_tokens(
+        tokens = _build_greedy_dspark_posterior_tokens(
             logits,
             expected_width=1,
             banned_token_ids=self.banned_token_ids,
+        )
+        return _BuiltKimiK3OrdinaryDecode(
+            output=tokens,
+            mode="full",
+            target_cache=self.target_cache,
+            expected_offset=plan.initial_offset + 1,
             evaluate=self.evaluate,
-        )[0]
+        )
 
     def make_round_engine(
         self,
@@ -1908,8 +3124,22 @@ class KimiK3DSparkRequestRuntime:
         target = ReplaySSMTargetAdapter(
             self.target_model,
             self.target_cache,
-            self._verify,
-            self._ordinary_decode,
+            self._verification_plan,
+            self._build_verification,
+            self._preflight_ordinary,
+            self._prepare_ordinary,
+            validate_closed=lambda expected_offset: _validate_target_cache(
+                self.target_cache,
+                expected_offset=expected_offset,
+                require_kda_state=True,
+            ),
+            validate_open=lambda expected_offset, width: _validate_target_cache(
+                self.target_cache,
+                expected_offset=expected_offset,
+                require_kda_state=True,
+                speculative_phase="open",
+                speculative_width=width,
+            ),
         )
         return KimiK3DSparkRoundEngine(
             config=self.loaded.config,
