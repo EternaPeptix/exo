@@ -100,8 +100,10 @@ rtk /usr/bin/python3 scripts/kimi_k3_tp2/k3_maintenance_canary.py \
 This reads source commits and clean-worktree state plus required files, hashes the full 4.5 GB DSpark
 weight file plus its config and rank manifest, reads the transport JSON,
 checks interface state, RAM, and free disk, source-attests `kimi_k3.py`,
-`kimi_k3_dspark.py`, and `gated_delta.py`, and detects whether `generate.py`
-actually selects the DSpark adapter. It does not import or load
+`kimi_k3_dspark.py`, `gated_delta.py`, `kimi_k3_fused_expert.py`,
+`kimi_k3_fused_switch_glu.py`, `kimi_k3_fused_down_reduce.py`, and
+`kimi_k3_packed_moe_front.py`, and detects whether `generate.py` actually
+selects the DSpark adapter. It does not import or load
 either model, stop a process, launch a runner, place an instance, or access the
 network beyond the two configured SSH routes.
 

@@ -1,5 +1,12 @@
 # Kimi K3 2-bit UVMAX: rank-local TP2 on EXO
 
+> **Version boundary:** the benchmark narrative below records the accepted v6
+> baseline. The current default-off v8 candidate is pinned by
+> [`K3_MAINTENANCE_CANARY.md`](../scripts/kimi_k3_tp2/K3_MAINTENANCE_CANARY.md)
+> and the coordinated `experiment/kimi-k3-uvmax-optimization-stack-v8`
+> branches in EXO, MLX-LM, and MLX. Do not use an older install command as the
+> v8 execution contract.
+
 This procedure converts one pinned Kimi K3 checkpoint into two rank-local MLX
 checkpoints, so each Mac loads only its tensor-parallel slice. The source
 checkpoint is downloaded once by the conversion coordinator; each resulting
@@ -61,7 +68,8 @@ checkpoint, so they remain research evidence rather than production defaults.
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
 | Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v6) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
-| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm) maintenance-candidate commit `1bcf43047a5a2c4a5be64f3c45ed33666981d1c1` |
+| Execution-time MLX-LM v8 candidate | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v8) commit `bf378e33831e745715a88418a44ce20ab1075b9b` |
+| Default-off MLX v8 kernel candidate | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v8) commit `2cfb83040011c273377a25df8ed16def80c6646c` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v2` |
 
@@ -85,14 +93,14 @@ them.
 
 The compact vocabulary-parallel greedy target path is default-off in ordinary
 runs. The maintenance canary enables it explicitly and requires MLX-LM commit
-`1bcf43047a5a2c4a5be64f3c45ed33666981d1c1`, whose exact verifier accepts the
+`bf378e33831e745715a88418a44ce20ab1075b9b`, whose exact verifier accepts the
 full banned-token set without materializing full-vocabulary logits on every
 rank.
 Install the EXO-compatible dependency at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@1bcf43047a5a2c4a5be64f3c45ed33666981d1c1"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@bf378e33831e745715a88418a44ce20ab1075b9b"
 ```
 
 ## License and trust boundary
