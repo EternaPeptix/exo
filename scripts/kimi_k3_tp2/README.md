@@ -35,6 +35,14 @@ parallel checkpoints.
 - `launch_k3_kda_stage_localizer_current.sh` runs that localizer on the pinned
   accepted stack and independently attests both ranks and the selected JACCL
   transport.
+- `k3_decoder_layer_stage_localizer.py` extends the real-checkpoint width-2
+  comparison across layer 0's preparation, KDA cache, AttnRes/RMS, MoE, and
+  residual boundaries. Controlled shared-input probes distinguish upstream
+  propagation, the verifier's direct non-history KDA path, and the
+  transaction's history-producing KDA path; complete-model layer-0 endpoint
+  reproduction is mandatory before an artifact can be written.
+- `launch_k3_decoder_layer_stage_localizer_current.sh` runs that checker only
+  on the accepted v6 JACCL mesh and rejects candidate KDA rewrites.
 - `transport-jaccl-tp2.example.json` documents the explicit topology contract
   that both ranks must receive; it contains placeholders, not deployment
   inventory.
