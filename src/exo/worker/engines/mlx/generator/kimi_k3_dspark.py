@@ -75,6 +75,10 @@ class DSparkFeatureUnavailableError(RuntimeError):
     """The installed MLX-LM build does not expose the required DSpark API."""
 
 
+class DSparkDistributedStateError(RuntimeError):
+    """A distributed state transition cannot be recovered safely."""
+
+
 @dataclass(frozen=True)
 class KimiK3DSparkConfig:
     """Validated local checkpoint and replicated placement contract."""
@@ -96,9 +100,9 @@ class KimiK3DSparkConfig:
 
     @property
     def target_hidden_state_indices(self) -> tuple[int, ...]:
-        """HF output_hidden_states indices for post-layer target taps."""
+        """Direct MLX-LM layer ids for post-layer target taps."""
 
-        return tuple(layer_id + 1 for layer_id in self.target_layer_ids)
+        return self.target_layer_ids
 
 
 def _strict_flag(name: str, raw: str) -> bool:
@@ -173,9 +177,8 @@ def kimi_k3_dspark_config(
     """Parse the fail-closed EXO and MLX-LM DSpark opt-ins.
 
     Configuration mistakes raise instead of silently selecting ordinary decode.
-    Runtime round failures are handled separately by
-    :class:`KimiK3DSparkRoundEngine`, which rolls back and uses ordinary target
-    decode for the current and subsequent rounds.
+    :class:`KimiK3DSparkRoundEngine` falls back only while both caches are still
+    recoverable; an uncertain target commit is a distributed fail-stop.
     """
 
     values = os.environ if environ is None else environ
@@ -311,6 +314,8 @@ class RankAgreement(Protocol):
         maximum_boundary: int,
     ) -> tuple[int, int] | None: ...
 
+    def agree_stage_success(self, local_success: bool) -> bool | None: ...
+
 
 @final
 class MlxRankAgreement:
@@ -382,6 +387,15 @@ class MlxRankAgreement:
             return None
         return first[1], first[2]
 
+    def agree_stage_success(self, local_success: bool) -> bool | None:
+        """Return a unanimous result, or ``None`` when rank outcomes differ."""
+
+        rows = self._all_gather_rows((int(local_success),))
+        first = rows[0][0]
+        if any(row[0] != first for row in rows[1:]):
+            return None
+        return first == 1
+
 
 @dataclass(frozen=True)
 class DSparkRoundTelemetry:
@@ -450,7 +464,7 @@ def accepted_draft_prefix(
 
 @dataclass
 class KimiK3DSparkRoundEngine:
-    """Run rank-agreed DSpark rounds and fail cleanly to target decode."""
+    """Run rank-agreed rounds with pre-commit fallback and commit fail-stop."""
 
     config: KimiK3DSparkConfig
     draft: ReplicatedDraft
@@ -630,21 +644,42 @@ class KimiK3DSparkRoundEngine:
 
         # Acceptance is collective before either state commit.  The target is
         # authoritative; its consumed input count is anchor + accepted drafts.
+        target_commit_error: str | None = None
         try:
             target_round.commit(accepted + 1)
         except Exception as error:
+            target_commit_error = (
+                f"target commit failed: {type(error).__name__}: {error}"
+            )
             try:
                 target_round.cancel()
-            finally:
-                if draft_round is not None:
+            except Exception as cancel_error:
+                target_commit_error += (
+                    "; target cancellation also failed: "
+                    f"{type(cancel_error).__name__}: {cancel_error}"
+                )
+
+        target_commit_consensus = self.collective.agree_stage_success(
+            target_commit_error is None
+        )
+        if target_commit_consensus is not True:
+            if draft_round is not None:
+                try:
                     draft_round.cancel()
-            return self._ordinary_fallback(
-                anchor_token,
-                draft_ms=draft_ms,
-                target_verify_ms=target_verify_ms,
-                proposed=gamma,
-                error=f"target commit failed: {type(error).__name__}: {error}",
+                except Exception:
+                    logger.opt(exception=True).warning(
+                        "Kimi K3 DSpark draft cancellation failed during "
+                        "fatal target commit handling"
+                    )
+            outcome = (
+                "disagreed across ranks"
+                if target_commit_consensus is None
+                else "failed on every rank"
             )
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark target commit "
+                f"{outcome}; target state cannot be recovered safely"
+            ) from None
 
         draft_commit_error: str | None = None
         assert draft_round is not None
@@ -657,6 +692,19 @@ class KimiK3DSparkRoundEngine:
             draft_commit_error = (
                 f"draft commit failed: {type(error).__name__}: {error}; "
                 "DSpark disabled for subsequent rounds"
+            )
+
+        draft_commit_consensus = self.collective.agree_stage_success(
+            draft_commit_error is None
+        )
+        if draft_commit_consensus is not True:
+            outcome = (
+                "outcome disagreed across ranks"
+                if draft_commit_consensus is None
+                else "failed on every rank"
+            )
+            draft_commit_error = (
+                f"draft commit {outcome}; DSpark disabled on every rank"
             )
             self._disabled_reason = draft_commit_error
 
@@ -776,8 +824,6 @@ class MlxDSparkFeatures:
 
     load_kimi_k3_dspark: Callable[..., object]
     proposer_type: Callable[..., object]
-    make_context_cache: Callable[[], object]
-    append_target_context: Callable[..., None]
 
 
 def detect_mlx_dspark_features() -> MlxDSparkFeatures | None:
@@ -790,8 +836,6 @@ def detect_mlx_dspark_features() -> MlxDSparkFeatures | None:
     required = {
         "load_kimi_k3_dspark": getattr(module, "load_kimi_k3_dspark", None),
         "proposer_type": getattr(module, "KimiK3DSparkProposer", None),
-        "make_context_cache": getattr(module, "make_context_cache", None),
-        "append_target_context": getattr(module, "append_target_context", None),
     }
     if not all(callable(value) for value in required.values()):
         return None
@@ -800,23 +844,210 @@ def detect_mlx_dspark_features() -> MlxDSparkFeatures | None:
             Callable[..., object], required["load_kimi_k3_dspark"]
         ),
         proposer_type=cast(Callable[..., object], required["proposer_type"]),
-        make_context_cache=cast(Callable[[], object], required["make_context_cache"]),
-        append_target_context=cast(
-            Callable[..., None],
-            required["append_target_context"],
-        ),
     )
+
+
+class _ProposalTokenArray(Protocol):
+    def tolist(self) -> object: ...
+
+
+class _AuxHiddenState(Protocol):
+    @property
+    def shape(self) -> Sequence[int]: ...
+
+    def __getitem__(self, key: tuple[object, ...]) -> object: ...
+
+
+class _MlxDSparkProposer(Protocol):
+    verify_width: int
+
+    def make_context_cache(self) -> object: ...
+
+    def append_target_context(
+        self,
+        aux_hidden_states: Sequence[object],
+        context_offset: int,
+        context_cache: object,
+    ) -> None: ...
+
+    def propose(self, anchor_token: int, context_cache: object) -> object: ...
+
+
+def _flatten_mlx_proposal_tokens(
+    proposal: object,
+    *,
+    expected: int,
+    verify_width: int,
+) -> tuple[int, ...]:
+    proposal_width = getattr(proposal, "verify_width", None)
+    if type(proposal_width) is not int or proposal_width != verify_width:
+        raise ValueError("MLX-LM DSpark proposal verify width does not match")
+    raw_tokens = getattr(proposal, "tokens", None)
+    tolist = getattr(raw_tokens, "tolist", None)
+    if not callable(tolist):
+        raise TypeError("MLX-LM DSpark proposal tokens must be an MLX array")
+    rows = cast(_ProposalTokenArray, raw_tokens).tolist()
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        raise ValueError("MLX-LM DSpark proposal tokens must have batch size one")
+    row_values = cast(Sequence[object], rows)
+    if (
+        len(row_values) != 1
+        or not isinstance(row_values[0], Sequence)
+        or isinstance(row_values[0], (str, bytes))
+    ):
+        raise ValueError("MLX-LM DSpark proposal tokens must have batch size one")
+    return _token_tuple(
+        cast(Sequence[int], row_values[0]),
+        expected=expected,
+        name="MLX-LM DSpark proposal",
+    )
+
+
+def _context_cache_offset(context_cache: object) -> int:
+    if (
+        not isinstance(context_cache, Sequence)
+        or isinstance(context_cache, (str, bytes))
+        or not context_cache
+    ):
+        raise ValueError("MLX-LM DSpark context cache must be a non-empty sequence")
+    entries = cast(Sequence[object], context_cache)
+    lengths = tuple(getattr(entry, "length", None) for entry in entries)
+    if any(type(length) is not int or length < 0 for length in lengths):
+        raise ValueError("MLX-LM DSpark context cache lengths are invalid")
+    if len(set(lengths)) != 1:
+        raise ValueError("MLX-LM DSpark context cache lengths disagree")
+    return cast(int, lengths[0])
+
+
+def _committed_aux_hidden_states(
+    aux_hidden_states: tuple[object, ...],
+    *,
+    consumed: int,
+    verify_width: int,
+) -> tuple[object, ...]:
+    if not aux_hidden_states:
+        raise ValueError("target posterior is missing DSpark auxiliary hidden states")
+    committed: list[object] = []
+    for hidden in aux_hidden_states:
+        shape = getattr(hidden, "shape", None)
+        if not isinstance(shape, Sequence):
+            raise ValueError(
+                "target DSpark auxiliary hidden-state shape does not match"
+            )
+        dimensions = cast(Sequence[object], shape)
+        if len(dimensions) != 3:
+            raise ValueError(
+                "target DSpark auxiliary hidden-state shape does not match"
+            )
+        batch_size, token_count = dimensions[:2]
+        if (
+            type(batch_size) is not int
+            or batch_size != 1
+            or type(token_count) is not int
+            or token_count != verify_width
+        ):
+            raise ValueError(
+                "target DSpark auxiliary hidden-state shape does not match"
+            )
+        hidden_state = cast(_AuxHiddenState, hidden)
+        committed.append(hidden_state[:, :consumed, :])
+    return tuple(committed)
+
+
+@final
+class _MlxDSparkDraftRound:
+    """Non-mutating proposal followed by append-only committed target context."""
+
+    def __init__(
+        self,
+        proposer: _MlxDSparkProposer,
+        context_cache: object,
+        proposal_tokens: tuple[int, ...],
+        verify_width: int,
+    ):
+        self._proposer = proposer
+        self._context_cache = context_cache
+        self._proposal_tokens = proposal_tokens
+        self._verify_width = verify_width
+        self._active = True
+
+    @property
+    def proposal_tokens(self) -> tuple[int, ...]:
+        return self._proposal_tokens
+
+    def commit(
+        self,
+        accepted_draft_tokens: int,
+        next_anchor_token: int,
+        target_posterior: TargetPosterior,
+    ) -> None:
+        if not self._active:
+            raise RuntimeError("MLX-LM DSpark draft round is no longer active")
+        if type(
+            accepted_draft_tokens
+        ) is not int or not 0 <= accepted_draft_tokens <= len(self._proposal_tokens):
+            raise ValueError("accepted DSpark draft-token count is invalid")
+        posterior_tokens = _token_tuple(
+            target_posterior.tokens,
+            expected=self._verify_width,
+            name="target posterior",
+        )
+        if (
+            type(next_anchor_token) is not int
+            or next_anchor_token != posterior_tokens[accepted_draft_tokens]
+        ):
+            raise ValueError("next DSpark anchor does not match the target posterior")
+        consumed = accepted_draft_tokens + 1
+        committed_hidden = _committed_aux_hidden_states(
+            target_posterior.aux_hidden_states,
+            consumed=consumed,
+            verify_width=self._verify_width,
+        )
+        context_offset = _context_cache_offset(self._context_cache)
+        try:
+            self._proposer.append_target_context(
+                committed_hidden,
+                context_offset,
+                self._context_cache,
+            )
+        finally:
+            # MLX-LM exposes append-only context, not rollback. Never retry a
+            # possibly partial append; rank consensus disables the draft.
+            self._active = False
+
+    def cancel(self) -> None:
+        # ``propose`` does not mutate MLX-LM's target-context cache.
+        self._active = False
 
 
 @dataclass(frozen=True)
 class LoadedMlxDSpark:
-    """Rank-local replicated MLX objects ready for an EXO draft adapter."""
+    """Concrete rank-local replicated draft backed by MLX-LM's proposer."""
 
     drafter: object
     proposer: object
     context_cache: object
-    append_target_context: Callable[..., None]
+    verify_width: int
     placement: Literal["replicated"] = "replicated"
+
+    def begin_round(self, anchor_token: int, num_proposals: int) -> DraftRound:
+        if type(anchor_token) is not int or anchor_token < 0:
+            raise ValueError("anchor_token must be a non-negative integer")
+        if num_proposals != self.verify_width - 1:
+            raise ValueError("requested DSpark proposal count does not match its width")
+        proposer = cast(_MlxDSparkProposer, self.proposer)
+        proposal = proposer.propose(anchor_token, self.context_cache)
+        proposal_tokens = _flatten_mlx_proposal_tokens(
+            proposal,
+            expected=num_proposals,
+            verify_width=self.verify_width,
+        )
+        return _MlxDSparkDraftRound(
+            proposer,
+            self.context_cache,
+            proposal_tokens,
+            self.verify_width,
+        )
 
 
 def load_replicated_mlx_dspark(
@@ -827,9 +1058,9 @@ def load_replicated_mlx_dspark(
 ) -> LoadedMlxDSpark:
     """Load the pinned local draft independently on the calling target rank.
 
-    EXO intentionally passes ``verify_sha256=True`` and an explicit width.  No
-    model identifier is accepted here, so this adapter cannot trigger a remote
-    checkpoint download.
+    EXO intentionally passes ``verify_weights_sha256=True`` and an explicit
+    width. No model identifier is accepted here, so this adapter cannot trigger
+    a remote checkpoint download.
     """
 
     detected = detect_mlx_dspark_features() if features is None else features
@@ -840,19 +1071,32 @@ def load_replicated_mlx_dspark(
     drafter = detected.load_kimi_k3_dspark(
         config.checkpoint_path,
         target_model,
-        verify_sha256=True,
+        verify_weights_sha256=True,
     )
     proposer = detected.proposer_type(
         drafter,
         verify_width=config.verify_width,
+        screening_override=(config.verify_width == DSPARK_CONSERVATIVE_VERIFY_WIDTH),
     )
-    if not callable(getattr(proposer, "propose", None)):
+    required_methods = (
+        "propose",
+        "make_context_cache",
+        "append_target_context",
+    )
+    if not all(callable(getattr(proposer, name, None)) for name in required_methods):
         raise DSparkFeatureUnavailableError(
-            "MLX-LM DSpark proposer has no propose method"
+            "MLX-LM DSpark proposer is missing proposal or context-cache methods"
         )
+    proposer_width = getattr(proposer, "verify_width", None)
+    if type(proposer_width) is not int or proposer_width != config.verify_width:
+        raise DSparkFeatureUnavailableError(
+            "MLX-LM DSpark proposer returned an unexpected verify width"
+        )
+    context_cache = cast(_MlxDSparkProposer, proposer).make_context_cache()
+    _context_cache_offset(context_cache)
     return LoadedMlxDSpark(
         drafter=drafter,
         proposer=proposer,
-        context_cache=detected.make_context_cache(),
-        append_target_context=detected.append_target_context,
+        context_cache=context_cache,
+        verify_width=config.verify_width,
     )

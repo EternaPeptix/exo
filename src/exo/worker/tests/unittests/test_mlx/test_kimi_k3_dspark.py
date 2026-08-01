@@ -4,6 +4,8 @@ import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -17,6 +19,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     MLX_DSPARK_PROPOSER_ENV,
     MLX_REPLAYSSM_ENV,
     DSparkConfigurationError,
+    DSparkDistributedStateError,
     DSparkFeatureUnavailableError,
     KimiK3DSparkConfig,
     KimiK3DSparkRoundEngine,
@@ -24,6 +27,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     ReplaySSMTargetAdapter,
     TargetPosterior,
     accepted_draft_prefix,
+    detect_mlx_dspark_features,
     has_replayssm_target_hooks,
     kimi_k3_dspark_config,
     load_replicated_mlx_dspark,
@@ -107,7 +111,7 @@ def test_model_native_width_eight_is_the_enabled_default(tmp_path: Path) -> None
     assert config.gamma == 7
     assert config.placement == "replicated"
     assert config.target_layer_ids == (7, 23, 51, 67, 83)
-    assert config.target_hidden_state_indices == (8, 24, 52, 68, 84)
+    assert config.target_hidden_state_indices == (7, 23, 51, 67, 83)
     assert validated == [tmp_path]
     assert warnings == []
 
@@ -196,6 +200,7 @@ class _FakeDraftRound:
     events: list[str]
     commits: list[tuple[int, int, tuple[int, ...]]] = field(default_factory=list)
     cancelled: bool = False
+    fail_commit: bool = False
 
     def commit(
         self,
@@ -204,6 +209,8 @@ class _FakeDraftRound:
         target_posterior: TargetPosterior,
     ) -> None:
         self.events.append("draft_commit")
+        if self.fail_commit:
+            raise RuntimeError("injected draft commit failure")
         self.commits.append(
             (
                 accepted_draft_tokens,
@@ -224,11 +231,16 @@ class _FakeDraft:
     events: list[str]
     placement: str = "replicated"
     rounds: list[_FakeDraftRound] = field(default_factory=list)
+    fail_commit: bool = False
 
     def begin_round(self, anchor_token: int, num_proposals: int) -> _FakeDraftRound:
         self.events.append("draft")
         assert num_proposals == self.verify_width - 1
-        round_state = _FakeDraftRound(self.proposal_tokens, self.events)
+        round_state = _FakeDraftRound(
+            self.proposal_tokens,
+            self.events,
+            fail_commit=self.fail_commit,
+        )
         self.rounds.append(round_state)
         return round_state
 
@@ -239,9 +251,12 @@ class _FakeTargetRound:
     events: list[str]
     commits: list[int] = field(default_factory=list)
     cancelled: bool = False
+    fail_commit: bool = False
 
     def commit(self, consumed_input_tokens: int) -> None:
         self.events.append("target_commit")
+        if self.fail_commit:
+            raise RuntimeError("injected target commit failure")
         self.commits.append(consumed_input_tokens)
 
     def cancel(self) -> None:
@@ -256,12 +271,14 @@ class _FakeTarget:
     ordinary_token: int = 999
     rounds: list[_FakeTargetRound] = field(default_factory=list)
     ordinary_anchors: list[int] = field(default_factory=list)
+    fail_commit: bool = False
 
     def begin_verification(self, proposal_block: tuple[int, ...]) -> _FakeTargetRound:
         self.events.append("target_verify")
         round_state = _FakeTargetRound(
             TargetPosterior(tuple(self.posterior_tokens), ("hidden-taps",)),
             self.events,
+            fail_commit=self.fail_commit,
         )
         self.rounds.append(round_state)
         return round_state
@@ -279,6 +296,7 @@ class _FakeAgreement:
     reject_acceptance: bool = False
     rank: int = 0
     size: int = 2
+    stage_outcomes: list[bool | None] = field(default_factory=list)
 
     def agree_proposal_block(
         self,
@@ -302,6 +320,12 @@ class _FakeAgreement:
             return None
         assert local_boundary <= maximum_boundary
         return local_boundary, local_next_token
+
+    def agree_stage_success(self, local_success: bool) -> bool | None:
+        self.events.append(f"agree_stage_{int(local_success)}")
+        if self.stage_outcomes:
+            return self.stage_outcomes.pop(0)
+        return local_success
 
 
 def _config(tmp_path: Path, width: int) -> KimiK3DSparkConfig:
@@ -366,7 +390,9 @@ def test_width_eight_accepts_seven_proposals_and_bonus_target_token(
         "target_verify",
         "agree_acceptance",
         "target_commit",
+        "agree_stage_1",
         "draft_commit",
+        "agree_stage_1",
     ]
 
 
@@ -454,6 +480,66 @@ def test_acceptance_disagreement_rolls_back_both_caches_before_fallback(
     ]
 
 
+def test_target_commit_outcome_disagreement_is_fail_stop(tmp_path: Path) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(events, stage_outcomes=[None])
+    engine, draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="disagreed across ranks"):
+        engine.decode_round(10)
+
+    assert target.rounds[0].commits == [3]
+    assert draft.rounds[0].cancelled is True
+    assert target.ordinary_anchors == []
+
+
+def test_target_commit_failure_never_falls_back_after_commit_phase(
+    tmp_path: Path,
+) -> None:
+    engine, draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+    )
+    target.fail_commit = True
+
+    with pytest.raises(DSparkDistributedStateError, match="failed on every rank"):
+        engine.decode_round(10)
+
+    assert target.rounds[0].cancelled is True
+    assert draft.rounds[0].cancelled is True
+    assert target.ordinary_anchors == []
+
+
+def test_draft_commit_disagreement_disables_draft_on_every_rank(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(events, stage_outcomes=[True, None])
+    engine, draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+
+    first = engine.decode_round(10)
+    second = engine.decode_round(13)
+
+    assert first.emitted_tokens == (11, 12, 13)
+    assert first.telemetry.error == (
+        "draft commit outcome disagreed across ranks; DSpark disabled on every rank"
+    )
+    assert second.emitted_tokens == (999,)
+    assert len(draft.rounds) == 1
+    assert target.ordinary_anchors == [13]
+
+
 @dataclass
 class _FakeTransaction:
     active: bool = True
@@ -531,58 +617,222 @@ def test_replayssm_adapter_rejects_incomplete_target_api() -> None:
         )
 
 
-def test_replicated_loader_uses_local_path_hash_check_and_explicit_width(
-    tmp_path: Path,
-) -> None:
-    calls: list[tuple[object, ...]] = []
+@dataclass(frozen=True)
+class _FakeTokenArray:
+    rows: list[list[int]]
 
-    class _FakeProposer:
-        def propose(self) -> None:
-            return None
+    def tolist(self) -> object:
+        return self.rows
 
-    proposer = _FakeProposer()
 
+@dataclass(frozen=True)
+class _FakeHidden:
+    shape: tuple[int, int, int]
+    name: str
+
+    def __getitem__(self, key: tuple[object, ...]) -> _FakeHidden:
+        assert len(key) == 3
+        token_slice = key[1]
+        assert isinstance(token_slice, slice)
+        stop = cast(int, token_slice.stop)
+        return _FakeHidden(
+            (self.shape[0], stop, self.shape[2]),
+            self.name,
+        )
+
+
+@dataclass
+class _FakeContextCache:
+    length: int = 0
+
+
+@dataclass
+class _FakeMlxProposer:
+    verify_width: int
+    calls: list[tuple[object, ...]]
+    proposal_rows: list[list[int]]
+    context_cache: list[_FakeContextCache] = field(
+        default_factory=lambda: [_FakeContextCache(), _FakeContextCache()]
+    )
+
+    def make_context_cache(self) -> object:
+        self.calls.append(("make_context_cache",))
+        return self.context_cache
+
+    def propose(self, anchor_token: int, context_cache: object) -> object:
+        self.calls.append(("propose", anchor_token, context_cache))
+        return SimpleNamespace(
+            tokens=_FakeTokenArray(self.proposal_rows),
+            verify_width=self.verify_width,
+        )
+
+    def append_target_context(
+        self,
+        aux_hidden_states: Sequence[object],
+        context_offset: int,
+        context_cache: object,
+    ) -> None:
+        assert isinstance(context_cache, list)
+        cache_entries = cast(list[object], context_cache)
+        hidden = tuple(aux_hidden_states)
+        assert hidden
+        assert all(isinstance(value, _FakeHidden) for value in hidden)
+        shapes = tuple(
+            value.shape for value in hidden if isinstance(value, _FakeHidden)
+        )
+        self.calls.append(("append_target_context", context_offset, shapes))
+        consumed = shapes[0][1]
+        for entry in cache_entries:
+            assert isinstance(entry, _FakeContextCache)
+            entry.length += consumed
+
+
+def _mock_mlx_features(
+    calls: list[tuple[object, ...]],
+    proposal_rows: list[list[int]],
+) -> MlxDSparkFeatures:
     def load(
         checkpoint_path: Path,
         target_model: object,
         *,
-        verify_sha256: bool,
+        verify_weights_sha256: bool,
     ) -> object:
-        calls.append(("load", checkpoint_path, target_model, verify_sha256))
+        calls.append(("load", checkpoint_path, target_model, verify_weights_sha256))
         return "draft"
 
     def make_proposer(
         drafter: object,
         *,
         verify_width: int,
+        screening_override: bool,
     ) -> object:
-        calls.append(("proposer", drafter, verify_width))
-        return proposer
+        calls.append(("proposer", drafter, verify_width, screening_override))
+        return _FakeMlxProposer(verify_width, calls, proposal_rows)
 
-    def append_context(*_args: object) -> None:
-        return None
-
-    features = MlxDSparkFeatures(
+    return MlxDSparkFeatures(
         load_kimi_k3_dspark=load,
         proposer_type=make_proposer,
-        make_context_cache=lambda: "context-cache",
-        append_target_context=append_context,
     )
-    config = _config(tmp_path, 8)
+
+
+def test_feature_detection_matches_actual_module_level_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def load(_path: object, _target: object, *, verify_weights_sha256: bool) -> None:
+        del verify_weights_sha256
+
+    class Proposer:
+        pass
+
+    module = SimpleNamespace(
+        load_kimi_k3_dspark=load,
+        KimiK3DSparkProposer=Proposer,
+    )
+
+    def import_module(_name: str) -> object:
+        return module
+
+    monkeypatch.setattr(
+        "exo.worker.engines.mlx.generator.kimi_k3_dspark.importlib.import_module",
+        import_module,
+    )
+
+    features = detect_mlx_dspark_features()
+
+    assert features is not None
+    assert features.load_kimi_k3_dspark is load
+    assert features.proposer_type is Proposer
+
+
+@pytest.mark.parametrize(
+    ("width", "screening_override", "proposal_rows"),
+    [
+        (8, False, [[11, 12, 13, 14, 15, 16, 17]]),
+        (3, True, [[11, 12]]),
+    ],
+)
+def test_replicated_loader_uses_exact_mlx_signatures_and_proposer_context(
+    tmp_path: Path,
+    width: int,
+    screening_override: bool,
+    proposal_rows: list[list[int]],
+) -> None:
+    calls: list[tuple[object, ...]] = []
     target_model = object()
 
     loaded = load_replicated_mlx_dspark(
-        config,
+        _config(tmp_path, width),
         target_model,
-        features=features,
+        features=_mock_mlx_features(calls, proposal_rows),
     )
 
     assert loaded.placement == "replicated"
-    assert loaded.context_cache == "context-cache"
+    assert loaded.verify_width == width
+    assert isinstance(loaded.context_cache, list)
     assert calls == [
         ("load", tmp_path, target_model, True),
-        ("proposer", "draft", 8),
+        ("proposer", "draft", width, screening_override),
+        ("make_context_cache",),
     ]
+
+
+def test_replicated_draft_flattens_proposals_and_appends_only_committed_context(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    loaded = load_replicated_mlx_dspark(
+        _config(tmp_path, 3),
+        object(),
+        features=_mock_mlx_features(calls, [[11, 12]]),
+    )
+    assert isinstance(loaded.context_cache, list)
+    context_cache = cast(list[_FakeContextCache], loaded.context_cache)
+    for entry in context_cache:
+        entry.length = 5
+
+    round_state = loaded.begin_round(10, 2)
+    assert tuple(round_state.proposal_tokens) == (11, 12)
+    round_state.commit(
+        1,
+        99,
+        TargetPosterior(
+            (11, 99, 100),
+            (
+                _FakeHidden((1, 3, 16), "layer-7"),
+                _FakeHidden((1, 3, 16), "layer-23"),
+            ),
+        ),
+    )
+
+    assert [entry.length for entry in context_cache] == [7, 7]
+    assert calls[-2:] == [
+        ("propose", 10, context_cache),
+        ("append_target_context", 5, ((1, 2, 16), (1, 2, 16))),
+    ]
+    with pytest.raises(RuntimeError, match="no longer active"):
+        round_state.commit(1, 99, TargetPosterior((11, 99, 100)))
+
+
+@pytest.mark.parametrize(
+    "proposal_rows",
+    [
+        [[11]],
+        [[11, 12], [11, 12]],
+        [[11, -1]],
+    ],
+)
+def test_replicated_draft_rejects_malformed_mlx_proposals(
+    tmp_path: Path,
+    proposal_rows: list[list[int]],
+) -> None:
+    loaded = load_replicated_mlx_dspark(
+        _config(tmp_path, 3),
+        object(),
+        features=_mock_mlx_features([], proposal_rows),
+    )
+
+    with pytest.raises((TypeError, ValueError)):
+        loaded.begin_round(10, 2)
 
 
 @pytest.mark.parametrize(
