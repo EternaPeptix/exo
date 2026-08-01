@@ -250,8 +250,8 @@ def test_checked_in_inventory_is_candidate_pinned_and_legacy_actions_are_rollbac
         SCRIPT_DIR / "k3_maintenance_canary.inventory.json"
     )
 
-    assert inventory.nodes[0].paths["exo_root"].endswith("bc51983")
-    assert inventory.nodes[0].paths["mlx_lm_root"].endswith("aa2e11e")
+    assert inventory.nodes[0].paths["exo_root"].endswith("6eb59a4")
+    assert inventory.nodes[0].paths["mlx_lm_root"].endswith("1bcf430")
     for action in ("start-baseline", "rollback"):
         contract = _mapping(inventory.actions[action])
         assert "rollback-only" in str(contract["reason"]).lower()

@@ -26,13 +26,13 @@ FACTS_SCHEMA: Final = "k3-maintenance-canary-facts/v1"
 
 # Candidate sources. The separate MLX core pins below are retained only as
 # rollback/baseline evidence; they do not attest the candidate runtime.
-EXO_DSPARK_CONTRACT_COMMIT: Final = "bc51983ef9f1cd45c9f2d24003593671183255fb"
-MLX_LM_DSPARK_COMMIT: Final = "aa2e11efdfc33c3847c5594524e579199009931b"
+EXO_DSPARK_CONTRACT_COMMIT: Final = "6eb59a4770d7a2efaa632c0b3f3df26fde545361"
+MLX_LM_DSPARK_COMMIT: Final = "1bcf43047a5a2c4a5be64f3c45ed33666981d1c1"
 MLX_ACCEPTED_COMMIT: Final = "57b87fe47cfce34d6dc59d0e274d8ee36bfb9308"
 MLX_FACTORIZED_COMMIT: Final = "152f01807c8327ac154b8ed56dd9279a6f9506e6"
 MLX_LM_FACTORIZED_WIRE_COMMIT: Final = "53dbe04a0499ffb3e98ede90ff5a82f118f77f04"
 MLX_LM_KIMI_K3_SHA256: Final = (
-    "571fe7e7cec44f9eeb34ab8d7ed3ec5f8e412f5cfbbbff3f95260221b72b901a"
+    "3e283240117d298d95e33f7238cb49abc5606aafdd26f70062e841518059088b"
 )
 MLX_LM_KIMI_K3_DSPARK_SHA256: Final = (
     "5ba010755e703f39b86aed1ad999576a18f2f93c041b502bbe3f57b197af2f01"

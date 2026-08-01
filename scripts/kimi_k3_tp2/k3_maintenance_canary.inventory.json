@@ -11,8 +11,8 @@
         "jeweled@512S1.local"
       ],
       "paths": {
-        "exo_root": "/Users/jeweled/exo-k3-dspark-runtime-bc51983",
-        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-maintenance-aa2e11e",
+        "exo_root": "/Users/jeweled/exo-k3-dspark-runtime-6eb59a4",
+        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-maintenance-1bcf430",
         "mlx_root": "/Users/jeweled/.exo/mlx-overrides/57b87fe",
         "factorized_mlx_root": "/Users/jeweled/mlx-k3-factorized-152f018",
         "rank_checkpoint": "/Users/jeweled/.exo/models/kernelpool--Kimi-K3-2bit-UVMAX-tp2-rank0",
@@ -34,8 +34,8 @@
         "jeweled@169.254.199.64"
       ],
       "paths": {
-        "exo_root": "/Users/jeweled/exo-k3-dspark-runtime-bc51983",
-        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-maintenance-aa2e11e",
+        "exo_root": "/Users/jeweled/exo-k3-dspark-runtime-6eb59a4",
+        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-maintenance-1bcf430",
         "mlx_root": "/Users/jeweled/.exo/mlx-overrides/57b87fe",
         "factorized_mlx_root": "/Users/jeweled/mlx-k3-factorized-152f018",
         "rank_checkpoint": "/Users/jeweled/.exo/models/kernelpool--Kimi-K3-2bit-UVMAX-tp2-rank1",
