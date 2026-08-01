@@ -161,23 +161,41 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
 def test_runtime_source_verification_uses_execution_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    runtime_source = tmp_path / "kimi_k3.py"
-    runtime_source.write_bytes(b"pinned execution runtime")
-    digest = hashlib.sha256(runtime_source.read_bytes()).hexdigest()
-    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_SHA256", digest)
-
     mlx_lm = types.ModuleType("mlx_lm")
     models = types.ModuleType("mlx_lm.models")
-    kimi_k3 = types.ModuleType("mlx_lm.models.kimi_k3")
-    kimi_k3.__file__ = str(runtime_source)
-    models.kimi_k3 = kimi_k3
     mlx_lm.models = models
     monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm)
     monkeypatch.setitem(sys.modules, "mlx_lm.models", models)
-    monkeypatch.setitem(sys.modules, "mlx_lm.models.kimi_k3", kimi_k3)
+
+    pins = (
+        ("kimi_k3", "MLX_LM_KIMI_K3_SHA256"),
+        ("kimi_k3_derived_bias", "MLX_LM_KIMI_K3_DERIVED_BIAS_SHA256"),
+        ("kimi_k3_fused_expert", "MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256"),
+        (
+            "kimi_k3_fused_switch_glu",
+            "MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256",
+        ),
+        (
+            "kimi_k3_fused_down_reduce",
+            "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256",
+        ),
+        (
+            "kimi_k3_tuned_gather_qmv",
+            "MLX_LM_KIMI_K3_TUNED_GATHER_QMV_SHA256",
+        ),
+    )
+    for module_name, pin_name in pins:
+        runtime_source = tmp_path / f"{module_name}.py"
+        runtime_source.write_bytes(f"pinned {module_name}".encode())
+        digest = hashlib.sha256(runtime_source.read_bytes()).hexdigest()
+        monkeypatch.setattr(loader, pin_name, digest)
+        module = types.ModuleType(f"mlx_lm.models.{module_name}")
+        module.__file__ = str(runtime_source)
+        setattr(models, module_name, module)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
 
     loader._verify_runtime_source()
-    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_SHA256", "0" * 64)
+    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_DERIVED_BIAS_SHA256", "0" * 64)
     with pytest.raises(loader.RankLocalLoadError, match="execution runtime pin"):
         loader._verify_runtime_source()
 

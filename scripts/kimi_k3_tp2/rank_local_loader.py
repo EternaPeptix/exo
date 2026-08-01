@@ -29,9 +29,24 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = "95fc8ad485e8d2568eda4e468c4169f6a556919a"
+RUNTIME_MLX_LM_COMMIT = "c72ba9ce3d813f2ccfee028cf623a9cfc17243e5"
 MLX_LM_KIMI_K3_SHA256 = (
-    "32d26c21e618ce09babf924f07b702e1c083bc52493f9f8234fcb8fd4213f300"
+    "4e550e1a1ae1801a86b472a0c02918f467806664ed3b4b3b860f7d3157141ce9"
+)
+MLX_LM_KIMI_K3_DERIVED_BIAS_SHA256 = (
+    "56792d995c2e7b29e7bbf5de42b9eb94fa7ecec16d22318e10073a8bb980b515"
+)
+MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256 = (
+    "a4cc3b031052bd65679153ecfdd4f8197920a0196aa433c15963a3fa9803c7f3"
+)
+MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256 = (
+    "ba62f6a1d375cb873c0e8fee8a08cc87554f45953c2c49f4fb869824ab1f6fa6"
+)
+MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256 = (
+    "038a79648ff9bb27faf8c54c551e0ffcc0c19b129105d1affad1ed3c4b48486f"
+)
+MLX_LM_KIMI_K3_TUNED_GATHER_QMV_SHA256 = (
+    "ec702446d3b3fe72cd95b0ee24497de54bcfde1ea2de9f78bad96e2f98ac4de2"
 )
 SOURCE_CONFIG_SHA256 = (
     "d041003554810a367bb600d18733976bdd21041bb46e75cc1e27c7b15fe034d0"
@@ -88,17 +103,53 @@ def _load_json(path: Path) -> dict:
 def _verify_runtime_source() -> None:
     """Fail closed if the pinned execution-time K3 source is not imported."""
 
-    from mlx_lm.models import kimi_k3
+    from mlx_lm.models import (
+        kimi_k3,
+        kimi_k3_derived_bias,
+        kimi_k3_fused_down_reduce,
+        kimi_k3_fused_expert,
+        kimi_k3_fused_switch_glu,
+        kimi_k3_tuned_gather_qmv,
+    )
 
-    source = Path(inspect.getfile(kimi_k3)).resolve()
-    actual = _sha256_file(source)
-    if actual != MLX_LM_KIMI_K3_SHA256:
-        raise RankLocalLoadError(
-            "mlx_lm.models.kimi_k3.py does not match the execution runtime pin: "
-            f"expected {MLX_LM_KIMI_K3_SHA256}, got {actual} at {source}. "
-            f"Install mlx-lm commit {RUNTIME_MLX_LM_COMMIT} or audit and update "
-            "the execution runtime pin."
-        )
+    pinned_sources = (
+        (kimi_k3, "kimi_k3.py", MLX_LM_KIMI_K3_SHA256),
+        (
+            kimi_k3_derived_bias,
+            "kimi_k3_derived_bias.py",
+            MLX_LM_KIMI_K3_DERIVED_BIAS_SHA256,
+        ),
+        (
+            kimi_k3_fused_expert,
+            "kimi_k3_fused_expert.py",
+            MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256,
+        ),
+        (
+            kimi_k3_fused_switch_glu,
+            "kimi_k3_fused_switch_glu.py",
+            MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256,
+        ),
+        (
+            kimi_k3_fused_down_reduce,
+            "kimi_k3_fused_down_reduce.py",
+            MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256,
+        ),
+        (
+            kimi_k3_tuned_gather_qmv,
+            "kimi_k3_tuned_gather_qmv.py",
+            MLX_LM_KIMI_K3_TUNED_GATHER_QMV_SHA256,
+        ),
+    )
+    for module, filename, expected in pinned_sources:
+        source = Path(inspect.getfile(module)).resolve()
+        actual = _sha256_file(source)
+        if actual != expected:
+            raise RankLocalLoadError(
+                f"mlx_lm.models.{filename} does not match the execution runtime "
+                f"pin: expected {expected}, got {actual} at {source}. "
+                f"Install mlx-lm commit {RUNTIME_MLX_LM_COMMIT} or audit and "
+                "update the execution runtime pin."
+            )
 
 
 def _verify_manifest(
