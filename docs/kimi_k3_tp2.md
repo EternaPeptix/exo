@@ -61,21 +61,22 @@ checkpoint, so they remain research evidence rather than production defaults.
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
 | Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v6) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
-| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v6) accepted runtime commit `95fc8ad485e8d2568eda4e468c4169f6a556919a` |
+| Execution-time MLX-LM | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm) maintenance-candidate commit `aa2e11efdfc33c3847c5594524e579199009931b` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v1` |
 
 Rank-local manifests retain the converter commit and Kimi K3 source-file digest
 that produced their slices. The loader verifies those identities independently
-from the imported execution-time `kimi_k3.py` digest and fails closed on either
-a different sharding contract or a different execution source. The immutable
-MLX-LM dependency commit pins the rest of the package; the single-file digest
-does not attest the other MLX-LM modules. Install the EXO-compatible dependency
-at its execution commit:
+from the imported execution-time `kimi_k3.py`, `kimi_k3_dspark.py`, and
+`gated_delta.py` digests and fails closed on either a different sharding
+contract or different execution sources. The immutable MLX-LM dependency
+commit pins the rest of the package. Its segmented-SDPA and KDA decode-tile
+experiments remain default-off for this candidate.
+Install the EXO-compatible dependency at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@95fc8ad485e8d2568eda4e468c4169f6a556919a"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@aa2e11efdfc33c3847c5594524e579199009931b"
 ```
 
 ## License and trust boundary

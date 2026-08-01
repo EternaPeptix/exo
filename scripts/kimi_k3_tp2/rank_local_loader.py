@@ -29,9 +29,15 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = "ebf0747a4185fd998d810dbb65070689415b1308"
+RUNTIME_MLX_LM_COMMIT = "aa2e11efdfc33c3847c5594524e579199009931b"
 MLX_LM_KIMI_K3_SHA256 = (
-    "2c76273a9d0ef2af3bbe699d0cab0b04d99fb0b6322d819715a0b0fd2558167a"
+    "571fe7e7cec44f9eeb34ab8d7ed3ec5f8e412f5cfbbbff3f95260221b72b901a"
+)
+MLX_LM_KIMI_K3_DSPARK_SHA256 = (
+    "5ba010755e703f39b86aed1ad999576a18f2f93c041b502bbe3f57b197af2f01"
+)
+MLX_LM_GATED_DELTA_SHA256 = (
+    "44aef2791ed0cd5cfb84e31ef00cb4df3d40ae184e6c6852b7f0dba7406d2f78"
 )
 SOURCE_CONFIG_SHA256 = (
     "d041003554810a367bb600d18733976bdd21041bb46e75cc1e27c7b15fe034d0"
@@ -88,17 +94,27 @@ def _load_json(path: Path) -> dict:
 def _verify_runtime_source() -> None:
     """Fail closed if the pinned execution-time K3 source is not imported."""
 
-    from mlx_lm.models import kimi_k3
+    from mlx_lm.models import gated_delta, kimi_k3, kimi_k3_dspark
 
-    source = Path(inspect.getfile(kimi_k3)).resolve()
-    actual = _sha256_file(source)
-    if actual != MLX_LM_KIMI_K3_SHA256:
-        raise RankLocalLoadError(
-            "mlx_lm.models.kimi_k3.py does not match the execution runtime pin: "
-            f"expected {MLX_LM_KIMI_K3_SHA256}, got {actual} at {source}. "
-            f"Install mlx-lm commit {RUNTIME_MLX_LM_COMMIT} or audit and update "
-            "the execution runtime pin."
-        )
+    pinned_sources = (
+        (kimi_k3, "kimi_k3.py", MLX_LM_KIMI_K3_SHA256),
+        (
+            kimi_k3_dspark,
+            "kimi_k3_dspark.py",
+            MLX_LM_KIMI_K3_DSPARK_SHA256,
+        ),
+        (gated_delta, "gated_delta.py", MLX_LM_GATED_DELTA_SHA256),
+    )
+    for module, filename, expected in pinned_sources:
+        source = Path(inspect.getfile(module)).resolve()
+        actual = _sha256_file(source)
+        if actual != expected:
+            raise RankLocalLoadError(
+                f"mlx_lm.models.{filename} does not match the execution runtime "
+                f"pin: expected {expected}, got {actual} at {source}. "
+                f"Install mlx-lm commit {RUNTIME_MLX_LM_COMMIT} or audit and "
+                "update the execution runtime pin."
+            )
 
 
 def _verify_manifest(

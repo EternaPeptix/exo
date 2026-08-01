@@ -16,14 +16,15 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import inspect
 import os
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol, cast, final
 
-import mlx.core as mx  # pyright: ignore[reportMissingModuleSource]
+import mlx.core as mx
 
 from exo.worker.runner.bootstrap import logger
 
@@ -34,6 +35,7 @@ DSPARK_TELEMETRY_ENV = "EXO_MLX_KIMI_K3_DSPARK_ROUND_TELEMETRY"
 
 MLX_DSPARK_PROPOSER_ENV = "MLX_LM_KIMI_K3_DSPARK_PROPOSER"
 MLX_REPLAYSSM_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
+MLX_DSPARK_SEGMENTED_SDPA_ENV = "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"
 
 RADIXARK_KIMI_K3_DSPARK_MODEL = "RadixArk/Kimi-K3-DSpark"
 RADIXARK_KIMI_K3_DSPARK_REVISION = "eb03982e58d4fb79bcfc099e902158f562e2e27b"
@@ -46,6 +48,9 @@ RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256 = (
 )
 RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS = (7, 23, 51, 67, 83)
 RADIXARK_KIMI_K3_DSPARK_BLOCK_SIZE = 7
+KIMI_K3_TARGET_HIDDEN_SIZE = 7168
+KIMI_K3_TARGET_TAP_COUNT = len(RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS)
+KIMI_K3_MAX_CONTEXT_LENGTH = 1_048_576
 
 # SGLang's published K3 deployment maps checkpoint block_size directly to
 # gamma, so seven proposals plus the current anchor are verified at once.
@@ -77,6 +82,10 @@ class DSparkFeatureUnavailableError(RuntimeError):
 
 class DSparkDistributedStateError(RuntimeError):
     """A distributed state transition cannot be recovered safely."""
+
+
+class DSparkCancellationError(RuntimeError):
+    """A speculative transaction could not be cancelled safely."""
 
 
 @dataclass(frozen=True)
@@ -118,6 +127,71 @@ def _strict_verify_width(raw: str) -> Literal[3, 8]:
     if parsed not in DSPARK_ALLOWED_VERIFY_WIDTHS:
         raise DSparkConfigurationError(f"{DSPARK_VERIFY_WIDTH_ENV} must be 3 or 8")
     return parsed
+
+
+def validate_dspark_greedy_sampling(
+    *,
+    temperature: float | None,
+    top_p: float | None,
+    top_k: int | None,
+    min_p: float | None,
+    logprobs: bool,
+    top_logprobs: int | None,
+    repetition_penalty: float | None,
+    repetition_context_size: int | None,
+    presence_penalty: float | None,
+    frequency_penalty: float | None,
+) -> None:
+    """Reject request controls the deterministic DSpark decoder cannot honor."""
+
+    if logprobs or top_logprobs is not None:
+        raise ValueError("Kimi K3 DSpark does not support logprobs")
+    if temperature != 0.0:
+        raise ValueError(
+            "Kimi K3 DSpark first canary supports greedy temperature=0 only"
+        )
+    if (
+        top_p not in (None, 1.0)
+        or top_k not in (None, 0)
+        or min_p
+        not in (
+            None,
+            0.05,
+        )
+    ):
+        raise ValueError(
+            "Kimi K3 DSpark does not support nondefault top_p, top_k, or min_p"
+        )
+    if (
+        repetition_penalty not in (None, 1.0)
+        or repetition_context_size is not None
+        or presence_penalty not in (None, 0.0)
+        or frequency_penalty not in (None, 0.0)
+    ):
+        raise ValueError("Kimi K3 DSpark does not support logit processors")
+
+
+def dspark_context_capacity_hint(
+    *,
+    prompt_tokens: int,
+    max_tokens: int,
+    verify_width: int,
+) -> int:
+    """Return bounded request context including one speculative tail round."""
+
+    if type(prompt_tokens) is not int or prompt_tokens < 2:
+        raise ValueError("Kimi K3 DSpark requires at least two prompt tokens")
+    if type(max_tokens) is not int or max_tokens <= 0:
+        raise ValueError("Kimi K3 DSpark max tokens must be positive")
+    if verify_width not in DSPARK_ALLOWED_VERIFY_WIDTHS:
+        raise ValueError("Kimi K3 DSpark verify width must be 3 or 8")
+    capacity_hint = prompt_tokens + max_tokens + verify_width
+    if capacity_hint > KIMI_K3_MAX_CONTEXT_LENGTH:
+        raise ValueError(
+            "Kimi K3 DSpark prompt, output, and speculative tail exceed the "
+            f"{KIMI_K3_MAX_CONTEXT_LENGTH}-token context limit"
+        )
+    return capacity_hint
 
 
 def _sha256(path: Path) -> str:
@@ -267,8 +341,11 @@ class DraftRound(Protocol):
 class ReplicatedDraft(Protocol):
     """Adapter implemented independently by every target TP rank."""
 
-    placement: str
-    verify_width: int
+    @property
+    def placement(self) -> str: ...
+
+    @property
+    def verify_width(self) -> int: ...
 
     def begin_round(self, anchor_token: int, num_proposals: int) -> DraftRound: ...
 
@@ -315,6 +392,8 @@ class RankAgreement(Protocol):
     ) -> tuple[int, int] | None: ...
 
     def agree_stage_success(self, local_success: bool) -> bool | None: ...
+
+    def agree_token(self, local_token: int | None) -> int | None: ...
 
 
 @final
@@ -396,6 +475,16 @@ class MlxRankAgreement:
             return None
         return first == 1
 
+    def agree_token(self, local_token: int | None) -> int | None:
+        valid = type(local_token) is int and local_token >= 0
+        rows = self._all_gather_rows(
+            (int(valid), local_token if valid and local_token is not None else -1)
+        )
+        first = rows[0]
+        if first[0] != 1 or any(row != first for row in rows[1:]):
+            return None
+        return first[1]
+
 
 @dataclass(frozen=True)
 class DSparkRoundTelemetry:
@@ -405,6 +494,9 @@ class DSparkRoundTelemetry:
     rank: int
     draft_ms: float
     target_verify_ms: float
+    target_commit_ms: float
+    draft_commit_ms: float
+    collective_ms: float
     proposed: int
     accepted: int
     emitted: int
@@ -425,6 +517,9 @@ def log_dspark_round(telemetry: DSparkRoundTelemetry) -> None:
         f"round={telemetry.round_index}, "
         f"draft_ms={telemetry.draft_ms:.3f}, "
         f"target_verify_ms={telemetry.target_verify_ms:.3f}, "
+        f"target_commit_ms={telemetry.target_commit_ms:.3f}, "
+        f"draft_commit_ms={telemetry.draft_commit_ms:.3f}, "
+        f"collective_ms={telemetry.collective_ms:.3f}, "
         f"proposed={telemetry.proposed}, "
         f"accepted={telemetry.accepted}, "
         f"emitted={telemetry.emitted}, "
@@ -462,6 +557,14 @@ def accepted_draft_prefix(
     return accepted
 
 
+def _error_fingerprint(error: str | None) -> int:
+    if error is None:
+        return 0
+    return (
+        int.from_bytes(hashlib.sha256(error.encode()).digest()[:4], "big") & 0x7FFFFFFF
+    )
+
+
 @dataclass
 class KimiK3DSparkRoundEngine:
     """Run rank-agreed rounds with pre-commit fallback and commit fail-stop."""
@@ -470,6 +573,7 @@ class KimiK3DSparkRoundEngine:
     draft: ReplicatedDraft
     target: WidthNTarget
     collective: RankAgreement
+    terminal_token_ids: tuple[int, ...] = ()
     telemetry_sink: Callable[[DSparkRoundTelemetry], None] | None = None
     clock: Callable[[], float] = time.perf_counter
     _round_index: int = field(default=0, init=False)
@@ -484,6 +588,17 @@ class KimiK3DSparkRoundEngine:
             raise DSparkConfigurationError(
                 "Kimi K3 DSpark proposer and EXO verify widths do not match"
             )
+        if any(
+            type(token_id) is not int or token_id < 0
+            for token_id in self.terminal_token_ids
+        ):
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark terminal token ids must be non-negative integers"
+            )
+
+    @property
+    def verify_width(self) -> int:
+        return self.config.verify_width
 
     def _publish(self, telemetry: DSparkRoundTelemetry) -> None:
         if self.config.round_telemetry:
@@ -496,31 +611,143 @@ class KimiK3DSparkRoundEngine:
                     "Kimi K3 DSpark telemetry callback failed"
                 )
 
+    def _agree_stage(
+        self,
+        local_success: bool,
+        local_error: str | None,
+    ) -> tuple[bool | None, int | None, float]:
+        started = self.clock()
+        stage = self.collective.agree_stage_success(local_success)
+        fingerprint = self.collective.agree_token(_error_fingerprint(local_error))
+        return stage, fingerprint, (self.clock() - started) * 1000.0
+
+    def _cancel_before_fallback(
+        self,
+        *,
+        draft_round: DraftRound | None,
+        target_round: TargetRound | None,
+        already_uncertain: bool,
+    ) -> float:
+        errors: list[str] = []
+        if already_uncertain:
+            errors.append("target verification cancellation was uncertain")
+        if target_round is not None:
+            try:
+                target_round.cancel()
+            except Exception as error:
+                errors.append(f"target cancel failed: {type(error).__name__}: {error}")
+        if draft_round is not None:
+            try:
+                draft_round.cancel()
+            except Exception as error:
+                errors.append(f"draft cancel failed: {type(error).__name__}: {error}")
+
+        local_error = "; ".join(errors) if errors else None
+        outcome, fingerprint, collective_ms = self._agree_stage(
+            local_error is None,
+            local_error,
+        )
+        if outcome is not True or fingerprint != 0:
+            detail = (
+                "outcomes disagreed across ranks"
+                if outcome is None or fingerprint is None
+                else "failed on every rank"
+            )
+            raise DSparkDistributedStateError(
+                f"Kimi K3 DSpark pre-commit cancellation {detail}; "
+                "cache state cannot be recovered safely"
+            ) from None
+        return collective_ms
+
+    def _cancel_draft_after_fatal_target_commit(
+        self,
+        draft_round: DraftRound | None,
+    ) -> float:
+        local_error: str | None = None
+        if draft_round is not None:
+            try:
+                draft_round.cancel()
+            except Exception as error:
+                local_error = f"draft cancel failed: {type(error).__name__}: {error}"
+        _, _, collective_ms = self._agree_stage(
+            local_error is None,
+            local_error,
+        )
+        return collective_ms
+
     def _ordinary_fallback(
         self,
         anchor_token: int,
         *,
         draft_ms: float,
         target_verify_ms: float,
+        target_commit_ms: float,
+        draft_commit_ms: float,
+        collective_ms: float,
         proposed: int,
         error: str,
+        planned_tail: bool = False,
     ) -> DSparkRoundResult:
         self._disabled_reason = error
-        fallback_error = error
+        fallback_error = None if planned_tail else error
+        local_token: int | None = None
+        local_decode_error: str | None = None
         try:
-            token = self.target.ordinary_decode(anchor_token)
-            emitted_tokens = (token,)
+            local_token = self.target.ordinary_decode(anchor_token)
         except Exception as decode_error:
-            emitted_tokens = ()
-            fallback_error = (
-                f"{error}; ordinary target fallback failed: "
+            local_decode_error = (
+                "ordinary target fallback failed: "
                 f"{type(decode_error).__name__}: {decode_error}"
+            )
+
+        decode_outcome, error_fingerprint, agreement_ms = self._agree_stage(
+            local_decode_error is None,
+            local_decode_error,
+        )
+        collective_ms += agreement_ms
+        if decode_outcome is not True or error_fingerprint != 0:
+            fallback_error = (
+                f"{error}; {local_decode_error or 'rank outcome disagreed'}"
             )
             telemetry = DSparkRoundTelemetry(
                 round_index=self._round_index,
                 rank=self.collective.rank,
                 draft_ms=draft_ms,
                 target_verify_ms=target_verify_ms,
+                target_commit_ms=target_commit_ms,
+                draft_commit_ms=draft_commit_ms,
+                collective_ms=collective_ms,
+                proposed=proposed,
+                accepted=0,
+                emitted=0,
+                fallback=not planned_tail,
+                error=fallback_error,
+            )
+            self._publish(telemetry)
+            self._round_index += 1
+            outcome = (
+                "disagreed across ranks"
+                if decode_outcome is None or error_fingerprint is None
+                else "failed on every rank"
+            )
+            raise DSparkDistributedStateError(
+                f"Kimi K3 DSpark ordinary fallback {outcome}; "
+                "target cache state cannot continue safely"
+            ) from None
+
+        agreed_token_started = self.clock()
+        agreed_token = self.collective.agree_token(local_token)
+        collective_ms += (self.clock() - agreed_token_started) * 1000.0
+        if agreed_token is None:
+            fallback_error = f"{error}; ordinary fallback token disagreed across ranks"
+            telemetry = DSparkRoundTelemetry(
+                round_index=self._round_index,
+                rank=self.collective.rank,
+                draft_ms=draft_ms,
+                target_verify_ms=target_verify_ms,
+                target_commit_ms=target_commit_ms,
+                draft_commit_ms=draft_commit_ms,
+                collective_ms=collective_ms,
                 proposed=proposed,
                 accepted=0,
                 emitted=0,
@@ -529,22 +756,46 @@ class KimiK3DSparkRoundEngine:
             )
             self._publish(telemetry)
             self._round_index += 1
-            raise
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark ordinary fallback token disagreed across ranks"
+            ) from None
+
+        emitted_tokens = (agreed_token,)
 
         telemetry = DSparkRoundTelemetry(
             round_index=self._round_index,
             rank=self.collective.rank,
             draft_ms=draft_ms,
             target_verify_ms=target_verify_ms,
+            target_commit_ms=target_commit_ms,
+            draft_commit_ms=draft_commit_ms,
+            collective_ms=collective_ms,
             proposed=proposed,
             accepted=0,
             emitted=len(emitted_tokens),
-            fallback=True,
+            fallback=not planned_tail,
             error=fallback_error,
         )
         self._publish(telemetry)
         self._round_index += 1
         return DSparkRoundResult(emitted_tokens=emitted_tokens, telemetry=telemetry)
+
+    def decode_ordinary_tail(self, anchor_token: int) -> DSparkRoundResult:
+        """Commit one target token when a full verifier round cannot fit."""
+
+        if type(anchor_token) is not int or anchor_token < 0:
+            raise ValueError("anchor_token must be a non-negative integer")
+        return self._ordinary_fallback(
+            anchor_token,
+            draft_ms=0.0,
+            target_verify_ms=0.0,
+            target_commit_ms=0.0,
+            draft_commit_ms=0.0,
+            collective_ms=0.0,
+            proposed=0,
+            error="target-only max-token tail",
+            planned_tail=True,
+        )
 
     def decode_round(self, anchor_token: int) -> DSparkRoundResult:
         """Decode one speculative round, or one ordinary token after rollback."""
@@ -556,11 +807,15 @@ class KimiK3DSparkRoundEngine:
                 anchor_token,
                 draft_ms=0.0,
                 target_verify_ms=0.0,
+                target_commit_ms=0.0,
+                draft_commit_ms=0.0,
+                collective_ms=0.0,
                 proposed=0,
                 error=f"DSpark disabled after earlier error: {self._disabled_reason}",
             )
 
         gamma = self.config.gamma
+        collective_ms = 0.0
         draft_round: DraftRound | None = None
         local_block: tuple[int, ...] | None = None
         local_error: str | None = None
@@ -577,17 +832,25 @@ class KimiK3DSparkRoundEngine:
             local_error = f"draft failed: {type(error).__name__}: {error}"
         draft_ms = (self.clock() - draft_start) * 1000.0
 
+        proposal_agreement_started = self.clock()
         agreed_block = self.collective.agree_proposal_block(
             local_block,
             self.config.verify_width,
         )
+        collective_ms += (self.clock() - proposal_agreement_started) * 1000.0
         if agreed_block is None:
-            if draft_round is not None:
-                draft_round.cancel()
+            collective_ms += self._cancel_before_fallback(
+                draft_round=draft_round,
+                target_round=None,
+                already_uncertain=False,
+            )
             return self._ordinary_fallback(
                 anchor_token,
                 draft_ms=draft_ms,
                 target_verify_ms=0.0,
+                target_commit_ms=0.0,
+                draft_commit_ms=0.0,
+                collective_ms=collective_ms,
                 proposed=0 if local_block is None else len(local_block) - 1,
                 error=local_error or "DSpark proposal tokens disagreed across ranks",
             )
@@ -597,6 +860,7 @@ class KimiK3DSparkRoundEngine:
         local_boundary: int | None = None
         local_next_token: int | None = None
         target_error: str | None = None
+        target_cancel_uncertain = False
         target_start = self.clock()
         try:
             target_round = self.target.begin_verification(agreed_block)
@@ -610,25 +874,51 @@ class KimiK3DSparkRoundEngine:
                 aux_hidden_states=target_round.posterior.aux_hidden_states,
             )
             local_boundary = accepted_draft_prefix(agreed_block, posterior_tokens)
+            if self.terminal_token_ids:
+                provisional_tokens = (
+                    *agreed_block[1 : local_boundary + 1],
+                    posterior_tokens[local_boundary],
+                )
+                terminal_ids = frozenset(self.terminal_token_ids)
+                terminal_index = next(
+                    (
+                        index
+                        for index, token in enumerate(provisional_tokens)
+                        if token in terminal_ids
+                    ),
+                    None,
+                )
+                if terminal_index is not None:
+                    # Reinterpret an accepted terminal proposal as the bonus at
+                    # that boundary so neither target nor draft commits beyond
+                    # the first visible EOS token.
+                    local_boundary = terminal_index
             local_next_token = posterior_tokens[local_boundary]
         except Exception as error:
             target_error = f"target verify failed: {type(error).__name__}: {error}"
+            target_cancel_uncertain = isinstance(error, DSparkCancellationError)
         target_verify_ms = (self.clock() - target_start) * 1000.0
 
+        acceptance_started = self.clock()
         agreed_acceptance = self.collective.agree_acceptance(
             local_boundary,
             local_next_token,
             gamma,
         )
+        collective_ms += (self.clock() - acceptance_started) * 1000.0
         if agreed_acceptance is None:
-            if target_round is not None:
-                target_round.cancel()
-            if draft_round is not None:
-                draft_round.cancel()
+            collective_ms += self._cancel_before_fallback(
+                draft_round=draft_round,
+                target_round=target_round,
+                already_uncertain=target_cancel_uncertain,
+            )
             return self._ordinary_fallback(
                 anchor_token,
                 draft_ms=draft_ms,
                 target_verify_ms=target_verify_ms,
+                target_commit_ms=0.0,
+                draft_commit_ms=0.0,
+                collective_ms=collective_ms,
                 proposed=gamma,
                 error=target_error
                 or "DSpark acceptance boundary disagreed across ranks",
@@ -645,6 +935,7 @@ class KimiK3DSparkRoundEngine:
         # Acceptance is collective before either state commit.  The target is
         # authoritative; its consumed input count is anchor + accepted drafts.
         target_commit_error: str | None = None
+        target_commit_started = self.clock()
         try:
             target_round.commit(accepted + 1)
         except Exception as error:
@@ -658,22 +949,22 @@ class KimiK3DSparkRoundEngine:
                     "; target cancellation also failed: "
                     f"{type(cancel_error).__name__}: {cancel_error}"
                 )
+        target_commit_ms = (self.clock() - target_commit_started) * 1000.0
 
-        target_commit_consensus = self.collective.agree_stage_success(
-            target_commit_error is None
+        (
+            target_commit_consensus,
+            target_commit_fingerprint,
+            agreement_ms,
+        ) = self._agree_stage(
+            target_commit_error is None,
+            target_commit_error,
         )
-        if target_commit_consensus is not True:
-            if draft_round is not None:
-                try:
-                    draft_round.cancel()
-                except Exception:
-                    logger.opt(exception=True).warning(
-                        "Kimi K3 DSpark draft cancellation failed during "
-                        "fatal target commit handling"
-                    )
+        collective_ms += agreement_ms
+        if target_commit_consensus is not True or target_commit_fingerprint != 0:
+            collective_ms += self._cancel_draft_after_fatal_target_commit(draft_round)
             outcome = (
                 "disagreed across ranks"
-                if target_commit_consensus is None
+                if target_commit_consensus is None or target_commit_fingerprint is None
                 else "failed on every rank"
             )
             raise DSparkDistributedStateError(
@@ -683,6 +974,7 @@ class KimiK3DSparkRoundEngine:
 
         draft_commit_error: str | None = None
         assert draft_round is not None
+        draft_commit_started = self.clock()
         try:
             draft_round.commit(accepted, next_anchor_token, posterior)
         except Exception as error:
@@ -693,14 +985,21 @@ class KimiK3DSparkRoundEngine:
                 f"draft commit failed: {type(error).__name__}: {error}; "
                 "DSpark disabled for subsequent rounds"
             )
+        draft_commit_ms = (self.clock() - draft_commit_started) * 1000.0
 
-        draft_commit_consensus = self.collective.agree_stage_success(
-            draft_commit_error is None
+        (
+            draft_commit_consensus,
+            draft_commit_fingerprint,
+            agreement_ms,
+        ) = self._agree_stage(
+            draft_commit_error is None,
+            draft_commit_error,
         )
-        if draft_commit_consensus is not True:
+        collective_ms += agreement_ms
+        if draft_commit_consensus is not True or draft_commit_fingerprint != 0:
             outcome = (
                 "outcome disagreed across ranks"
-                if draft_commit_consensus is None
+                if draft_commit_consensus is None or draft_commit_fingerprint is None
                 else "failed on every rank"
             )
             draft_commit_error = (
@@ -713,6 +1012,9 @@ class KimiK3DSparkRoundEngine:
             rank=self.collective.rank,
             draft_ms=draft_ms,
             target_verify_ms=target_verify_ms,
+            target_commit_ms=target_commit_ms,
+            draft_commit_ms=draft_commit_ms,
+            collective_ms=collective_ms,
             proposed=gamma,
             accepted=accepted,
             emitted=len(emitted_tokens),
@@ -808,9 +1110,16 @@ class ReplaySSMTargetAdapter:
         )
         try:
             posterior = self._verify(proposal_block)
-        except BaseException:
-            if bool(getattr(transaction, "active", True)):
-                self._hooks.cancel_speculative_cache(transaction)
+        except BaseException as verify_error:
+            try:
+                if bool(getattr(transaction, "active", True)):
+                    self._hooks.cancel_speculative_cache(transaction)
+            except BaseException as cancel_error:
+                raise DSparkCancellationError(
+                    "target verification failed and its speculative transaction "
+                    f"could not be cancelled: {type(cancel_error).__name__}: "
+                    f"{cancel_error}"
+                ) from verify_error
             raise
         return _ReplaySSMTargetRound(self._hooks, transaction, posterior)
 
@@ -847,6 +1156,45 @@ def detect_mlx_dspark_features() -> MlxDSparkFeatures | None:
     )
 
 
+def preflight_mlx_dspark_segmented_sdpa(
+    *,
+    environ: Mapping[str, str] | None = None,
+    module_loader: Callable[[str], object] | None = None,
+) -> None:
+    """Reject segmented DSpark unless MLX advertises bounded Metal memory.
+
+    The accepted runtime keeps this experimental path disabled.  If an operator
+    explicitly enables it, EXO delegates to MLX-LM's public capability gate
+    before allocating either target or draft weights.
+    """
+
+    values = os.environ if environ is None else environ
+    if not _strict_flag(
+        MLX_DSPARK_SEGMENTED_SDPA_ENV,
+        values.get(MLX_DSPARK_SEGMENTED_SDPA_ENV, "0"),
+    ):
+        return
+    load_module = importlib.import_module if module_loader is None else module_loader
+    try:
+        module = load_module("mlx_lm.models.kimi_k3_dspark")
+    except ImportError as error:
+        raise DSparkFeatureUnavailableError(
+            "segmented Kimi K3 DSpark requires the pinned MLX-LM capability gate"
+        ) from error
+    preflight = getattr(module, "require_kimi_k3_dspark_segmented_sdpa", None)
+    if not callable(preflight):
+        raise DSparkFeatureUnavailableError(
+            "segmented Kimi K3 DSpark requires the pinned MLX-LM capability gate"
+        )
+    try:
+        preflight()
+    except Exception as error:
+        raise DSparkFeatureUnavailableError(
+            "segmented Kimi K3 DSpark requires MLX bounded_memory_metal_v1; "
+            "the accepted runtime must keep it disabled"
+        ) from error
+
+
 class _ProposalTokenArray(Protocol):
     def tolist(self) -> object: ...
 
@@ -861,7 +1209,7 @@ class _AuxHiddenState(Protocol):
 class _MlxDSparkProposer(Protocol):
     verify_width: int
 
-    def make_context_cache(self) -> object: ...
+    def make_context_cache(self, **kwargs: object) -> object: ...
 
     def append_target_context(
         self,
@@ -925,9 +1273,28 @@ def _committed_aux_hidden_states(
     consumed: int,
     verify_width: int,
 ) -> tuple[object, ...]:
-    if not aux_hidden_states:
-        raise ValueError("target posterior is missing DSpark auxiliary hidden states")
+    validated = _validated_aux_hidden_states(
+        aux_hidden_states,
+        expected_width=verify_width,
+    )
     committed: list[object] = []
+    for hidden in validated:
+        hidden_state = cast(_AuxHiddenState, hidden)
+        committed.append(hidden_state[:, :consumed, :])
+    return tuple(committed)
+
+
+def _validated_aux_hidden_states(
+    aux_hidden_states: Sequence[object],
+    *,
+    expected_width: int,
+) -> tuple[object, ...]:
+    if len(aux_hidden_states) != KIMI_K3_TARGET_TAP_COUNT:
+        raise ValueError(
+            f"target DSpark must provide exactly {KIMI_K3_TARGET_TAP_COUNT} "
+            "auxiliary hidden-state taps"
+        )
+    validated: list[object] = []
     for hidden in aux_hidden_states:
         shape = getattr(hidden, "shape", None)
         if not isinstance(shape, Sequence):
@@ -939,19 +1306,36 @@ def _committed_aux_hidden_states(
             raise ValueError(
                 "target DSpark auxiliary hidden-state shape does not match"
             )
-        batch_size, token_count = dimensions[:2]
+        batch_size, token_count, hidden_size = dimensions
         if (
             type(batch_size) is not int
             or batch_size != 1
             or type(token_count) is not int
-            or token_count != verify_width
+            or token_count != expected_width
+            or type(hidden_size) is not int
+            or hidden_size != KIMI_K3_TARGET_HIDDEN_SIZE
         ):
             raise ValueError(
-                "target DSpark auxiliary hidden-state shape does not match"
+                "target DSpark auxiliary hidden-state shape must be "
+                f"[1, {expected_width}, {KIMI_K3_TARGET_HIDDEN_SIZE}]"
             )
-        hidden_state = cast(_AuxHiddenState, hidden)
-        committed.append(hidden_state[:, :consumed, :])
-    return tuple(committed)
+        validated.append(hidden)
+    return tuple(validated)
+
+
+def _materialize_context_cache(
+    context_cache: object,
+    evaluate: Callable[..., None],
+) -> None:
+    entries = cast(Sequence[object], context_cache)
+    arrays: list[object] = []
+    for entry in entries:
+        keys = getattr(entry, "keys", None)
+        values = getattr(entry, "values", None)
+        if keys is None or values is None:
+            raise ValueError("MLX-LM DSpark context cache is not populated")
+        arrays.extend((keys, values))
+    evaluate(arrays)
 
 
 @final
@@ -964,11 +1348,13 @@ class _MlxDSparkDraftRound:
         context_cache: object,
         proposal_tokens: tuple[int, ...],
         verify_width: int,
+        evaluate: Callable[..., None],
     ):
         self._proposer = proposer
         self._context_cache = context_cache
         self._proposal_tokens = proposal_tokens
         self._verify_width = verify_width
+        self._evaluate = evaluate
         self._active = True
 
     @property
@@ -1010,6 +1396,12 @@ class _MlxDSparkDraftRound:
                 context_offset,
                 self._context_cache,
             )
+            _materialize_context_cache(self._context_cache, self._evaluate)
+            expected_offset = context_offset + consumed
+            if _context_cache_offset(self._context_cache) != expected_offset:
+                raise ValueError(
+                    "MLX-LM DSpark committed context offset does not match"
+                )
         finally:
             # MLX-LM exposes append-only context, not rollback. Never retry a
             # possibly partial append; rank consensus disables the draft.
@@ -1021,14 +1413,35 @@ class _MlxDSparkDraftRound:
 
 
 @dataclass(frozen=True)
-class LoadedMlxDSpark:
-    """Concrete rank-local replicated draft backed by MLX-LM's proposer."""
+class MlxDSparkRequestDraft:
+    """Fresh per-request context bound to one rank-local loaded proposer."""
 
-    drafter: object
     proposer: object
     context_cache: object
     verify_width: int
+    evaluate: Callable[..., None] = mx.eval
     placement: Literal["replicated"] = "replicated"
+
+    def seed_target_context(
+        self,
+        aux_hidden_states: Sequence[object],
+        *,
+        expected_width: int,
+    ) -> None:
+        validated = _validated_aux_hidden_states(
+            aux_hidden_states,
+            expected_width=expected_width,
+        )
+        context_offset = _context_cache_offset(self.context_cache)
+        proposer = cast(_MlxDSparkProposer, self.proposer)
+        proposer.append_target_context(
+            validated,
+            context_offset,
+            self.context_cache,
+        )
+        _materialize_context_cache(self.context_cache, self.evaluate)
+        if _context_cache_offset(self.context_cache) != context_offset + expected_width:
+            raise ValueError("MLX-LM DSpark seeded context offset does not match")
 
     def begin_round(self, anchor_token: int, num_proposals: int) -> DraftRound:
         if type(anchor_token) is not int or anchor_token < 0:
@@ -1047,6 +1460,43 @@ class LoadedMlxDSpark:
             self.context_cache,
             proposal_tokens,
             self.verify_width,
+            self.evaluate,
+        )
+
+
+@dataclass(frozen=True)
+class LoadedMlxDSpark:
+    """Rank-local immutable weights/proposer factory; no request context lives here."""
+
+    config: KimiK3DSparkConfig
+    target_model: object
+    drafter: object
+    proposer: object
+    evaluate: Callable[..., None] = mx.eval
+    placement: Literal["replicated"] = "replicated"
+
+    @property
+    def verify_width(self) -> int:
+        return self.config.verify_width
+
+    def new_request(self, *, capacity_hint: int) -> MlxDSparkRequestDraft:
+        if type(capacity_hint) is not int or capacity_hint <= 0:
+            raise ValueError("Kimi K3 DSpark context capacity hint must be positive")
+        proposer = cast(_MlxDSparkProposer, self.proposer)
+        make_context_cache = proposer.make_context_cache
+        parameters = inspect.signature(make_context_cache).parameters
+        context_cache = (
+            make_context_cache(capacity_hint=capacity_hint)
+            if "capacity_hint" in parameters
+            else make_context_cache()
+        )
+        if _context_cache_offset(context_cache) != 0:
+            raise ValueError("MLX-LM DSpark request context must start empty")
+        return MlxDSparkRequestDraft(
+            proposer=self.proposer,
+            context_cache=context_cache,
+            verify_width=self.verify_width,
+            evaluate=self.evaluate,
         )
 
 
@@ -1055,6 +1505,7 @@ def load_replicated_mlx_dspark(
     target_model: object,
     *,
     features: MlxDSparkFeatures | None = None,
+    evaluate: Callable[..., None] = mx.eval,
 ) -> LoadedMlxDSpark:
     """Load the pinned local draft independently on the calling target rank.
 
@@ -1063,6 +1514,7 @@ def load_replicated_mlx_dspark(
     a remote checkpoint download.
     """
 
+    preflight_mlx_dspark_segmented_sdpa()
     detected = detect_mlx_dspark_features() if features is None else features
     if detected is None:
         raise DSparkFeatureUnavailableError(
@@ -1092,11 +1544,439 @@ def load_replicated_mlx_dspark(
         raise DSparkFeatureUnavailableError(
             "MLX-LM DSpark proposer returned an unexpected verify width"
         )
-    context_cache = cast(_MlxDSparkProposer, proposer).make_context_cache()
-    _context_cache_offset(context_cache)
     return LoadedMlxDSpark(
+        config=config,
+        target_model=target_model,
         drafter=drafter,
         proposer=proposer,
-        context_cache=context_cache,
-        verify_width=config.verify_width,
+        evaluate=evaluate,
     )
+
+
+class _TargetForwardResult(Protocol):
+    logits: object
+    aux_hidden_states: Sequence[object]
+
+
+class _TargetCacheEntry(Protocol):
+    @property
+    def state(self) -> object: ...
+
+
+class _TargetWithAuxForward(Protocol):
+    def forward_with_aux_hidden_states(
+        self,
+        inputs: mx.array,
+        cache: object,
+        layer_ids: tuple[int, ...],
+    ) -> object: ...
+
+
+def _target_cache_offset(target_cache: object) -> int:
+    if (
+        not isinstance(target_cache, Sequence)
+        or isinstance(target_cache, (str, bytes))
+        or not target_cache
+    ):
+        raise ValueError("Kimi K3 target cache must be a non-empty sequence")
+    offsets: list[int] = []
+    for entry in cast(Sequence[object], target_cache):
+        class_name = type(entry).__name__
+        if any(
+            unsupported in class_name
+            for unsupported in ("Batch", "Quantized", "Rotating", "CacheList")
+        ):
+            raise ValueError(
+                f"Kimi K3 DSpark does not support target cache type {class_name}"
+            )
+        offset: object = getattr(entry, "offset", None)
+        if offset is not None:
+            if type(offset) is not int or offset < 0:
+                raise ValueError("Kimi K3 target cache offset is invalid")
+            offsets.append(offset)
+            continue
+        values: object = getattr(entry, "cache", None)
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            raise ValueError(
+                f"Kimi K3 DSpark does not recognize target cache type {class_name}"
+            )
+    if not offsets or len(set(offsets)) != 1:
+        raise ValueError("Kimi K3 target MLA cache offsets disagree")
+    return offsets[0]
+
+
+def _validate_target_cache(
+    target_cache: object,
+    *,
+    expected_offset: int,
+    require_kda_state: bool,
+) -> None:
+    if _target_cache_offset(target_cache) != expected_offset:
+        raise ValueError(f"Kimi K3 target cache must be at offset {expected_offset}")
+    for entry in cast(Sequence[object], target_cache):
+        values: object = getattr(entry, "cache", None)
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            continue
+        cache_values = cast(Sequence[object], values)
+        populated = tuple(value is not None for value in cache_values)
+        if require_kda_state and (not populated or not all(populated)):
+            raise ValueError("Kimi K3 target KDA cache is not fully populated")
+        if not require_kda_state and any(populated):
+            raise ValueError("Kimi K3 target cache must be fresh for each request")
+        if bool(getattr(entry, "speculative_ready", False)) or int(
+            getattr(entry, "speculative_width", 0)
+        ):
+            raise ValueError("Kimi K3 target cache has a stale speculative transaction")
+
+
+def _target_cache_states(target_cache: object) -> tuple[object, ...]:
+    return tuple(
+        cast(_TargetCacheEntry, entry).state
+        for entry in cast(Sequence[object], target_cache)
+    )
+
+
+def _validate_target_logits(logits: object, *, expected_width: int) -> None:
+    shape: object = getattr(logits, "shape", None)
+    if not isinstance(shape, Sequence):
+        raise ValueError("Kimi K3 target logits have no shape")
+    dimensions = tuple(cast(Sequence[object], shape))
+    if (
+        len(dimensions) != 3
+        or dimensions[0] != 1
+        or dimensions[1] != expected_width
+        or type(dimensions[2]) is not int
+        or dimensions[2] <= 0
+    ):
+        raise ValueError(
+            f"Kimi K3 target logits must have shape [1, {expected_width}, vocab]"
+        )
+
+
+def greedy_dspark_posterior_tokens(
+    logits: object,
+    *,
+    expected_width: int,
+    banned_token_ids: Sequence[int],
+    evaluate: Callable[..., None],
+) -> tuple[int, ...]:
+    _validate_target_logits(logits, expected_width=expected_width)
+    logits_array = cast(mx.array, logits)
+    token_logits = logits_array[0]
+    vocab_size = int(token_logits.shape[-1])
+    for token_id in banned_token_ids:
+        if type(token_id) is not int or not 0 <= token_id < vocab_size:
+            raise ValueError("Kimi K3 DSpark banned token id is out of range")
+        token_logits[..., token_id] = float("-inf")
+    tokens = mx.argmax(token_logits, axis=-1).astype(mx.int32)
+    evaluate(tokens)
+    values = cast(Sequence[int], tokens.tolist())
+    return _token_tuple(
+        values,
+        expected=expected_width,
+        name="Kimi K3 target posterior",
+    )
+
+
+@dataclass
+class KimiK3DSparkRequestRuntime:
+    """One fresh target/draft cache pair for sequential greedy TP2 generation."""
+
+    loaded: LoadedMlxDSpark
+    target_model: object
+    target_cache: object
+    draft: MlxDSparkRequestDraft
+    collective: RankAgreement
+    banned_token_ids: tuple[int, ...] = ()
+    terminal_token_ids: tuple[int, ...] = ()
+    evaluate: Callable[..., None] = mx.eval
+    clock: Callable[[], float] = time.perf_counter
+
+    def __post_init__(self) -> None:
+        if self.target_model is not self.loaded.target_model:
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark weights are bound to a different target model"
+            )
+        if self.collective.size != 2:
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark first canary requires exactly two tensor ranks"
+            )
+        if self.draft.verify_width != self.loaded.verify_width:
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark request and loaded proposer widths do not match"
+            )
+        if not has_replayssm_target_hooks(self.target_model):
+            raise DSparkFeatureUnavailableError(
+                "MLX-LM Kimi K3 target is missing hidden-tap or ReplaySSM hooks"
+            )
+        layers: object = getattr(self.target_model, "layers", None)
+        if not isinstance(layers, Sequence) or isinstance(layers, (str, bytes)):
+            raise DSparkConfigurationError("Kimi K3 target layers are unavailable")
+        target_cache: object = self.target_cache
+        if not isinstance(target_cache, Sequence) or isinstance(
+            target_cache, (str, bytes)
+        ):
+            raise DSparkConfigurationError(
+                "Kimi K3 target cache must be a non-empty sequence"
+            )
+        target_entries = cast(Sequence[object], target_cache)
+        target_layers = cast(Sequence[object], layers)
+        if len(target_entries) != len(target_layers):
+            raise DSparkConfigurationError(
+                "Kimi K3 fresh target cache does not match the target layers"
+            )
+        target_cache_object: object = target_entries
+        _validate_target_cache(
+            target_cache_object,
+            expected_offset=0,
+            require_kda_state=False,
+        )
+        if _context_cache_offset(self.draft.context_cache) != 0:
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark request context must begin empty"
+            )
+
+    @classmethod
+    def create(
+        cls,
+        loaded: LoadedMlxDSpark,
+        target_model: object,
+        target_cache: object,
+        collective: RankAgreement,
+        *,
+        capacity_hint: int,
+        banned_token_ids: Sequence[int] = (),
+        terminal_token_ids: Sequence[int] = (),
+        evaluate: Callable[..., None] = mx.eval,
+    ) -> "KimiK3DSparkRequestRuntime":
+        draft = loaded.new_request(capacity_hint=capacity_hint)
+        return cls(
+            loaded=loaded,
+            target_model=target_model,
+            target_cache=target_cache,
+            draft=draft,
+            collective=collective,
+            banned_token_ids=tuple(banned_token_ids),
+            terminal_token_ids=tuple(terminal_token_ids),
+            evaluate=evaluate,
+        )
+
+    def _agreed_operation[T](self, name: str, operation: Callable[[], T]) -> T:
+        result: T | None = None
+        local_error: str | None = None
+        try:
+            result = operation()
+        except Exception as error:
+            local_error = f"{name} failed: {type(error).__name__}: {error}"
+
+        outcome = self.collective.agree_stage_success(local_error is None)
+        fingerprint = self.collective.agree_token(_error_fingerprint(local_error))
+        if outcome is not True or fingerprint != 0:
+            detail = (
+                "outcomes disagreed across ranks"
+                if outcome is None or fingerprint is None
+                else "failed on every rank"
+            )
+            raise DSparkDistributedStateError(
+                f"Kimi K3 DSpark {name} {detail}; request caches cannot continue"
+            ) from None
+        return cast(T, result)
+
+    def _forward_with_taps(self, inputs: mx.array) -> _TargetForwardResult:
+        if inputs.ndim != 2 or inputs.shape[0] != 1 or inputs.shape[1] <= 0:
+            raise ValueError("Kimi K3 DSpark target input must be non-empty batch one")
+        width = int(inputs.shape[1])
+        initial_offset = _target_cache_offset(self.target_cache)
+        forward = cast(
+            _TargetWithAuxForward,
+            self.target_model,
+        ).forward_with_aux_hidden_states(
+            inputs,
+            self.target_cache,
+            self.loaded.config.target_hidden_state_indices,
+        )
+        logits = getattr(forward, "logits", None)
+        aux_hidden_states = getattr(forward, "aux_hidden_states", None)
+        if not isinstance(aux_hidden_states, Sequence) or isinstance(
+            aux_hidden_states, (str, bytes)
+        ):
+            raise ValueError("Kimi K3 target did not return auxiliary hidden states")
+        validated = _validated_aux_hidden_states(
+            cast(Sequence[object], aux_hidden_states),
+            expected_width=width,
+        )
+        _validate_target_logits(logits, expected_width=width)
+        self.evaluate(
+            logits,
+            validated,
+            _target_cache_states(self.target_cache),
+        )
+        _validate_target_cache(
+            self.target_cache,
+            expected_offset=initial_offset + width,
+            require_kda_state=True,
+        )
+        return cast(_TargetForwardResult, forward)
+
+    def seed_prompt(
+        self,
+        prompt_prefix: mx.array,
+        *,
+        prefill_step_size: int,
+        progress_callback: Callable[[int, int], None],
+        distributed_progress_callback: Callable[[], None] | None,
+    ) -> tuple[float, int]:
+        if prompt_prefix.ndim != 1 or len(prompt_prefix) == 0:
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark requires at least two logical prompt tokens"
+            )
+        if prefill_step_size <= 0:
+            raise ValueError("Kimi K3 DSpark prefill step size must be positive")
+        total = len(prompt_prefix)
+        processed = 0
+        started = self.clock()
+        progress_callback(0, total)
+        while processed < total:
+            chunk_size = min(prefill_step_size, total - processed)
+            chunk = prompt_prefix[processed : processed + chunk_size][None]
+            forward = self._agreed_operation(
+                "target prompt seeding",
+                lambda chunk=chunk: self._forward_with_taps(chunk),
+            )
+            self._agreed_operation(
+                "draft prompt projection",
+                lambda forward=forward,
+                chunk_size=chunk_size: self.draft.seed_target_context(
+                    forward.aux_hidden_states,
+                    expected_width=chunk_size,
+                ),
+            )
+            processed += chunk_size
+            if distributed_progress_callback is not None:
+                distributed_progress_callback()
+            progress_callback(processed, total)
+            mx.clear_cache()
+
+        if _target_cache_offset(self.target_cache) != total:
+            raise DSparkDistributedStateError(
+                "Kimi K3 target prompt cache did not reach the decode boundary"
+            )
+        if _context_cache_offset(self.draft.context_cache) != total:
+            raise DSparkDistributedStateError(
+                "Kimi K3 draft prompt context did not reach the decode boundary"
+            )
+        elapsed = self.clock() - started
+        return (total / elapsed if elapsed > 0 else 0.0), total
+
+    def _verify(self, proposal_block: tuple[int, ...]) -> TargetPosterior:
+        input_ids = mx.array([proposal_block], dtype=mx.int32)
+        forward = self._forward_with_taps(input_ids)
+        tokens = greedy_dspark_posterior_tokens(
+            forward.logits,
+            expected_width=len(proposal_block),
+            banned_token_ids=self.banned_token_ids,
+            evaluate=self.evaluate,
+        )
+        # The five exact taps and the target cache were materialized and checked
+        # in _forward_with_taps before this posterior becomes committable.
+        return TargetPosterior(tokens, tuple(forward.aux_hidden_states))
+
+    def _ordinary_decode(self, anchor_token: int) -> int:
+        initial_offset = _target_cache_offset(self.target_cache)
+        logits = cast(Callable[..., object], self.target_model)(
+            mx.array([[anchor_token]], dtype=mx.int32),
+            cache=self.target_cache,
+        )
+        _validate_target_logits(logits, expected_width=1)
+        self.evaluate(logits, _target_cache_states(self.target_cache))
+        _validate_target_cache(
+            self.target_cache,
+            expected_offset=initial_offset + 1,
+            require_kda_state=True,
+        )
+        return greedy_dspark_posterior_tokens(
+            logits,
+            expected_width=1,
+            banned_token_ids=self.banned_token_ids,
+            evaluate=self.evaluate,
+        )[0]
+
+    def make_round_engine(
+        self,
+        telemetry_sink: Callable[[DSparkRoundTelemetry], None] | None = None,
+    ) -> KimiK3DSparkRoundEngine:
+        target = ReplaySSMTargetAdapter(
+            self.target_model,
+            self.target_cache,
+            self._verify,
+            self._ordinary_decode,
+        )
+        return KimiK3DSparkRoundEngine(
+            config=self.loaded.config,
+            draft=self.draft,
+            target=target,
+            collective=self.collective,
+            terminal_token_ids=self.terminal_token_ids,
+            telemetry_sink=telemetry_sink,
+            clock=self.clock,
+        )
+
+
+@dataclass(frozen=True)
+class DSparkDecodedToken:
+    token: int
+    from_draft: bool
+    finish_reason: Literal["stop", "length"] | None
+
+
+class DSparkRoundDecoder(Protocol):
+    @property
+    def verify_width(self) -> int: ...
+
+    def decode_round(self, anchor_token: int) -> DSparkRoundResult: ...
+
+    def decode_ordinary_tail(self, anchor_token: int) -> DSparkRoundResult: ...
+
+
+def dspark_decode_tokens(
+    engine: DSparkRoundDecoder,
+    *,
+    anchor_token: int,
+    max_tokens: int,
+    eos_token_ids: Sequence[int],
+    round_observer: Callable[[DSparkRoundTelemetry], None] | None = None,
+    token_observer: Callable[[bool], None] | None = None,
+) -> Iterator[DSparkDecodedToken]:
+    """Flatten committed rounds while preserving earliest EOS and length limits."""
+
+    if type(max_tokens) is not int or max_tokens <= 0:
+        raise ValueError("Kimi K3 DSpark max tokens must be positive")
+    eos = frozenset(eos_token_ids)
+    emitted = 0
+    next_anchor = anchor_token
+    while emitted < max_tokens:
+        remaining = max_tokens - emitted
+        result = (
+            engine.decode_round(next_anchor)
+            if remaining >= engine.verify_width
+            else engine.decode_ordinary_tail(next_anchor)
+        )
+        if round_observer is not None:
+            round_observer(result.telemetry)
+        if not result.emitted_tokens:
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark round committed no output token"
+            )
+        for round_token_index, token in enumerate(result.emitted_tokens):
+            emitted += 1
+            next_anchor = token
+            from_draft = round_token_index < result.telemetry.accepted
+            if token_observer is not None:
+                token_observer(from_draft)
+            if token in eos:
+                yield DSparkDecodedToken(token, from_draft, "stop")
+                return
+            if emitted == max_tokens:
+                yield DSparkDecodedToken(token, from_draft, "length")
+                return
+            yield DSparkDecodedToken(token, from_draft, None)

@@ -61,8 +61,18 @@ from exo.worker.engines.mlx.cache import (
 from exo.worker.engines.mlx.constants import (
     DEFAULT_TOP_LOGPROBS,
     KV_BITS,
+    KV_CACHE_BITS,
     KV_GROUP_SIZE,
     MAX_TOKENS,
+)
+from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
+    DSparkRoundTelemetry,
+    KimiK3DSparkRequestRuntime,
+    LoadedMlxDSpark,
+    MlxRankAgreement,
+    dspark_context_capacity_hint,
+    dspark_decode_tokens,
+    validate_dspark_greedy_sampling,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -109,6 +119,14 @@ class _PromptLookupTelemetry:
         self.accepted_tokens += int(stats.accepted_tokens)
         self.committed_tokens += int(stats.committed_tokens)
 
+    def observe_dspark_round(self, stats: DSparkRoundTelemetry) -> None:
+        self.rounds += 1
+        self.drafted_tokens += stats.proposed
+
+    def observe_dspark_token(self, accepted_draft: bool) -> None:
+        self.committed_tokens += 1
+        self.accepted_tokens += int(accepted_draft)
+
 
 class _SpeculativeRoundStatsLike(Protocol):
     round_index: int
@@ -139,6 +157,16 @@ class _PromptLookupStreamGenerate(Protocol):
         ),
         **kwargs: object,
     ) -> Generator[MlxGenerationResponse, None, None]: ...
+
+
+class _DSparkDetokenizer(Protocol):
+    last_segment: str
+
+    def reset(self) -> None: ...
+
+    def add_token(self, token: int) -> None: ...
+
+    def finalize(self) -> None: ...
 
 
 def _strict_env_int(name: str, value: str, *, minimum: int, maximum: int) -> int:
@@ -792,6 +820,7 @@ def warmup_inference(
     tokenizer: TokenizerWrapper,
     group: mx.distributed.Group | None,
     model_id: ModelId,
+    dspark: LoadedMlxDSpark | None = None,
 ) -> int:
     logger.info(f"warming up inference for instance: {model_id}")
 
@@ -841,6 +870,7 @@ def warmup_inference(
         prompt=warmup_prompt,
         kv_prefix_cache=None,
         group=group,
+        dspark=dspark,
     ):
         tokens_generated += 1
 
@@ -884,6 +914,98 @@ def eos_ids_from_tokenizer(tokenizer: TokenizerWrapper) -> list[int]:
     if eos is None:
         return []
     return eos
+
+
+def _validate_dspark_request(
+    dspark: LoadedMlxDSpark,
+    *,
+    model: Model,
+    task: TextGenerationTaskParams,
+    group: mx.distributed.Group | None,
+    kv_prefix_cache: KVPrefixCache | None,
+    vision_processor: VisionProcessor | None,
+    is_pipeline: bool,
+    prompt_lookup_configuration: _PromptLookupConfig | None,
+) -> None:
+    """Fail closed outside the first sequential, fresh-cache, greedy TP2 canary."""
+
+    if is_pipeline:
+        raise ValueError("Kimi K3 DSpark does not support pipeline parallelism")
+    if group is None or group.size() != 2:
+        raise ValueError("Kimi K3 DSpark requires exactly two tensor ranks")
+    if dspark.target_model is not model:
+        raise ValueError("Kimi K3 DSpark is bound to a different target model")
+    if type(model).__module__ != "mlx_lm.models.kimi_k3":
+        raise ValueError("Kimi K3 DSpark requires the exact MLX-LM Kimi K3 target")
+    if kv_prefix_cache is not None or task.use_prefix_cache:
+        raise ValueError("Kimi K3 DSpark requires a fresh per-request target cache")
+    if task.prefill_endpoint is not None:
+        raise ValueError("Kimi K3 DSpark does not support remote prefill")
+    if vision_processor is not None or task.images or task.image_hashes:
+        raise ValueError("Kimi K3 DSpark does not support vision requests")
+    if KV_BITS is not None or KV_CACHE_BITS is not None:
+        raise ValueError("Kimi K3 DSpark does not support quantized KV caches")
+    if prompt_lookup_configuration is not None:
+        raise ValueError("Kimi K3 DSpark cannot be combined with prompt lookup")
+    validate_dspark_greedy_sampling(
+        temperature=task.temperature,
+        top_p=task.top_p,
+        top_k=task.top_k,
+        min_p=task.min_p,
+        logprobs=task.logprobs,
+        top_logprobs=task.top_logprobs,
+        repetition_penalty=task.repetition_penalty,
+        repetition_context_size=task.repetition_context_size,
+        presence_penalty=task.presence_penalty,
+        frequency_penalty=task.frequency_penalty,
+    )
+
+
+def _dspark_mlx_responses(
+    runtime: KimiK3DSparkRequestRuntime,
+    tokenizer: TokenizerWrapper,
+    *,
+    anchor_token: int,
+    max_tokens: int,
+    is_bench: bool,
+    telemetry: _PromptLookupTelemetry,
+) -> Generator[MlxGenerationResponse, None, None]:
+    detokenizer = cast(_DSparkDetokenizer, cast(object, tokenizer.detokenizer))
+    detokenizer.reset()
+    eos_token_ids = () if is_bench else tuple(eos_ids_from_tokenizer(tokenizer))
+    engine = runtime.make_round_engine()
+    started = time.perf_counter()
+    empty_logprobs = mx.array([], dtype=mx.float32)
+    for generation_tokens, decoded in enumerate(
+        dspark_decode_tokens(
+            engine,
+            anchor_token=anchor_token,
+            max_tokens=max_tokens,
+            eos_token_ids=eos_token_ids,
+            round_observer=telemetry.observe_dspark_round,
+            token_observer=telemetry.observe_dspark_token,
+        ),
+        start=1,
+    ):
+        if decoded.finish_reason == "stop":
+            detokenizer.finalize()
+        else:
+            detokenizer.add_token(decoded.token)
+            if decoded.finish_reason == "length":
+                detokenizer.finalize()
+        elapsed = time.perf_counter() - started
+        yield MlxGenerationResponse(
+            text=detokenizer.last_segment,
+            token=decoded.token,
+            logprobs=empty_logprobs,
+            from_draft=decoded.from_draft,
+            prompt_tokens=1,
+            prompt_tps=0.0,
+            generation_tokens=generation_tokens,
+            generation_tps=generation_tokens / elapsed if elapsed > 0 else 0.0,
+            peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason=decoded.finish_reason,
+        )
 
 
 def extract_top_logprobs(
@@ -946,6 +1068,7 @@ def mlx_generate(
     distributed_prompt_progress_callback: Callable[[], None] | None = None,
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
+    dspark: LoadedMlxDSpark | None = None,
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
@@ -954,6 +1077,17 @@ def mlx_generate(
         is_pipeline=is_pipeline,
         is_batch=False,
     )
+    if dspark is not None:
+        _validate_dspark_request(
+            dspark,
+            model=model,
+            task=task,
+            group=group,
+            kv_prefix_cache=kv_prefix_cache,
+            vision_processor=vision_processor,
+            is_pipeline=is_pipeline,
+            prompt_lookup_configuration=prompt_lookup_configuration,
+        )
     # TODO: Randomise task seed and set in taskparams, instead of hard coding as 42.
     seed = task.seed or 42
     mx.random.seed(seed)
@@ -961,6 +1095,8 @@ def mlx_generate(
     # Encode prompt once at the top and fix unmatched think tags
     all_prompt_tokens = encode_prompt(tokenizer, prompt)
     all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
+    if dspark is not None and len(all_prompt_tokens) < 2:
+        raise ValueError("Kimi K3 DSpark requires at least two prompt tokens")
     min_prefix_hit_length = max(1000, system_prompt_token_count(task, tokenizer))
 
     vision: VisionResult | None = None
@@ -1048,6 +1184,7 @@ def mlx_generate(
         else []
     )
     max_stop_len = max((len(s) for s in stop_sequences), default=0)
+    max_tokens = task.max_output_tokens or MAX_TOKENS
 
     maybe_vision_ctx = (
         patch_embed_tokens(
@@ -1068,8 +1205,37 @@ def mlx_generate(
     prefill_tps = 0.0
     prefill_tokens = 0
     ssm_snapshots_list: list[CacheSnapshot] = []
+    dspark_runtime: KimiK3DSparkRequestRuntime | None = None
     with maybe_vision_ctx:
-        if use_remote and task.prefill_endpoint is not None:
+        if dspark is not None:
+            assert group is not None
+            eos_token_ids = tuple(eos_ids_from_tokenizer(tokenizer))
+            banned_token_ids = eos_token_ids if is_bench else ()
+            terminal_token_ids = () if is_bench else eos_token_ids
+            dspark_runtime = KimiK3DSparkRequestRuntime.create(
+                dspark,
+                model,
+                caches,
+                MlxRankAgreement(group),
+                capacity_hint=dspark_context_capacity_hint(
+                    prompt_tokens=len(all_prompt_tokens),
+                    max_tokens=max_tokens,
+                    verify_width=dspark.verify_width,
+                ),
+                banned_token_ids=banned_token_ids,
+                terminal_token_ids=terminal_token_ids,
+            )
+            mx_barrier(group)
+            prefill_tps, prefill_tokens = dspark_runtime.seed_prompt(
+                prompt_tokens[:-1],
+                prefill_step_size=_prefill_step_size(
+                    len(prompt_tokens) - 1,
+                    is_pipeline=False,
+                ),
+                progress_callback=on_prefill_progress or (lambda _done, _total: None),
+                distributed_progress_callback=distributed_prompt_progress_callback,
+            )
+        elif use_remote and task.prefill_endpoint is not None:
             try:
                 prefill_tps, prefill_tokens, ssm_snapshots_list = remote_prefill(
                     prompt_tokens[:-1],
@@ -1085,7 +1251,7 @@ def mlx_generate(
                 logger.opt(exception=True).warning(
                     "Remote prefill failed, falling back to local prefill"
                 )
-        if not remote_prefilled:
+        if dspark is None and not remote_prefilled:
             prefill_tps, prefill_tokens, ssm_snapshots_list = prefill(
                 model,
                 tokenizer,
@@ -1135,10 +1301,9 @@ def mlx_generate(
                 prefill_tps=prefill_tps,
             )
 
-    # stream_generate starts from the last token
+    # stream_generate starts from the last two tokens. DSpark instead owns the
+    # exact prompt[:-1] target/draft boundary and starts from prompt[-1].
     last_token = prompt_tokens[-2:]
-
-    max_tokens = task.max_output_tokens or MAX_TOKENS
     relay_enabled = is_pipeline and not task.logprobs
     decode_sampler = sampler
     with _pipeline_token_relay_scope(model, relay_enabled):
@@ -1176,7 +1341,17 @@ def mlx_generate(
         # is EOS (or EXO matches a stop sequence), abandoning that lookahead
         # leaves pipeline rank zero in an unmatched send while the final rank
         # enters the completion barrier.
-        if prompt_lookup_kwargs is None:
+        if dspark_runtime is not None:
+            anchor_token = int(prompt_tokens[-1].item())
+            decode_outputs = _dspark_mlx_responses(
+                dspark_runtime,
+                tokenizer,
+                anchor_token=anchor_token,
+                max_tokens=max_tokens,
+                is_bench=is_bench,
+                telemetry=prompt_lookup_telemetry,
+            )
+        elif prompt_lookup_kwargs is None:
             decode_outputs = stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -1243,9 +1418,7 @@ def mlx_generate(
                 # to resolve the final cache transaction and account for that
                 # round before serializing telemetry.
                 decode_outputs.close()
-                decode_elapsed_seconds = (
-                    time.perf_counter() - generation_start_time
-                )
+                decode_elapsed_seconds = time.perf_counter() - generation_start_time
                 effective_generation_tps = (
                     completion_tokens / decode_elapsed_seconds
                     if decode_elapsed_seconds > 0
@@ -1264,9 +1437,7 @@ def mlx_generate(
                     decode_elapsed_seconds=decode_elapsed_seconds,
                     effective_generation_tps=effective_generation_tps,
                     speculative_rounds=prompt_lookup_telemetry.rounds,
-                    speculative_drafted_tokens=(
-                        prompt_lookup_telemetry.drafted_tokens
-                    ),
+                    speculative_drafted_tokens=(prompt_lookup_telemetry.drafted_tokens),
                     speculative_accepted_tokens=(
                         prompt_lookup_telemetry.accepted_tokens
                     ),
@@ -1316,8 +1487,7 @@ def mlx_generate(
                 # Log generation stats
                 generation_elapsed = (
                     stats.decode_elapsed_seconds
-                    if stats is not None
-                    and stats.decode_elapsed_seconds is not None
+                    if stats is not None and stats.decode_elapsed_seconds is not None
                     else time.perf_counter() - generation_start_time
                 )
                 generated_tokens = len(generated_text_parts)

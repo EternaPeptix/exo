@@ -162,23 +162,49 @@ def test_runtime_source_verification_uses_execution_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     runtime_source = tmp_path / "kimi_k3.py"
+    dspark_source = tmp_path / "kimi_k3_dspark.py"
+    gated_delta_source = tmp_path / "gated_delta.py"
     runtime_source.write_bytes(b"pinned execution runtime")
+    dspark_source.write_bytes(b"pinned DSpark execution runtime")
+    gated_delta_source.write_bytes(b"pinned gated-delta execution runtime")
     digest = hashlib.sha256(runtime_source.read_bytes()).hexdigest()
+    dspark_digest = hashlib.sha256(dspark_source.read_bytes()).hexdigest()
+    gated_delta_digest = hashlib.sha256(gated_delta_source.read_bytes()).hexdigest()
     monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_SHA256", digest)
+    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_DSPARK_SHA256", dspark_digest)
+    monkeypatch.setattr(loader, "MLX_LM_GATED_DELTA_SHA256", gated_delta_digest)
 
     mlx_lm = types.ModuleType("mlx_lm")
     models = types.ModuleType("mlx_lm.models")
+    gated_delta = types.ModuleType("mlx_lm.models.gated_delta")
     kimi_k3 = types.ModuleType("mlx_lm.models.kimi_k3")
+    kimi_k3_dspark = types.ModuleType("mlx_lm.models.kimi_k3_dspark")
+    gated_delta.__file__ = str(gated_delta_source)
     kimi_k3.__file__ = str(runtime_source)
+    kimi_k3_dspark.__file__ = str(dspark_source)
+    models.gated_delta = gated_delta
     models.kimi_k3 = kimi_k3
+    models.kimi_k3_dspark = kimi_k3_dspark
     mlx_lm.models = models
     monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm)
     monkeypatch.setitem(sys.modules, "mlx_lm.models", models)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.gated_delta", gated_delta)
     monkeypatch.setitem(sys.modules, "mlx_lm.models.kimi_k3", kimi_k3)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.kimi_k3_dspark", kimi_k3_dspark)
 
     loader._verify_runtime_source()
     monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_SHA256", "0" * 64)
     with pytest.raises(loader.RankLocalLoadError, match="execution runtime pin"):
+        loader._verify_runtime_source()
+
+    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_SHA256", digest)
+    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_DSPARK_SHA256", "0" * 64)
+    with pytest.raises(loader.RankLocalLoadError, match="kimi_k3_dspark.py"):
+        loader._verify_runtime_source()
+
+    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_DSPARK_SHA256", dspark_digest)
+    monkeypatch.setattr(loader, "MLX_LM_GATED_DELTA_SHA256", "0" * 64)
+    with pytest.raises(loader.RankLocalLoadError, match="gated_delta.py"):
         loader._verify_runtime_source()
 
 

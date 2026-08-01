@@ -11,6 +11,7 @@ from exo.shared.types.events import Event
 from exo.shared.types.tasks import TaskId
 from exo.shared.types.worker.instances import BoundInstance
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
+from exo.shared.types.worker.shards import PipelineShardMetadata, TensorShardMetadata
 from exo.utils.channels import MpReceiver, MpSender
 from exo.worker.engines.base import Builder, Engine
 from exo.worker.runner.bootstrap import logger
@@ -21,6 +22,14 @@ from exo.worker.runner.llm_inference.batch_generator import (
 from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
 from .cache import KVPrefixCache
+from .generator.kimi_k3_dspark import (
+    DSparkConfigurationError,
+    KimiK3DSparkConfig,
+    LoadedMlxDSpark,
+    kimi_k3_dspark_config,
+    load_replicated_mlx_dspark,
+    preflight_mlx_dspark_segmented_sdpa,
+)
 from .types import Model
 from .utils_mlx import (
     initialize_mlx,
@@ -38,16 +47,42 @@ class MlxBuilder(Builder):
     tokenizer: TokenizerWrapper | None = None
     group: mx.distributed.Group | None = None
     vision_processor: VisionProcessor | None = None
+    dspark_config: KimiK3DSparkConfig | None = None
+    dspark: LoadedMlxDSpark | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
         self.group = initialize_mlx(bound_instance)
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
+        shard = bound_instance.bound_shard
+        self.dspark_config = kimi_k3_dspark_config(
+            is_pipeline=isinstance(shard, PipelineShardMetadata),
+            is_batch=os.environ.get("EXO_NO_BATCH") != "1",
+        )
+        if self.dspark_config is not None:
+            preflight_mlx_dspark_segmented_sdpa()
+            if not isinstance(shard, TensorShardMetadata) or shard.world_size != 2:
+                raise DSparkConfigurationError(
+                    "Kimi K3 DSpark first canary requires tensor parallel world size 2"
+                )
+            if self.group is None or self.group.size() != 2:
+                raise DSparkConfigurationError(
+                    "Kimi K3 DSpark requires an initialized two-rank MLX group"
+                )
         (
             self.inference_model,
             self.tokenizer,
             self.vision_processor,
         ) = yield from load_mlx_items(bound_instance, self.group)
+        if self.dspark_config is not None:
+            if self.vision_processor is not None:
+                raise DSparkConfigurationError(
+                    "Kimi K3 DSpark does not support vision models"
+                )
+            self.dspark = load_replicated_mlx_dspark(
+                self.dspark_config,
+                self.inference_model,
+            )
 
     def close(self) -> None:
         with contextlib.suppress(NameError, AttributeError):
@@ -56,6 +91,8 @@ class MlxBuilder(Builder):
             del self.tokenizer
         with contextlib.suppress(NameError, AttributeError):
             del self.group
+        with contextlib.suppress(NameError, AttributeError):
+            del self.dspark
 
     def build(
         self,
@@ -80,10 +117,14 @@ class MlxBuilder(Builder):
                 self.tokenizer.tool_parser,  # type: ignore
             )
 
-        kv_prefix_cache = KVPrefixCache(self.group)
+        kv_prefix_cache = None if self.dspark is not None else KVPrefixCache(self.group)
 
         device_rank = 0 if self.group is None else self.group.rank()
-        if os.environ.get("EXO_NO_BATCH"):
+        if self.dspark is not None and os.environ.get("EXO_NO_BATCH") != "1":
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark requires EXO_NO_BATCH=1 for its entire runner lifetime"
+            )
+        if self.dspark is not None or os.environ.get("EXO_NO_BATCH"):
             logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(
                 model=self.inference_model,
@@ -96,6 +137,7 @@ class MlxBuilder(Builder):
                 cancel_receiver=self.cancel_receiver,
                 event_sender=self.event_sender,
                 vision_processor=vision_processor,
+                dspark=self.dspark,
             )
         else:
             logger.info("using BatchGenerator")
