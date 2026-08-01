@@ -109,13 +109,14 @@ def _facts(
     node: canary.Node,
     *,
     adapter_wired: bool = False,
+    factorized_wire_is_ancestor: bool = True,
 ) -> dict[str, object]:
     return {
         "schema": canary.FACTS_SCHEMA,
         "node": node.name,
         "rank": node.rank,
         "commits": {
-            "exo": canary.EXO_SCAFFOLD_COMMIT,
+            "exo": canary.EXO_DSPARK_CONTRACT_COMMIT,
             "mlx_lm": canary.MLX_LM_DSPARK_COMMIT,
             "mlx": canary.MLX_ACCEPTED_COMMIT,
             "factorized_mlx": canary.MLX_FACTORIZED_COMMIT,
@@ -126,9 +127,9 @@ def _facts(
             "mlx": True,
             "factorized_mlx": True,
         },
-        "mlx_lm_factorized_wire_is_ancestor": True,
+        "mlx_lm_factorized_wire_is_ancestor": factorized_wire_is_ancestor,
         "required_files": {
-            "exo_scaffold": True,
+            "exo_dspark_contract": True,
             "exo_generate": True,
             "mlx_lm_dspark": True,
             "mlx_lm_kimi_k3": True,
@@ -176,7 +177,7 @@ def test_plan_pins_abba_gates_and_disabled_unwired_actions(
     _, plan = _valid_plan(tmp_path)
 
     assert plan["pins"] == {
-        "exo_scaffold": canary.EXO_SCAFFOLD_COMMIT,
+        "exo_dspark_contract": canary.EXO_DSPARK_CONTRACT_COMMIT,
         "mlx_lm_dspark": canary.MLX_LM_DSPARK_COMMIT,
         "mlx_accepted_decode": canary.MLX_ACCEPTED_COMMIT,
         "mlx_factorized_prefill": canary.MLX_FACTORIZED_COMMIT,
@@ -214,6 +215,7 @@ def test_plan_pins_abba_gates_and_disabled_unwired_actions(
     width3 = _mapping(_list(_mapping(phases[1])["sequence"])[1])
     width8 = _mapping(_list(_mapping(phases[2])["sequence"])[1])
     assert _mapping(width3["environment"])["EXO_MLX_KIMI_K3_DSPARK_VERIFY_WIDTH"] == "3"
+    assert _mapping(width3["gates"])["minimum_mean_emitted_per_round"] == 2.391
     assert _mapping(width8["environment"])["EXO_MLX_KIMI_K3_DSPARK_VERIFY_WIDTH"] == "8"
 
     factorized = _mapping(plan["factorized_prefill_canary"])
@@ -223,6 +225,27 @@ def test_plan_pins_abba_gates_and_disabled_unwired_actions(
         {"query_tokens": 32, "context_tokens": 4096},
         {"query_tokens": 32, "context_tokens": 8192},
     ]
+
+
+def test_preflight_rejects_missing_factorized_wire_ancestor(tmp_path: Path) -> None:
+    inventory = canary.load_inventory(_write_inventory(tmp_path))
+    facts = {
+        node.rank: _facts(node, factorized_wire_is_ancestor=False)
+        for node in inventory.nodes
+    }
+
+    preflight = _mapping(canary.build_plan(inventory, facts)["preflight"])
+
+    assert preflight["pass"] is False
+    ancestor_errors = [
+        str(error)
+        for error in _list(preflight["errors"])
+        if "factorized wire commit" in str(error)
+    ]
+    assert len(ancestor_errors) == 2
+    assert all(
+        canary.MLX_LM_FACTORIZED_WIRE_COMMIT in str(error) for error in ancestor_errors
+    )
 
 
 def test_action_digest_binds_exact_command_contract(tmp_path: Path) -> None:

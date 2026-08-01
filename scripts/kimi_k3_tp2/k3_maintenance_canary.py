@@ -24,11 +24,11 @@ SCHEMA: Final = "k3-maintenance-canary/v1"
 INVENTORY_SCHEMA: Final = "k3-maintenance-canary-inventory/v1"
 FACTS_SCHEMA: Final = "k3-maintenance-canary-facts/v1"
 
-EXO_SCAFFOLD_COMMIT: Final = "a583614bb18199fb63227217521d9c880b3466c3"
-MLX_LM_DSPARK_COMMIT: Final = "53dbe04a0499ffb3e98ede90ff5a82f118f77f04"
+EXO_DSPARK_CONTRACT_COMMIT: Final = "ba7f8aa07edd382a80751f85b514d2de4139c5d9"
+MLX_LM_DSPARK_COMMIT: Final = "ebf0747a4185fd998d810dbb65070689415b1308"
 MLX_ACCEPTED_COMMIT: Final = "57b87fe47cfce34d6dc59d0e274d8ee36bfb9308"
 MLX_FACTORIZED_COMMIT: Final = "152f01807c8327ac154b8ed56dd9279a6f9506e6"
-MLX_LM_FACTORIZED_WIRE_COMMIT: Final = "e284ef8731ee30856925d2649b7d72a285510a3c"
+MLX_LM_FACTORIZED_WIRE_COMMIT: Final = "53dbe04a0499ffb3e98ede90ff5a82f118f77f04"
 
 DSPARK_REVISION: Final = "eb03982e58d4fb79bcfc099e902158f562e2e27b"
 DSPARK_CONFIG_SHA256: Final = (
@@ -66,6 +66,7 @@ ACTIONS: Final[tuple[str, ...]] = (
 ACCEPTED_FLAGS: Final[dict[str, str]] = {
     "EXO_NO_BATCH": "1",
     "EXO_MLX_JACCL_FORCE_MESH": "1",
+    "EXO_MLX_MAX_ATTENTION_CELLS_PER_CHUNK": "268435456",
     "EXO_MLX_K3_VOCAB_PARALLEL_HEAD": "1",
     "EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4": "0",
     "EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4": "0",
@@ -302,7 +303,7 @@ factorized_wire = run([
     request["mlx_lm_factorized_wire_commit"], "HEAD",
 ])
 required = {
-    "exo_scaffold": pathlib.Path(paths["exo_root"], "src/exo/worker/engines/mlx/generator/kimi_k3_dspark.py"),
+    "exo_dspark_contract": pathlib.Path(paths["exo_root"], "src/exo/worker/engines/mlx/generator/kimi_k3_dspark.py"),
     "exo_generate": pathlib.Path(paths["exo_root"], "src/exo/worker/engines/mlx/generator/generate.py"),
     "mlx_lm_dspark": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/kimi_k3_dspark.py"),
     "mlx_lm_kimi_k3": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/kimi_k3.py"),
@@ -401,7 +402,7 @@ def validate_facts(node: Node, facts: Mapping[str, object]) -> list[str]:
         errors.append("facts node/rank identity mismatch")
     commits = _nested(facts, "commits")
     expected_commits = {
-        "exo": EXO_SCAFFOLD_COMMIT,
+        "exo": EXO_DSPARK_CONTRACT_COMMIT,
         "mlx_lm": MLX_LM_DSPARK_COMMIT,
         "mlx": MLX_ACCEPTED_COMMIT,
         "factorized_mlx": MLX_FACTORIZED_COMMIT,
@@ -420,7 +421,7 @@ def validate_facts(node: Node, facts: Mapping[str, object]) -> list[str]:
         )
     required = _nested(facts, "required_files")
     for name in (
-        "exo_scaffold",
+        "exo_dspark_contract",
         "exo_generate",
         "mlx_lm_dspark",
         "mlx_lm_kimi_k3",
@@ -502,7 +503,7 @@ def _abba_plan() -> list[dict[str, object]]:
         }
     ]
     for label, width, min_acceptance, min_emitted in (
-        ("gamma2-width3", 3, 0.70, 2.39),
+        ("gamma2-width3", 3, 0.70, 2.391),
         ("gamma7-width8", 8, 0.50, 4.50),
     ):
         candidate = {
@@ -635,7 +636,7 @@ def build_plan(
         "schema": SCHEMA,
         "default_mode": "preflight-only",
         "pins": {
-            "exo_scaffold": EXO_SCAFFOLD_COMMIT,
+            "exo_dspark_contract": EXO_DSPARK_CONTRACT_COMMIT,
             "mlx_lm_dspark": MLX_LM_DSPARK_COMMIT,
             "mlx_accepted_decode": MLX_ACCEPTED_COMMIT,
             "mlx_factorized_prefill": MLX_FACTORIZED_COMMIT,

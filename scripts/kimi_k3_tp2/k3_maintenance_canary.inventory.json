@@ -11,9 +11,9 @@
         "jeweled@512S1.local"
       ],
       "paths": {
-        "exo_root": "/Users/jeweled/exo-k3-dspark-a583614",
-        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-dspark-replayssm-factorized-53dbe04",
-        "mlx_root": "/Users/jeweled/mlx-k3-accepted-57b87fe",
+        "exo_root": "/Users/jeweled/exo-k3-dspark-contract-ba7f8aa",
+        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-dspark-adaptive-ebf0747",
+        "mlx_root": "/Users/jeweled/.exo/mlx-overrides/57b87fe",
         "factorized_mlx_root": "/Users/jeweled/mlx-k3-factorized-152f018",
         "rank_checkpoint": "/Users/jeweled/.exo/models/kernelpool--Kimi-K3-2bit-UVMAX-tp2-rank0",
         "dspark_checkpoint": "/Users/jeweled/.exo/models/RadixArk--Kimi-K3-DSpark-eb03982e58d4fb79bcfc099e902158f562e2e27b",
@@ -31,12 +31,12 @@
         "BatchMode=yes",
         "-J",
         "jeweled@512S1.local",
-        "jeweled@169.254.42.123"
+        "jeweled@169.254.199.64"
       ],
       "paths": {
-        "exo_root": "/Users/jeweled/exo-k3-dspark-a583614",
-        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-dspark-replayssm-factorized-53dbe04",
-        "mlx_root": "/Users/jeweled/mlx-k3-accepted-57b87fe",
+        "exo_root": "/Users/jeweled/exo-k3-dspark-contract-ba7f8aa",
+        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-dspark-adaptive-ebf0747",
+        "mlx_root": "/Users/jeweled/.exo/mlx-overrides/57b87fe",
         "factorized_mlx_root": "/Users/jeweled/mlx-k3-factorized-152f018",
         "rank_checkpoint": "/Users/jeweled/.exo/models/kernelpool--Kimi-K3-2bit-UVMAX-tp2-rank1",
         "dspark_checkpoint": "/Users/jeweled/.exo/models/RadixArk--Kimi-K3-DSpark-eb03982e58d4fb79bcfc099e902158f562e2e27b",
@@ -63,7 +63,7 @@
           "environment": {
             "K3_REMOTE_EXO_HOME": ".exo-k3",
             "K3_S1_SSH_HOST": "512S1.local",
-            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+            "K3_S2_TUNNEL_HOST": "169.254.199.64"
           },
           "required_file_sha256": {
             "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
@@ -82,10 +82,10 @@
             "--api-url",
             "http://512S1.local:52415",
             "--artifact-dir",
-            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-a583614",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-ba7f8aa",
             "launch",
             "--namespace",
-            "kimi-k3-maintenance-a583614",
+            "kimi-k3-maintenance-ba7f8aa",
             "--tensor",
             "--jaccl-force-mesh",
             "--vocab-parallel-head",
@@ -98,6 +98,8 @@
             "--fused-routed-up-add",
             "--authoritative-packed-moe-front",
             "--kda-row-prefill",
+            "--prefill-max-attention-cells",
+            "268435456",
             "--async-decode-boundaries",
             "laguna8",
             "--async-decode-state",
@@ -106,11 +108,11 @@
           ],
           "environment": {
             "K3_REMOTE_EXO_HOME": ".exo-k3",
-            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3",
-            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-overlay",
+            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3-routed-up-add-pin-76a75fd",
+            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-attnres-router-kda-wide-routed-add-95fc8ad",
             "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
             "K3_S1_SSH_HOST": "512S1.local",
-            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+            "K3_S2_TUNNEL_HOST": "169.254.199.64"
           },
           "required_file_sha256": {
             "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
@@ -123,23 +125,23 @@
             "--api-url",
             "http://512S1.local:52415",
             "--artifact-dir",
-            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-a583614",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-ba7f8aa",
             "place",
             "--backend",
             "MlxJaccl",
             "--sharding",
             "Tensor",
             "--coordinator-ip",
-            "169.254.205.255",
+            "169.254.14.36",
             "--apply"
           ],
           "environment": {
             "K3_REMOTE_EXO_HOME": ".exo-k3",
-            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3",
-            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-overlay",
+            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3-routed-up-add-pin-76a75fd",
+            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-attnres-router-kda-wide-routed-add-95fc8ad",
             "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
             "K3_S1_SSH_HOST": "512S1.local",
-            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+            "K3_S2_TUNNEL_HOST": "169.254.199.64"
           },
           "required_file_sha256": {
             "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
@@ -149,12 +151,12 @@
     },
     "start-dspark-width3": {
       "enabled": false,
-      "reason": "Blocked: EXO scaffold a583614 is not wired into generate.py and the adapter contract audit is unresolved.",
+      "reason": "Blocked: EXO contract ba7f8aa repairs the adapter but is not wired into generate.py.",
       "steps": []
     },
     "start-dspark-width8": {
       "enabled": false,
-      "reason": "Blocked: native gamma-7 width-8 must not run until the EXO adapter and collective commit protocol are repaired.",
+      "reason": "Blocked: native gamma-7 width-8 must not run until generator wiring and end-to-end semantics are implemented.",
       "steps": []
     },
     "rollback": {
@@ -173,7 +175,7 @@
           "environment": {
             "K3_REMOTE_EXO_HOME": ".exo-k3",
             "K3_S1_SSH_HOST": "512S1.local",
-            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+            "K3_S2_TUNNEL_HOST": "169.254.199.64"
           },
           "required_file_sha256": {
             "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
@@ -186,10 +188,10 @@
             "--api-url",
             "http://512S1.local:52415",
             "--artifact-dir",
-            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-a583614",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-ba7f8aa",
             "launch",
             "--namespace",
-            "kimi-k3-maintenance-a583614",
+            "kimi-k3-maintenance-ba7f8aa",
             "--tensor",
             "--jaccl-force-mesh",
             "--vocab-parallel-head",
@@ -202,6 +204,8 @@
             "--fused-routed-up-add",
             "--authoritative-packed-moe-front",
             "--kda-row-prefill",
+            "--prefill-max-attention-cells",
+            "268435456",
             "--async-decode-boundaries",
             "laguna8",
             "--async-decode-state",
@@ -210,11 +214,11 @@
           ],
           "environment": {
             "K3_REMOTE_EXO_HOME": ".exo-k3",
-            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3",
-            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-overlay",
+            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3-routed-up-add-pin-76a75fd",
+            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-attnres-router-kda-wide-routed-add-95fc8ad",
             "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
             "K3_S1_SSH_HOST": "512S1.local",
-            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+            "K3_S2_TUNNEL_HOST": "169.254.199.64"
           },
           "required_file_sha256": {
             "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
@@ -227,23 +231,23 @@
             "--api-url",
             "http://512S1.local:52415",
             "--artifact-dir",
-            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-a583614",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-ba7f8aa",
             "place",
             "--backend",
             "MlxJaccl",
             "--sharding",
             "Tensor",
             "--coordinator-ip",
-            "169.254.205.255",
+            "169.254.14.36",
             "--apply"
           ],
           "environment": {
             "K3_REMOTE_EXO_HOME": ".exo-k3",
-            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3",
-            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-overlay",
+            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3-routed-up-add-pin-76a75fd",
+            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-attnres-router-kda-wide-routed-add-95fc8ad",
             "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
             "K3_S1_SSH_HOST": "512S1.local",
-            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+            "K3_S2_TUNNEL_HOST": "169.254.199.64"
           },
           "required_file_sha256": {
             "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"

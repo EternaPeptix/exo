@@ -6,12 +6,13 @@ read-only SSH probes, hashes the staged source and checkpoint contracts, and
 prints a deterministic JSON plan.  No command in this runbook was executed on
 either Mac while this offline package was prepared.
 
-The plan is rooted at the default-off EXO scaffold
-`a583614bb18199fb63227217521d9c880b3466c3`.  That scaffold is deliberately
-not connected to ordinary generation.  Accordingly, both DSpark actions are
-disabled in the checked-in inventory; no confirmation string can bypass that
-block.  The factorized-prefill actions are also disabled because that is a
-separate canary with a separate runtime.
+The plan is rooted at the default-off EXO contract repair
+`ba7f8aa07edd382a80751f85b514d2de4139c5d9`.  That revision matches the real
+MLX-LM proposer API and hardens rank-consensus commit outcomes, but it is
+deliberately not connected to ordinary generation.  Accordingly, both DSpark
+actions are disabled in the checked-in inventory; no confirmation string can
+bypass that block.  The factorized-prefill actions are also disabled because
+that is a separate canary with a separate runtime.
 
 ## Fixed contract
 
@@ -19,11 +20,11 @@ The preflight accepts only this source and data set:
 
 | Component | Required value |
 | --- | --- |
-| EXO DSpark scaffold | `a583614bb18199fb63227217521d9c880b3466c3` |
-| Consolidated MLX-LM DSpark head | `53dbe04a0499ffb3e98ede90ff5a82f118f77f04` |
+| EXO DSpark contract repair | `ba7f8aa07edd382a80751f85b514d2de4139c5d9` |
+| Consolidated MLX-LM DSpark head | `ebf0747a4185fd998d810dbb65070689415b1308` |
 | Accepted MLX/JACCL decode runtime | `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
 | Factorized MLX core | `152f01807c8327ac154b8ed56dd9279a6f9506e6` |
-| Factorized MLX-LM wiring ancestor | `e284ef8731ee30856925d2649b7d72a285510a3c` |
+| Factorized MLX-LM wiring ancestor | `53dbe04a0499ffb3e98ede90ff5a82f118f77f04` |
 | DSpark revision | `eb03982e58d4fb79bcfc099e902158f562e2e27b` |
 | DSpark model bytes | `4,498,585,858` |
 | DSpark model SHA-256 | `29df0e8eafb81909f785df55cb352b90d6a1500c609b1d60526c1a62b4d42495` |
@@ -48,17 +49,27 @@ for rank 1.  A node with less than 500 GiB physical RAM or 16 GiB free in its
 artifact filesystem fails preflight.
 
 The exact host routes and intended staging paths are in
-`k3_maintenance_canary.inventory.json`.  Two paths are staging contracts, not
+`k3_maintenance_canary.inventory.json`.  Four paths are staging contracts, not
 a claim that deployment has occurred:
 
-- `/Users/jeweled/exo-k3-dspark-a583614` must resolve to the scaffold commit;
-- `/Users/jeweled/mlx-k3-accepted-57b87fe` must resolve to the accepted MLX
+- `/Users/jeweled/exo-k3-dspark-contract-ba7f8aa` must resolve to the contract
+  repair commit;
+- `/Users/jeweled/mlx-lm-k3-dspark-adaptive-ebf0747` must resolve to the
+  consolidated MLX-LM commit;
+- `/Users/jeweled/.exo/mlx-overrides/57b87fe` must resolve to the accepted MLX
+  commit.
+- `/Users/jeweled/mlx-k3-factorized-152f018` must resolve to the factorized MLX
   commit.
 
-If either path has not been staged, the read-only preflight must fail.  Do not
+If any path has not been staged, the read-only preflight must fail.  Do not
 weaken the expected commit to make it pass.  Baseline and rollback actions
-continue to name the existing accepted `/Users/jeweled/exo-k3` and
-`/Users/jeweled/mlx-lm-k3-overlay` deployment, not the candidate source.
+continue to name the existing accepted
+`/Users/jeweled/exo-k3-routed-up-add-pin-76a75fd` and
+`/Users/jeweled/mlx-lm-k3-attnres-router-kda-wide-routed-add-95fc8ad`
+deployment, not the candidate source.  The pinned one-rail addresses from the
+last verified live state are `169.254.14.36` on 512S1 and
+`169.254.199.64` on 512S2; any address change must produce a new inspected
+plan rather than an ad-hoc command edit.
 
 ## Read-only preflight
 
@@ -140,14 +151,15 @@ The enabled actions are:
 `start-factorized-on` are disabled.  Enabling one is a code-reviewed inventory
 change, not an operator override.
 
-## DSpark canary after adapter repair
+## DSpark canary after generator integration
 
-Do not enable DSpark on `a583614` as checked in.  A later adapter revision must
-first fix the audited MLX-LM call signatures, zero-based layer mapping,
-concrete replicated-draft lifecycle, generator selection, and collective
-target/draft commit agreement.  It must also reject batch, pipeline,
-prefix-cache, remote-prefill, quantized-KV, vision, and stochastic sampling
-paths in the initial canary.
+Do not enable DSpark on `ba7f8aa` as checked in.  It fixes the audited MLX-LM
+call signatures, zero-based layer mapping, concrete replicated-draft lifecycle,
+and collective target/draft commit agreement.  A later revision must still
+wire generator selection, auxiliary-state prefill seeding, target verification,
+EOS/max-token/logprob semantics, and runtime telemetry.  It must reject batch,
+pipeline, prefix-cache, remote-prefill, quantized-KV, vision, and stochastic
+sampling paths in the initial canary.
 
 Once those fixes and their exact new EXO pin are reviewed, retain the plan's
 three-stage evidence order:
@@ -157,7 +169,7 @@ three-stage evidence order:
    speedups of 1.20x, 1.45x, and 2.00x respectively.  The measured reference
    speedups were approximately 1.30x, 1.60x, and 2.22x.
 2. Run conservative gamma 2 as width 3 in A-B-B-A order.  It is an explicit
-   screening override, must accept at least 70%, emit at least 2.39 tokens per
+   screening override, must accept at least 70%, emit at least 2.391 tokens per
    round on average, report no fallback/error/rank-disagreement rounds, and
    reach at least 17 tok/s.
 3. Run native gamma 7 as width 8 in a separate A-B-B-A sequence.  It must
