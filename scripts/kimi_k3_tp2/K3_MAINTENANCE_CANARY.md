@@ -6,13 +6,14 @@ read-only SSH probes, hashes the staged source and checkpoint contracts, and
 prints a deterministic JSON plan.  No command in this runbook was executed on
 either Mac while this offline package was prepared.
 
-The plan is rooted at the default-off EXO contract repair
-`ba7f8aa07edd382a80751f85b514d2de4139c5d9`.  That revision matches the real
-MLX-LM proposer API and hardens rank-consensus commit outcomes, but it is
-deliberately not connected to ordinary generation.  Accordingly, both DSpark
-actions are disabled in the checked-in inventory; no confirmation string can
-bypass that block.  The factorized-prefill actions are also disabled because
-that is a separate canary with a separate runtime.
+The plan is rooted at the default-off EXO generator integration
+`bc51983ef9f1cd45c9f2d24003593671183255fb`. It pins and source-attests the
+consolidated MLX-LM candidate, but both DSpark actions remain disabled until a
+real two-Mac TP2 Builder-to-`mlx_generate` hardware canary exercises reject and
+full-accept rounds. No confirmation string can bypass that block. Segmented
+SDPA and the new KDA decode tile remain explicitly off. The factorized-prefill
+actions are also disabled because that is a separate canary with a separate
+runtime.
 
 ## Fixed contract
 
@@ -20,10 +21,13 @@ The preflight accepts only this source and data set:
 
 | Component | Required value |
 | --- | --- |
-| EXO DSpark contract repair | `ba7f8aa07edd382a80751f85b514d2de4139c5d9` |
-| Consolidated MLX-LM DSpark head | `ebf0747a4185fd998d810dbb65070689415b1308` |
-| Accepted MLX/JACCL decode runtime | `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
-| Factorized MLX core | `152f01807c8327ac154b8ed56dd9279a6f9506e6` |
+| EXO DSpark generator candidate | `bc51983ef9f1cd45c9f2d24003593671183255fb` |
+| Consolidated MLX-LM candidate | `aa2e11efdfc33c3847c5594524e579199009931b` |
+| MLX-LM `kimi_k3.py` SHA-256 | `571fe7e7cec44f9eeb34ab8d7ed3ec5f8e412f5cfbbbff3f95260221b72b901a` |
+| MLX-LM `kimi_k3_dspark.py` SHA-256 | `5ba010755e703f39b86aed1ad999576a18f2f93c041b502bbe3f57b197af2f01` |
+| MLX-LM `gated_delta.py` SHA-256 | `44aef2791ed0cd5cfb84e31ef00cb4df3d40ae184e6c6852b7f0dba7406d2f78` |
+| Rollback-only MLX/JACCL decode runtime | `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
+| Rollback-only factorized MLX core | `152f01807c8327ac154b8ed56dd9279a6f9506e6` |
 | Factorized MLX-LM wiring ancestor | `53dbe04a0499ffb3e98ede90ff5a82f118f77f04` |
 | DSpark revision | `eb03982e58d4fb79bcfc099e902158f562e2e27b` |
 | DSpark model bytes | `4,498,585,858` |
@@ -52,18 +56,18 @@ The exact host routes and intended staging paths are in
 `k3_maintenance_canary.inventory.json`.  Four paths are staging contracts, not
 a claim that deployment has occurred:
 
-- `/Users/jeweled/exo-k3-dspark-contract-ba7f8aa` must resolve to the contract
-  repair commit;
-- `/Users/jeweled/mlx-lm-k3-dspark-adaptive-ebf0747` must resolve to the
-  consolidated MLX-LM commit;
-- `/Users/jeweled/.exo/mlx-overrides/57b87fe` must resolve to the accepted MLX
-  commit.
-- `/Users/jeweled/mlx-k3-factorized-152f018` must resolve to the factorized MLX
-  commit.
+- `/Users/jeweled/exo-k3-dspark-runtime-bc51983` must resolve to the candidate
+  EXO commit;
+- `/Users/jeweled/mlx-lm-k3-maintenance-aa2e11e` must resolve to the candidate
+  MLX-LM commit and all three source hashes above;
+- `/Users/jeweled/.exo/mlx-overrides/57b87fe` must resolve to the rollback-only
+  MLX commit;
+- `/Users/jeweled/mlx-k3-factorized-152f018` must resolve to the rollback-only
+  factorized MLX commit.
 
 If any path has not been staged, the read-only preflight must fail.  Do not
-weaken the expected commit to make it pass.  Baseline and rollback actions
-continue to name the existing accepted
+weaken the expected commit to make it pass. Baseline and rollback actions are
+explicitly rollback-only and continue to name the existing accepted
 `/Users/jeweled/exo-k3-routed-up-add-pin-76a75fd` and
 `/Users/jeweled/mlx-lm-k3-attnres-router-kda-wide-routed-add-95fc8ad`
 deployment, not the candidate source.  The pinned one-rail addresses from the
@@ -83,8 +87,9 @@ rtk /usr/bin/python3 scripts/kimi_k3_tp2/k3_maintenance_canary.py \
 
 This reads source commits and clean-worktree state plus required files, hashes the full 4.5 GB DSpark
 weight file plus its config and rank manifest, reads the transport JSON,
-checks interface state, RAM, and free disk, and detects whether
-`generate.py` actually selects the DSpark adapter.  It does not import or load
+checks interface state, RAM, and free disk, source-attests `kimi_k3.py`,
+`kimi_k3_dspark.py`, and `gated_delta.py`, and detects whether `generate.py`
+actually selects the DSpark adapter. It does not import or load
 either model, stop a process, launch a runner, place an instance, or access the
 network beyond the two configured SSH routes.
 
@@ -141,28 +146,25 @@ The enabled actions are:
 - `stop`: one isolated-service stop.  This remains ready after an attestation
   failure so an operator can fail-stop a bad canary; the underlying harness
   still resolves the isolated two-node service before acting.
-- `start-baseline`: launch the accepted non-speculative stack, wait for the
-  topology in the placement step, and submit the explicit one-rail TP2
-  placement.
-- `rollback`: stop, relaunch the accepted stack, and recreate its explicit
-  one-rail placement.  Steps stop on the first nonzero exit.
+- `start-baseline`: rollback-only launch of the legacy accepted non-speculative
+  stack and explicit one-rail TP2 placement. It is not candidate validation.
+- `rollback`: stop and recreate that rollback-only stack. Steps stop on the
+  first nonzero exit.
 
 `start-dspark-width3`, `start-dspark-width8`, `start-factorized-off`, and
 `start-factorized-on` are disabled.  Enabling one is a code-reviewed inventory
 change, not an operator override.
 
-## DSpark canary after generator integration
+## DSpark hardware canary before enablement
 
-Do not enable DSpark on `ba7f8aa` as checked in.  It fixes the audited MLX-LM
-call signatures, zero-based layer mapping, concrete replicated-draft lifecycle,
-and collective target/draft commit agreement.  A later revision must still
-wire generator selection, auxiliary-state prefill seeding, target verification,
-EOS/max-token/logprob semantics, and runtime telemetry.  It must reject batch,
-pipeline, prefix-cache, remote-prefill, quantized-KV, vision, and stochastic
-sampling paths in the initial canary.
-
-Once those fixes and their exact new EXO pin are reviewed, retain the plan's
-three-stage evidence order:
+The candidate wires generator selection, fresh auxiliary-state prompt seeding,
+transactional target verification, EOS/max-token boundaries, token provenance,
+runtime telemetry, and fail-stop rank agreement. It rejects batch, pipeline,
+prefix-cache, remote-prefill, quantized-KV, vision, logprobs, and stochastic or
+otherwise unsupported sampling controls. Offline tests are not a substitute
+for a real two-Mac TP2 run through Builder and `mlx_generate`; keep both start
+actions disabled until that canary records at least one reject round and one
+full-accept round with matching rank state. Retain this evidence order:
 
 1. Run the exact target verifier at widths 2, 3, and 8.  Require bitwise
    logits, equal cache digests, the accepted completion digest, and minimum

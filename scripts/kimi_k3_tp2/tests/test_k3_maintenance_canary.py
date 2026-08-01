@@ -133,9 +133,15 @@ def _facts(
             "exo_generate": True,
             "mlx_lm_dspark": True,
             "mlx_lm_kimi_k3": True,
+            "mlx_lm_gated_delta": True,
             "factorized_kernel": True,
             "rank_manifest": True,
             "transport": True,
+        },
+        "mlx_lm_source_sha256": {
+            "mlx_lm_kimi_k3": canary.MLX_LM_KIMI_K3_SHA256,
+            "mlx_lm_dspark": canary.MLX_LM_KIMI_K3_DSPARK_SHA256,
+            "mlx_lm_gated_delta": canary.MLX_LM_GATED_DELTA_SHA256,
         },
         "dspark": {
             "path": canary.DSPARK_PATH,
@@ -179,8 +185,11 @@ def test_plan_pins_abba_gates_and_disabled_unwired_actions(
     assert plan["pins"] == {
         "exo_dspark_contract": canary.EXO_DSPARK_CONTRACT_COMMIT,
         "mlx_lm_dspark": canary.MLX_LM_DSPARK_COMMIT,
-        "mlx_accepted_decode": canary.MLX_ACCEPTED_COMMIT,
-        "mlx_factorized_prefill": canary.MLX_FACTORIZED_COMMIT,
+        "mlx_lm_kimi_k3_sha256": canary.MLX_LM_KIMI_K3_SHA256,
+        "mlx_lm_kimi_k3_dspark_sha256": canary.MLX_LM_KIMI_K3_DSPARK_SHA256,
+        "mlx_lm_gated_delta_sha256": canary.MLX_LM_GATED_DELTA_SHA256,
+        "mlx_rollback_only_decode": canary.MLX_ACCEPTED_COMMIT,
+        "mlx_factorized_rollback_only": canary.MLX_FACTORIZED_COMMIT,
         "mlx_lm_factorized_wire": canary.MLX_LM_FACTORIZED_WIRE_COMMIT,
         "dspark_revision": canary.DSPARK_REVISION,
         "dspark_path": canary.DSPARK_PATH,
@@ -195,6 +204,9 @@ def test_plan_pins_abba_gates_and_disabled_unwired_actions(
     assert readiness["start-baseline"] is True
     assert readiness["start-dspark-width3"] is False
     assert readiness["start-dspark-width8"] is False
+    accepted_flags = _mapping(plan["accepted_flags"])
+    assert accepted_flags["MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"] == "0"
+    assert accepted_flags["MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE"] == "0"
 
     phases = _list(plan["dspark_canary"])
     verifier = _mapping(phases[0])
@@ -227,6 +239,29 @@ def test_plan_pins_abba_gates_and_disabled_unwired_actions(
     ]
 
 
+def test_checked_in_inventory_is_candidate_pinned_and_legacy_actions_are_rollback_only() -> (
+    None
+):
+    inventory = canary.load_inventory(
+        SCRIPT_DIR / "k3_maintenance_canary.inventory.json"
+    )
+
+    assert inventory.nodes[0].paths["exo_root"].endswith("bc51983")
+    assert inventory.nodes[0].paths["mlx_lm_root"].endswith("aa2e11e")
+    for action in ("start-baseline", "rollback"):
+        contract = _mapping(inventory.actions[action])
+        assert "rollback-only" in str(contract["reason"]).lower()
+        for raw_step in _list(contract["steps"]):
+            environment = _mapping(_mapping(raw_step)["environment"])
+            if "K3_REMOTE_EXO_SOURCE" in environment:
+                assert environment["MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"] == "0"
+                assert environment["MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE"] == "0"
+    for action in ("start-dspark-width3", "start-dspark-width8"):
+        contract = _mapping(inventory.actions[action])
+        assert contract["enabled"] is False
+        assert "hardware canary" in str(contract["reason"]).lower()
+
+
 def test_preflight_rejects_missing_factorized_wire_ancestor(tmp_path: Path) -> None:
     inventory = canary.load_inventory(_write_inventory(tmp_path))
     facts = {
@@ -245,6 +280,21 @@ def test_preflight_rejects_missing_factorized_wire_ancestor(tmp_path: Path) -> N
     assert len(ancestor_errors) == 2
     assert all(
         canary.MLX_LM_FACTORIZED_WIRE_COMMIT in str(error) for error in ancestor_errors
+    )
+
+
+def test_preflight_rejects_wrong_candidate_runtime_source_hash(tmp_path: Path) -> None:
+    inventory = canary.load_inventory(_write_inventory(tmp_path))
+    facts = {node.rank: _facts(node) for node in inventory.nodes}
+    source_hashes = _mutable_mapping(facts[0]["mlx_lm_source_sha256"])
+    source_hashes["mlx_lm_gated_delta"] = "0" * 64
+
+    preflight = _mapping(canary.build_plan(inventory, facts)["preflight"])
+
+    assert preflight["pass"] is False
+    assert any(
+        "mlx_lm_gated_delta SHA-256" in str(error)
+        for error in _list(preflight["errors"])
     )
 
 

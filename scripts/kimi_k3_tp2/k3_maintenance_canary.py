@@ -24,11 +24,22 @@ SCHEMA: Final = "k3-maintenance-canary/v1"
 INVENTORY_SCHEMA: Final = "k3-maintenance-canary-inventory/v1"
 FACTS_SCHEMA: Final = "k3-maintenance-canary-facts/v1"
 
-EXO_DSPARK_CONTRACT_COMMIT: Final = "ba7f8aa07edd382a80751f85b514d2de4139c5d9"
-MLX_LM_DSPARK_COMMIT: Final = "ebf0747a4185fd998d810dbb65070689415b1308"
+# Candidate sources. The separate MLX core pins below are retained only as
+# rollback/baseline evidence; they do not attest the candidate runtime.
+EXO_DSPARK_CONTRACT_COMMIT: Final = "bc51983ef9f1cd45c9f2d24003593671183255fb"
+MLX_LM_DSPARK_COMMIT: Final = "aa2e11efdfc33c3847c5594524e579199009931b"
 MLX_ACCEPTED_COMMIT: Final = "57b87fe47cfce34d6dc59d0e274d8ee36bfb9308"
 MLX_FACTORIZED_COMMIT: Final = "152f01807c8327ac154b8ed56dd9279a6f9506e6"
 MLX_LM_FACTORIZED_WIRE_COMMIT: Final = "53dbe04a0499ffb3e98ede90ff5a82f118f77f04"
+MLX_LM_KIMI_K3_SHA256: Final = (
+    "571fe7e7cec44f9eeb34ab8d7ed3ec5f8e412f5cfbbbff3f95260221b72b901a"
+)
+MLX_LM_KIMI_K3_DSPARK_SHA256: Final = (
+    "5ba010755e703f39b86aed1ad999576a18f2f93c041b502bbe3f57b197af2f01"
+)
+MLX_LM_GATED_DELTA_SHA256: Final = (
+    "44aef2791ed0cd5cfb84e31ef00cb4df3d40ae184e6c6852b7f0dba7406d2f78"
+)
 
 DSPARK_REVISION: Final = "eb03982e58d4fb79bcfc099e902158f562e2e27b"
 DSPARK_CONFIG_SHA256: Final = (
@@ -83,6 +94,8 @@ ACCEPTED_FLAGS: Final[dict[str, str]] = {
     "MLX_LM_KIMI_K3_PACKED_MOE_FRONT": "0",
     "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT": "1",
     "MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL": "1",
+    "MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE": "0",
+    "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA": "0",
     "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES": "laguna8",
     "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE": "hidden",
 }
@@ -307,6 +320,7 @@ required = {
     "exo_generate": pathlib.Path(paths["exo_root"], "src/exo/worker/engines/mlx/generator/generate.py"),
     "mlx_lm_dspark": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/kimi_k3_dspark.py"),
     "mlx_lm_kimi_k3": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/kimi_k3.py"),
+    "mlx_lm_gated_delta": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/gated_delta.py"),
     "factorized_kernel": pathlib.Path(paths["factorized_mlx_root"], "mlx/backend/metal/kernels/steel/attn/kernels/steel_factorized_attention.h"),
     "rank_manifest": pathlib.Path(paths["rank_checkpoint"], "tp_manifest.json"),
     "transport": pathlib.Path(paths["transport_contract"]),
@@ -333,6 +347,10 @@ facts = {
     "git_clean": {name: result["returncode"] == 0 and not result["stdout"] for name, result in git_clean.items()},
     "mlx_lm_factorized_wire_is_ancestor": factorized_wire["returncode"] == 0,
     "required_files": {name: path.is_file() for name, path in required.items()},
+    "mlx_lm_source_sha256": {
+        name: digest(required[name]) if required[name].is_file() else None
+        for name in ("mlx_lm_kimi_k3", "mlx_lm_dspark", "mlx_lm_gated_delta")
+    },
     "dspark": {
         "path": str(dspark),
         "config_sha256": digest(config) if config.is_file() else None,
@@ -425,12 +443,22 @@ def validate_facts(node: Node, facts: Mapping[str, object]) -> list[str]:
         "exo_generate",
         "mlx_lm_dspark",
         "mlx_lm_kimi_k3",
+        "mlx_lm_gated_delta",
         "factorized_kernel",
         "rank_manifest",
         "transport",
     ):
         if required.get(name) is not True:
             errors.append(f"required file missing: {name}")
+    source_hashes = _nested(facts, "mlx_lm_source_sha256")
+    expected_source_hashes = {
+        "mlx_lm_kimi_k3": MLX_LM_KIMI_K3_SHA256,
+        "mlx_lm_dspark": MLX_LM_KIMI_K3_DSPARK_SHA256,
+        "mlx_lm_gated_delta": MLX_LM_GATED_DELTA_SHA256,
+    }
+    for name, expected in expected_source_hashes.items():
+        if source_hashes.get(name) != expected:
+            errors.append(f"{name} SHA-256 must be {expected}")
     dspark = _nested(facts, "dspark")
     if dspark.get("path") != DSPARK_PATH:
         errors.append("DSpark checkpoint path mismatch")
@@ -638,8 +666,11 @@ def build_plan(
         "pins": {
             "exo_dspark_contract": EXO_DSPARK_CONTRACT_COMMIT,
             "mlx_lm_dspark": MLX_LM_DSPARK_COMMIT,
-            "mlx_accepted_decode": MLX_ACCEPTED_COMMIT,
-            "mlx_factorized_prefill": MLX_FACTORIZED_COMMIT,
+            "mlx_lm_kimi_k3_sha256": MLX_LM_KIMI_K3_SHA256,
+            "mlx_lm_kimi_k3_dspark_sha256": MLX_LM_KIMI_K3_DSPARK_SHA256,
+            "mlx_lm_gated_delta_sha256": MLX_LM_GATED_DELTA_SHA256,
+            "mlx_rollback_only_decode": MLX_ACCEPTED_COMMIT,
+            "mlx_factorized_rollback_only": MLX_FACTORIZED_COMMIT,
             "mlx_lm_factorized_wire": MLX_LM_FACTORIZED_WIRE_COMMIT,
             "dspark_revision": DSPARK_REVISION,
             "dspark_path": DSPARK_PATH,
@@ -666,7 +697,10 @@ def build_plan(
         "factorized_prefill_canary": _factorized_plan(),
         "rollback": {
             "trigger_on_any_gate_failure": True,
-            "target": "accepted baseline on MLX 57b87fe; DSpark and factorized flags unset",
+            "target": (
+                "rollback-only baseline on MLX 57b87fe; DSpark, segmented SDPA, "
+                "KDA decode tile, and factorized flags unset"
+            ),
             "completion_sha256": ACCEPTED_COMPLETION_SHA256,
         },
         "action_readiness": action_readiness,

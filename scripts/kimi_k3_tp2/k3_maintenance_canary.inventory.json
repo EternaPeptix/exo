@@ -11,8 +11,8 @@
         "jeweled@512S1.local"
       ],
       "paths": {
-        "exo_root": "/Users/jeweled/exo-k3-dspark-contract-ba7f8aa",
-        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-dspark-adaptive-ebf0747",
+        "exo_root": "/Users/jeweled/exo-k3-dspark-runtime-bc51983",
+        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-maintenance-aa2e11e",
         "mlx_root": "/Users/jeweled/.exo/mlx-overrides/57b87fe",
         "factorized_mlx_root": "/Users/jeweled/mlx-k3-factorized-152f018",
         "rank_checkpoint": "/Users/jeweled/.exo/models/kernelpool--Kimi-K3-2bit-UVMAX-tp2-rank0",
@@ -34,8 +34,8 @@
         "jeweled@169.254.199.64"
       ],
       "paths": {
-        "exo_root": "/Users/jeweled/exo-k3-dspark-contract-ba7f8aa",
-        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-dspark-adaptive-ebf0747",
+        "exo_root": "/Users/jeweled/exo-k3-dspark-runtime-bc51983",
+        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-maintenance-aa2e11e",
         "mlx_root": "/Users/jeweled/.exo/mlx-overrides/57b87fe",
         "factorized_mlx_root": "/Users/jeweled/mlx-k3-factorized-152f018",
         "rank_checkpoint": "/Users/jeweled/.exo/models/kernelpool--Kimi-K3-2bit-UVMAX-tp2-rank1",
@@ -73,7 +73,7 @@
     },
     "start-baseline": {
       "enabled": true,
-      "reason": "Launch and explicitly place the accepted non-speculative one-rail TP2 stack.",
+      "reason": "Rollback-only: launch and explicitly place the legacy accepted non-speculative one-rail TP2 stack; this action does not validate the DSpark candidate.",
       "steps": [
         {
           "argv": [
@@ -108,6 +108,8 @@
           ],
           "environment": {
             "K3_REMOTE_EXO_HOME": ".exo-k3",
+            "MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE": "0",
+            "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA": "0",
             "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3-routed-up-add-pin-76a75fd",
             "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-attnres-router-kda-wide-routed-add-95fc8ad",
             "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
@@ -137,6 +139,8 @@
           ],
           "environment": {
             "K3_REMOTE_EXO_HOME": ".exo-k3",
+            "MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE": "0",
+            "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA": "0",
             "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3-routed-up-add-pin-76a75fd",
             "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-attnres-router-kda-wide-routed-add-95fc8ad",
             "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
@@ -151,17 +155,17 @@
     },
     "start-dspark-width3": {
       "enabled": false,
-      "reason": "Blocked: EXO contract ba7f8aa repairs the adapter but is not wired into generate.py.",
+      "reason": "Blocked: the candidate is wired and offline-tested, but requires a real two-Mac TP2 Builder-to-mlx_generate two-round reject/full-accept hardware canary before enablement.",
       "steps": []
     },
     "start-dspark-width8": {
       "enabled": false,
-      "reason": "Blocked: native gamma-7 width-8 must not run until generator wiring and end-to-end semantics are implemented.",
+      "reason": "Blocked: native gamma-7 width-8 requires the real two-Mac TP2 hardware canary after conservative width-3 passes; segmented SDPA and KDA decode tiling remain disabled.",
       "steps": []
     },
     "rollback": {
       "enabled": true,
-      "reason": "Stop the maintenance service, relaunch the accepted non-speculative stack, and recreate the explicit TP2 placement.",
+      "reason": "Rollback-only: stop the maintenance service, relaunch the legacy accepted non-speculative stack, and recreate the explicit TP2 placement; this action is not candidate validation.",
       "steps": [
         {
           "argv": [
@@ -214,6 +218,8 @@
           ],
           "environment": {
             "K3_REMOTE_EXO_HOME": ".exo-k3",
+            "MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE": "0",
+            "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA": "0",
             "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3-routed-up-add-pin-76a75fd",
             "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-attnres-router-kda-wide-routed-add-95fc8ad",
             "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
@@ -243,6 +249,8 @@
           ],
           "environment": {
             "K3_REMOTE_EXO_HOME": ".exo-k3",
+            "MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE": "0",
+            "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA": "0",
             "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3-routed-up-add-pin-76a75fd",
             "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-attnres-router-kda-wide-routed-add-95fc8ad",
             "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
