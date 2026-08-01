@@ -14,6 +14,7 @@ RadixArk artifact.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib
 import inspect
@@ -609,6 +610,26 @@ def log_dspark_round(telemetry: DSparkRoundTelemetry) -> None:
     )
 
 
+def _log_nonfatal_warning(message: str) -> None:
+    with contextlib.suppress(Exception):
+        logger.opt(exception=True).warning(message)
+
+
+def _nonthrowing_telemetry_clock(
+    clock: Callable[[], float],
+) -> Callable[[], float]:
+    """Keep diagnostic timing failures out of distributed control flow."""
+
+    def read() -> float:
+        try:
+            return float(clock())
+        except Exception:
+            _log_nonfatal_warning("Kimi K3 DSpark telemetry clock failed")
+            return 0.0
+
+    return read
+
+
 def _token_tuple(tokens: Sequence[int], *, expected: int, name: str) -> tuple[int, ...]:
     values = tuple(tokens)
     if len(values) != expected:
@@ -660,8 +681,45 @@ def _token_contract_fingerprint(*sequences: Sequence[int]) -> tuple[int, ...]:
         digest.update(len(sequence).to_bytes(8, "big"))
         for token in sequence:
             if type(token) is not int or not 0 <= token <= 0x7FFFFFFF:
-                raise ValueError("Kimi K3 request token ids must fit non-negative int32")
+                raise ValueError(
+                    "Kimi K3 request token ids must fit non-negative int32"
+                )
             digest.update(token.to_bytes(4, "big"))
+    raw = digest.digest()
+    return tuple(
+        int.from_bytes(raw[offset : offset + 4], "big") & 0x7FFFFFFF
+        for offset in range(0, 16, 4)
+    )
+
+
+def _request_control_fingerprint(
+    *,
+    max_tokens: int,
+    prefill_step_size: int,
+    stop_sequences: Sequence[str],
+    distributed_progress: bool,
+) -> tuple[int, ...]:
+    """Bind controls that can change TP graph count or response termination."""
+
+    if type(max_tokens) is not int or not 0 < max_tokens <= KIMI_K3_MAX_CONTEXT_LENGTH:
+        raise ValueError("Kimi K3 DSpark max tokens are out of range")
+    if (
+        type(prefill_step_size) is not int
+        or not 0 < prefill_step_size <= KIMI_K3_MAX_CONTEXT_LENGTH
+    ):
+        raise ValueError("Kimi K3 DSpark prefill step size is out of range")
+    if isinstance(stop_sequences, (str, bytes)):
+        raise TypeError("Kimi K3 DSpark stop sequences must be a sequence of strings")
+
+    digest = hashlib.sha256(b"kimi-k3-dspark-request-control/v1\0")
+    digest.update(max_tokens.to_bytes(8, "big"))
+    digest.update(prefill_step_size.to_bytes(8, "big"))
+    digest.update(int(distributed_progress).to_bytes(1, "big"))
+    digest.update(len(stop_sequences).to_bytes(8, "big"))
+    for stop in stop_sequences:
+        encoded = stop.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
     raw = digest.digest()
     return tuple(
         int.from_bytes(raw[offset : offset + 4], "big") & 0x7FFFFFFF
@@ -684,6 +742,7 @@ class KimiK3DSparkRoundEngine:
     _disabled_reason: str | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
+        self.clock = _nonthrowing_telemetry_clock(self.clock)
         if self.draft.placement != "replicated":
             raise DSparkConfigurationError(
                 "Kimi K3 DSpark must be replicated on every target TP rank"
@@ -706,14 +765,15 @@ class KimiK3DSparkRoundEngine:
 
     def _publish(self, telemetry: DSparkRoundTelemetry) -> None:
         if self.config.round_telemetry:
-            log_dspark_round(telemetry)
+            try:
+                log_dspark_round(telemetry)
+            except Exception:
+                _log_nonfatal_warning("Kimi K3 DSpark round logging failed")
         if self.telemetry_sink is not None:
             try:
                 self.telemetry_sink(telemetry)
             except Exception:
-                logger.opt(exception=True).warning(
-                    "Kimi K3 DSpark telemetry callback failed"
-                )
+                _log_nonfatal_warning("Kimi K3 DSpark telemetry callback failed")
 
     def _agree_stage(
         self,
@@ -730,10 +790,7 @@ class KimiK3DSparkRoundEngine:
         *,
         draft_round: DraftRound | PreparedDraftRound | None,
         target_round: (
-            TargetRound
-            | PreparedTargetVerification
-            | BuiltTargetVerification
-            | None
+            TargetRound | PreparedTargetVerification | BuiltTargetVerification | None
         ),
         already_uncertain: bool,
     ) -> float:
@@ -876,11 +933,7 @@ class KimiK3DSparkRoundEngine:
             local_build_error,
         )
         collective_ms += agreement_ms
-        if (
-            build_outcome is not True
-            or build_fingerprint != 0
-            or prepared is None
-        ):
+        if build_outcome is not True or build_fingerprint != 0 or prepared is None:
             fallback_error = (
                 f"{error}; "
                 f"{local_build_error or 'ordinary target graph build disagreed'}"
@@ -1085,9 +1138,7 @@ class KimiK3DSparkRoundEngine:
             # graph, but must not call mx.eval()/tolist() yet.
             prepared_draft = self.draft.prepare_round(anchor_token, gamma)
         except Exception as error:
-            graph_error = (
-                f"draft graph build failed: {type(error).__name__}: {error}"
-            )
+            graph_error = f"draft graph build failed: {type(error).__name__}: {error}"
 
         graph_outcome, graph_fingerprint, agreement_ms = self._agree_stage(
             graph_error is None,
@@ -1225,11 +1276,7 @@ class KimiK3DSparkRoundEngine:
             target_error,
         )
         collective_ms += agreement_ms
-        if (
-            build_outcome is not True
-            or build_fingerprint != 0
-            or built_target is None
-        ):
+        if build_outcome is not True or build_fingerprint != 0 or built_target is None:
             collective_ms += self._cancel_before_fallback(
                 draft_round=draft_round,
                 target_round=built_target or prepared_target,
@@ -1662,9 +1709,7 @@ class ReplaySSMTargetAdapter:
             [tuple[int, ...], TargetVerificationPlan], _TargetPosteriorGraph
         ],
         preflight_ordinary: Callable[[int], OrdinaryDecodePlan],
-        prepare_ordinary: Callable[
-            [int, OrdinaryDecodePlan], PreparedOrdinaryDecode
-        ],
+        prepare_ordinary: Callable[[int, OrdinaryDecodePlan], PreparedOrdinaryDecode],
         validate_closed: Callable[[int], None] | None = None,
         validate_open: Callable[[int, int], None] | None = None,
     ):
@@ -1852,8 +1897,7 @@ def _validate_mlx_proposal_graph(
     shape = getattr(raw_tokens, "shape", None)
     if _shape_tuple(shape) != (1, expected):
         raise ValueError(
-            "MLX-LM DSpark proposal token graph must have shape "
-            f"[1, {expected}]"
+            f"MLX-LM DSpark proposal token graph must have shape [1, {expected}]"
         )
     tolist = getattr(raw_tokens, "tolist", None)
     if not callable(tolist):
@@ -2106,7 +2150,9 @@ class MlxDSparkRequestDraft:
         if num_proposals != self.verify_width - 1:
             raise ValueError("requested DSpark proposal count does not match its width")
         if os.environ.get(MLX_DSPARK_PROPOSER_ENV) != "1":
-            raise ValueError("MLX-LM DSpark proposer became disabled during the request")
+            raise ValueError(
+                "MLX-LM DSpark proposer became disabled during the request"
+            )
         context_offset = _context_cache_offset(self.context_cache)
         if context_offset <= 0:
             raise ValueError("MLX-LM DSpark proposal requires populated context")
@@ -2454,8 +2500,7 @@ def _validate_batched_greedy_tokens(
     shape = getattr(tokens, "shape", None)
     if _shape_tuple(shape) != (1, expected_width):
         raise ValueError(
-            "Kimi K3 compact verifier tokens must have shape "
-            f"[1, {expected_width}]"
+            f"Kimi K3 compact verifier tokens must have shape [1, {expected_width}]"
         )
     if not callable(getattr(tokens, "tolist", None)):
         raise TypeError("Kimi K3 compact verifier tokens must be an MLX array")
@@ -2600,7 +2645,9 @@ class _BuiltKimiK3CompactTargetPosterior:
 
     def materialize(self) -> TargetPosterior:
         if self._materialized:
-            raise RuntimeError("Kimi K3 compact verifier graph was already materialized")
+            raise RuntimeError(
+                "Kimi K3 compact verifier graph was already materialized"
+            )
         self._evaluate(
             self._tokens,
             self._aux_hidden_states,
@@ -2683,6 +2730,7 @@ class KimiK3DSparkRequestRuntime:
     clock: Callable[[], float] = time.perf_counter
 
     def __post_init__(self) -> None:
+        self.clock = _nonthrowing_telemetry_clock(self.clock)
         if self.target_model is not self.loaded.target_model:
             raise DSparkConfigurationError(
                 "Kimi K3 DSpark weights are bound to a different target model"
@@ -2774,6 +2822,98 @@ class KimiK3DSparkRequestRuntime:
             ) from None
         return cast(T, result)
 
+    def agree_local_value[T](self, name: str, operation: Callable[[], T]) -> T:
+        """Agree local success before a peer can enter another TP graph."""
+
+        return self._agreed_operation(name, operation)
+
+    def agree_local_side_effect(self, name: str, operation: Callable[[], None]) -> None:
+        """Agree a callback, preserving only a unanimous callback exception."""
+
+        local_error: Exception | None = None
+        error_text: str | None = None
+        try:
+            operation()
+        except Exception as error:
+            local_error = error
+            error_text = f"{name} failed: {type(error).__name__}: {error}"
+
+        outcome = self.collective.agree_stage_success(local_error is None)
+        local_fingerprint = _error_fingerprint(error_text)
+        agreed_fingerprint = self.collective.agree_token(local_fingerprint)
+        if outcome is True and agreed_fingerprint == 0:
+            return
+        if (
+            outcome is False
+            and local_error is not None
+            and agreed_fingerprint == local_fingerprint
+        ):
+            raise local_error
+        raise DSparkDistributedStateError(
+            f"Kimi K3 DSpark {name} outcomes disagreed across ranks; "
+            "request caches cannot continue"
+        ) from None
+
+    def agree_text(
+        self,
+        name: str,
+        operation: Callable[[], str],
+    ) -> str:
+        """Agree successful local text production and its exact UTF-8 digest."""
+
+        def render_and_fingerprint() -> tuple[str, tuple[int, ...]]:
+            text = operation()
+            return text, _token_contract_fingerprint(tuple(text.encode("utf-8")))
+
+        text, fingerprint = self._agreed_operation(name, render_and_fingerprint)
+        for word in fingerprint:
+            if self.collective.agree_token(word) != word:
+                raise DSparkDistributedStateError(
+                    f"Kimi K3 DSpark {name} disagreed across ranks; "
+                    "request caches cannot continue"
+                ) from None
+        return text
+
+    def agree_response_control(
+        self,
+        operation: Callable[[], tuple[int, str | None, bool, str, str]],
+    ) -> tuple[int, str | None, bool, str, str]:
+        """Agree text-derived stop control before callbacks or another round."""
+
+        def resolve() -> tuple[
+            tuple[int, str | None, bool, str, str],
+            tuple[int, ...],
+        ]:
+            result = operation()
+            token, finish_reason, stop_matched, accumulated_text, visible_text = result
+            if type(token) is not int or not 0 <= token <= 0x7FFFFFFF:
+                raise ValueError("Kimi K3 DSpark response token is invalid")
+            finish_codes = {None: 0, "stop": 1, "length": 2}
+            if finish_reason not in finish_codes:
+                raise ValueError("Kimi K3 DSpark finish reason is invalid")
+            if type(stop_matched) is not bool:
+                raise TypeError("Kimi K3 DSpark stop-match flag must be boolean")
+            text_fingerprint = _token_contract_fingerprint(
+                tuple(accumulated_text.encode("utf-8")),
+                tuple(visible_text.encode("utf-8")),
+            )
+            control = (
+                token,
+                finish_codes[finish_reason],
+                int(stop_matched),
+                *text_fingerprint,
+            )
+            return result, control
+
+        result, control = self._agreed_operation("response control", resolve)
+        for value in control:
+            if self.collective.agree_token(value) != value:
+                raise DSparkDistributedStateError(
+                    "Kimi K3 DSpark response control disagreed across ranks; "
+                    "request caches cannot continue"
+                ) from None
+        return result
+
     def _validate_forward_readiness(
         self,
         inputs: mx.array,
@@ -2845,60 +2985,102 @@ class KimiK3DSparkRequestRuntime:
     def _prompt_contract(
         self,
         prompt_prefix: mx.array,
+        *,
+        max_tokens: int,
+        prefill_step_size: int,
+        stop_sequences: Sequence[str],
+        distributed_progress: bool,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if prompt_prefix.ndim != 1 or len(prompt_prefix) == 0:
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark requires at least two logical prompt tokens"
+            )
         tolist = getattr(prompt_prefix, "tolist", None)
         if not callable(tolist):
             raise TypeError("Kimi K3 prompt prefix must be an MLX token array")
         raw_tokens = tolist()
-        if not isinstance(raw_tokens, Sequence) or isinstance(
-            raw_tokens, (str, bytes)
-        ):
+        if not isinstance(raw_tokens, Sequence) or isinstance(raw_tokens, (str, bytes)):
             raise ValueError("Kimi K3 prompt prefix must be one-dimensional")
         tokens = _token_tuple(
             cast(Sequence[int], raw_tokens),
             expected=len(prompt_prefix),
             name="Kimi K3 prompt prefix",
         )
-        fingerprint = _token_contract_fingerprint(
+        token_fingerprint = _token_contract_fingerprint(
             tokens,
             self.banned_token_ids,
             self.terminal_token_ids,
             (int(self.compact_greedy),),
         )
-        return tokens, fingerprint
+        request_fingerprint = _request_control_fingerprint(
+            max_tokens=max_tokens,
+            prefill_step_size=prefill_step_size,
+            stop_sequences=stop_sequences,
+            distributed_progress=distributed_progress,
+        )
+        return tokens, (*token_fingerprint, *request_fingerprint)
 
     def seed_prompt(
         self,
         prompt_prefix: mx.array,
         *,
         prefill_step_size: int,
+        max_tokens: int,
+        stop_sequences: Sequence[str],
         progress_callback: Callable[[int, int], None],
         distributed_progress_callback: Callable[[], None] | None,
     ) -> tuple[float, int]:
-        if prompt_prefix.ndim != 1 or len(prompt_prefix) == 0:
-            raise DSparkConfigurationError(
-                "Kimi K3 DSpark requires at least two logical prompt tokens"
-            )
-        if prefill_step_size <= 0:
-            raise ValueError("Kimi K3 DSpark prefill step size must be positive")
-        total = len(prompt_prefix)
         prompt_tokens, prompt_fingerprint = self._agreed_operation(
             "prompt contract validation",
-            lambda: self._prompt_contract(prompt_prefix),
+            lambda: self._prompt_contract(
+                prompt_prefix,
+                max_tokens=max_tokens,
+                prefill_step_size=prefill_step_size,
+                stop_sequences=stop_sequences,
+                distributed_progress=distributed_progress_callback is not None,
+            ),
         )
-        contract_values = (len(prompt_tokens), *prompt_fingerprint)
+        total = len(prompt_tokens)
+        contract_values = (
+            total,
+            prefill_step_size,
+            max_tokens,
+            *prompt_fingerprint,
+        )
         for contract_value in contract_values:
             if self.collective.agree_token(contract_value) != contract_value:
                 raise DSparkDistributedStateError(
-                    "Kimi K3 DSpark prompt/tokenizer contract disagreed across ranks; "
+                    "Kimi K3 DSpark prompt/request contract disagreed across ranks; "
                     "no target TP graph was built"
                 ) from None
         processed = 0
         started = self.clock()
-        progress_callback(0, total)
+        self.agree_local_side_effect(
+            "initial prompt progress publication",
+            lambda: progress_callback(0, total),
+        )
         while processed < total:
             chunk_size = min(prefill_step_size, total - processed)
-            chunk = prompt_prefix[processed : processed + chunk_size][None]
+            next_processed = processed + chunk_size
+            chunk_tokens = prompt_tokens[processed:next_processed]
+            chunk_contract = (
+                processed,
+                next_processed,
+                chunk_size,
+                *_token_contract_fingerprint(chunk_tokens),
+            )
+            for contract_value in chunk_contract:
+                if self.collective.agree_token(contract_value) != contract_value:
+                    raise DSparkDistributedStateError(
+                        "Kimi K3 DSpark prompt chunk contract disagreed across "
+                        "ranks; no target TP graph was built"
+                    ) from None
+            chunk = self._agreed_operation(
+                "prompt chunk construction",
+                lambda processed=processed, chunk_size=chunk_size: prompt_prefix[
+                    processed : processed + chunk_size
+                ][None],
+            )
             initial_offset = self._agreed_operation(
                 "target prompt readiness",
                 lambda chunk=chunk: self._validate_forward_readiness(chunk),
@@ -2928,20 +3110,35 @@ class KimiK3DSparkRequestRuntime:
                     expected_width=chunk_size,
                 ),
             )
-            processed += chunk_size
+            processed = next_processed
             if distributed_progress_callback is not None:
-                distributed_progress_callback()
-            progress_callback(processed, total)
-            mx.clear_cache()
+                self.agree_local_side_effect(
+                    "distributed prompt progress publication",
+                    distributed_progress_callback,
+                )
+            self.agree_local_side_effect(
+                "prompt progress publication",
+                lambda processed=processed: progress_callback(processed, total),
+            )
+            try:
+                mx.clear_cache()
+            except Exception:
+                _log_nonfatal_warning("Kimi K3 DSpark prompt cache cleanup failed")
 
-        if _target_cache_offset(self.target_cache) != total:
-            raise DSparkDistributedStateError(
-                "Kimi K3 target prompt cache did not reach the decode boundary"
-            )
-        if _context_cache_offset(self.draft.context_cache) != total:
-            raise DSparkDistributedStateError(
-                "Kimi K3 draft prompt context did not reach the decode boundary"
-            )
+        def validate_complete_prompt() -> None:
+            if _target_cache_offset(self.target_cache) != total:
+                raise DSparkDistributedStateError(
+                    "Kimi K3 target prompt cache did not reach the decode boundary"
+                )
+            if _context_cache_offset(self.draft.context_cache) != total:
+                raise DSparkDistributedStateError(
+                    "Kimi K3 draft prompt context did not reach the decode boundary"
+                )
+
+        self._agreed_operation(
+            "prompt completion validation",
+            validate_complete_prompt,
+        )
         elapsed = self.clock() - started
         return (total / elapsed if elapsed > 0 else 0.0), total
 
@@ -3063,9 +3260,7 @@ class KimiK3DSparkRequestRuntime:
                 "Kimi K3 compact vocab-parallel greedy was requested but the "
                 "target rank does not support it"
             )
-        mode: Literal["full", "compact"] = (
-            "compact" if compact_requested else "full"
-        )
+        mode: Literal["full", "compact"] = "compact" if compact_requested else "full"
         if mode == "full" and not callable(self.target_model):
             raise DSparkFeatureUnavailableError(
                 "Kimi K3 target does not expose the ordinary full-logits path"
@@ -3082,16 +3277,16 @@ class KimiK3DSparkRequestRuntime:
             raise ValueError("Kimi K3 ordinary decode plan changed after agreement")
         input_ids = mx.array([[anchor_token]], dtype=mx.int32)
         if plan.mode == "compact":
-            sampled = cast(_CompactGreedyTarget, self.target_model).vocab_parallel_greedy(
+            sampled = cast(
+                _CompactGreedyTarget, self.target_model
+            ).vocab_parallel_greedy(
                 input_ids,
                 cache=self.target_cache,
             )
             shape = getattr(sampled, "shape", None)
             item = getattr(sampled, "item", None)
             if _shape_tuple(shape) != (1,) or not callable(item):
-                raise ValueError(
-                    "Kimi K3 compact greedy target must return one token"
-                )
+                raise ValueError("Kimi K3 compact greedy target must return one token")
             return _BuiltKimiK3OrdinaryDecode(
                 output=sampled,
                 mode="compact",
@@ -3192,7 +3387,10 @@ def dspark_decode_tokens(
             else engine.decode_ordinary_tail(next_anchor)
         )
         if round_observer is not None:
-            round_observer(result.telemetry)
+            try:
+                round_observer(result.telemetry)
+            except Exception:
+                _log_nonfatal_warning("Kimi K3 DSpark round observer failed")
         if not result.emitted_tokens:
             raise DSparkDistributedStateError(
                 "Kimi K3 DSpark round committed no output token"
@@ -3202,7 +3400,10 @@ def dspark_decode_tokens(
             next_anchor = token
             from_draft = round_token_index < result.telemetry.accepted
             if token_observer is not None:
-                token_observer(from_draft)
+                try:
+                    token_observer(from_draft)
+                except Exception:
+                    _log_nonfatal_warning("Kimi K3 DSpark token observer failed")
             if token in eos:
                 yield DSparkDecodedToken(token, from_draft, "stop")
                 return

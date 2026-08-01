@@ -436,6 +436,8 @@ class _FakeAgreement:
     size: int = 2
     stage_outcomes: list[bool | None] = field(default_factory=list)
     agreed_tokens: list[int | None] = field(default_factory=list)
+    reject_token_call: int | None = None
+    token_calls: int = field(default=0, init=False)
 
     def agree_proposal_block(
         self,
@@ -467,6 +469,9 @@ class _FakeAgreement:
         return local_success
 
     def agree_token(self, local_token: int | None) -> int | None:
+        self.token_calls += 1
+        if self.token_calls == self.reject_token_call:
+            return None
         if self.agreed_tokens:
             return self.agreed_tokens.pop(0)
         return local_token
@@ -645,7 +650,9 @@ def test_peer_draft_preflight_failure_never_builds_or_materializes_tp_graph(
     assert target.rounds == []
 
 
-def test_decode_anchor_disagreement_prevents_every_lazy_tp_graph(tmp_path: Path) -> None:
+def test_decode_anchor_disagreement_prevents_every_lazy_tp_graph(
+    tmp_path: Path,
+) -> None:
     events: list[str] = []
     agreement = _FakeAgreement(events, agreed_tokens=[None])
     engine, _draft, target, _collective, _events = _engine(
@@ -1770,8 +1777,38 @@ class _FakeKDATargetCache:
 
 @dataclass
 class _FakeRuntimeTarget(_FakeHookTarget):
-    layers: tuple[object, ...] = field(
-        default_factory=lambda: (object(), object())
+    layers: tuple[object, ...] = field(default_factory=lambda: (object(), object()))
+
+
+def _prompt_runtime(
+    tmp_path: Path,
+    agreement: _FakeAgreement,
+) -> tuple[KimiK3DSparkRequestRuntime, list[object]]:
+    target_model = _FakeRuntimeTarget()
+    target_cache: list[object] = [_FakeTargetCache(), _FakeKDATargetCache()]
+    proposer = _FakeMlxProposer(3, [], [[11, 12]])
+    draft = MlxDSparkRequestDraft(
+        proposer=proposer,
+        context_cache=[_FakeContextCache(), _FakeContextCache()],
+        verify_width=3,
+        evaluate=lambda *_values: None,
+    )
+    return (
+        KimiK3DSparkRequestRuntime(
+            loaded=LoadedMlxDSpark(
+                config=_config(tmp_path, 3),
+                target_model=target_model,
+                drafter=object(),
+                proposer=proposer,
+                evaluate=lambda *_values: None,
+            ),
+            target_model=target_model,
+            target_cache=target_cache,
+            draft=draft,
+            collective=agreement,
+            evaluate=lambda *_values: None,
+        ),
+        target_cache,
     )
 
 
@@ -1837,6 +1874,8 @@ def test_prompt_prefix_is_chunk_seeded_into_fresh_target_and_draft_context(
     prompt_tps, prompt_tokens = runtime.seed_prompt(
         cast(mx.array, cast(object, full_prompt[:-1])),
         prefill_step_size=2,
+        max_tokens=16,
+        stop_sequences=("STOP",),
         progress_callback=lambda done, total: progress.append((done, total)),
         distributed_progress_callback=lambda: distributed_progress.append(None),
     )
@@ -1873,21 +1912,151 @@ def test_prompt_content_disagreement_prevents_target_graph_build(
         target_model=target_model,
         target_cache=target_cache,
         draft=draft,
-        # Operation fingerprint and length agree; a prompt digest word does not.
-        collective=_FakeAgreement([], agreed_tokens=[0, 2, None]),
+        # Validation, length, and controls agree; a prompt digest word does not.
+        collective=_FakeAgreement([], reject_token_call=5),
         evaluate=lambda *_values: None,
     )
 
-    with pytest.raises(DSparkDistributedStateError, match="prompt/tokenizer"):
+    with pytest.raises(DSparkDistributedStateError, match="prompt/request"):
         runtime.seed_prompt(
             cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
             prefill_step_size=2,
+            max_tokens=16,
+            stop_sequences=(),
             progress_callback=lambda _done, _total: None,
             distributed_progress_callback=None,
         )
 
     assert target_cache[0].offset == 0
     assert target_cache[1].cache == [None, None]
+
+
+def test_request_control_fingerprint_binds_graph_and_termination_controls() -> None:
+    fingerprint = dspark_module._request_control_fingerprint(
+        max_tokens=16,
+        prefill_step_size=2,
+        stop_sequences=("STOP", "END"),
+        distributed_progress=False,
+    )
+
+    assert fingerprint != dspark_module._request_control_fingerprint(
+        max_tokens=17,
+        prefill_step_size=2,
+        stop_sequences=("STOP", "END"),
+        distributed_progress=False,
+    )
+    assert fingerprint != dspark_module._request_control_fingerprint(
+        max_tokens=16,
+        prefill_step_size=3,
+        stop_sequences=("STOP", "END"),
+        distributed_progress=False,
+    )
+    assert fingerprint != dspark_module._request_control_fingerprint(
+        max_tokens=16,
+        prefill_step_size=2,
+        stop_sequences=("END", "STOP"),
+        distributed_progress=False,
+    )
+    assert fingerprint != dspark_module._request_control_fingerprint(
+        max_tokens=16,
+        prefill_step_size=2,
+        stop_sequences=("STOP", "END"),
+        distributed_progress=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("reject_token_call", "control"),
+    ((3, "prefill step"), (4, "max tokens"), (9, "stop sequence digest")),
+)
+def test_asymmetric_request_controls_prevent_prompt_graph_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reject_token_call: int,
+    control: str,
+) -> None:
+    agreement = _FakeAgreement([], reject_token_call=reject_token_call)
+    runtime, target_cache = _prompt_runtime(tmp_path, agreement)
+    graph_builds: list[str] = []
+
+    def unexpected_graph(*_args: object, **_kwargs: object) -> object:
+        graph_builds.append(control)
+        raise AssertionError("request disagreement must precede target graph build")
+
+    monkeypatch.setattr(runtime, "_build_forward_with_taps", unexpected_graph)
+
+    with pytest.raises(DSparkDistributedStateError, match="prompt/request"):
+        runtime.seed_prompt(
+            cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
+            prefill_step_size=2,
+            max_tokens=16,
+            stop_sequences=("STOP",),
+            progress_callback=lambda _done, _total: None,
+            distributed_progress_callback=None,
+        )
+
+    assert graph_builds == []
+    assert cast(_FakeTargetCache, target_cache[0]).offset == 0
+
+
+def test_asymmetric_distributed_progress_presence_prevents_prompt_graph_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agreement = _FakeAgreement([], reject_token_call=9)
+    runtime, target_cache = _prompt_runtime(tmp_path, agreement)
+    graph_builds: list[None] = []
+    distributed_progress: list[None] = []
+
+    def unexpected_graph(*_args: object, **_kwargs: object) -> object:
+        graph_builds.append(None)
+        raise AssertionError("callback disagreement must precede target graph build")
+
+    monkeypatch.setattr(runtime, "_build_forward_with_taps", unexpected_graph)
+
+    with pytest.raises(DSparkDistributedStateError, match="prompt/request"):
+        runtime.seed_prompt(
+            cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
+            prefill_step_size=2,
+            max_tokens=16,
+            stop_sequences=(),
+            progress_callback=lambda _done, _total: None,
+            distributed_progress_callback=lambda: distributed_progress.append(None),
+        )
+
+    assert graph_builds == []
+    assert distributed_progress == []
+    assert cast(_FakeTargetCache, target_cache[0]).offset == 0
+
+
+def test_asymmetric_prompt_chunk_contract_prevents_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Calls 1-12 bind validation plus the complete request; 13-15 bind the
+    # first chunk's start, cumulative boundary, and width, respectively.
+    agreement = _FakeAgreement([], reject_token_call=15)
+    runtime, target_cache = _prompt_runtime(tmp_path, agreement)
+    graph_builds: list[None] = []
+
+    def unexpected_graph(*_args: object, **_kwargs: object) -> object:
+        graph_builds.append(None)
+        raise AssertionError("chunk disagreement must precede target graph build")
+
+    monkeypatch.setattr(runtime, "_build_forward_with_taps", unexpected_graph)
+
+    with pytest.raises(DSparkDistributedStateError, match="prompt chunk contract"):
+        runtime.seed_prompt(
+            cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
+            prefill_step_size=2,
+            max_tokens=16,
+            stop_sequences=("STOP",),
+            progress_callback=lambda _done, _total: None,
+            distributed_progress_callback=None,
+        )
+
+    assert graph_builds == []
+    assert cast(_FakeTargetCache, target_cache[0]).offset == 0
 
 
 def test_peer_prompt_graph_build_failure_never_materializes_lazy_target_graph(
@@ -1914,7 +2083,7 @@ def test_peer_prompt_graph_build_failure_never_materializes_lazy_target_graph(
         target_model=target_model,
         target_cache=target_cache,
         draft=draft,
-        collective=_FakeAgreement([], stage_outcomes=[True, True, None]),
+        collective=_FakeAgreement([], stage_outcomes=[True, True, True, True, None]),
         evaluate=lambda *_values: None,
     )
     materializations: list[None] = []
@@ -1945,11 +2114,130 @@ def test_peer_prompt_graph_build_failure_never_materializes_lazy_target_graph(
         runtime.seed_prompt(
             cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
             prefill_step_size=2,
+            max_tokens=16,
+            stop_sequences=(),
             progress_callback=lambda _done, _total: None,
             distributed_progress_callback=None,
         )
 
     assert materializations == []
+
+
+def test_asymmetric_prompt_progress_failure_is_agreed_after_committed_chunk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agreement = _FakeAgreement(
+        [],
+        # prompt contract, initial publication, chunk construction, readiness,
+        # graph build, materialization, draft projection, then asymmetric
+        # publication.
+        stage_outcomes=[True, True, True, True, True, True, True, None],
+    )
+    runtime, target_cache = _prompt_runtime(tmp_path, agreement)
+    graph_builds: list[None] = []
+
+    def build(
+        chunk: _FakePromptBatch,
+        *,
+        initial_offset: int,
+        speculative_width: int | None = None,
+    ) -> _FakePendingForward:
+        assert initial_offset == cast(_FakeTargetCache, target_cache[0]).offset
+        assert speculative_width is None
+        graph_builds.append(None)
+        cast(_FakeTargetCache, target_cache[0]).offset += len(chunk.values)
+        cast(_FakeKDATargetCache, target_cache[1]).cache = [object(), object()]
+        return _FakePendingForward(
+            SimpleNamespace(
+                aux_hidden_states=tuple(
+                    _FakeHidden((1, len(chunk.values), 7168), f"tap-{index}")
+                    for index in range(5)
+                )
+            )
+        )
+
+    monkeypatch.setattr(runtime, "_build_forward_with_taps", build)
+    monkeypatch.setattr(dspark_module.mx, "clear_cache", lambda: None, raising=False)
+
+    def publish(done: int, _total: int) -> None:
+        if done > 0:
+            raise RuntimeError("rank-zero event sender failed")
+
+    with pytest.raises(DSparkDistributedStateError, match="progress publication"):
+        runtime.seed_prompt(
+            cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
+            prefill_step_size=2,
+            max_tokens=16,
+            stop_sequences=(),
+            progress_callback=publish,
+            distributed_progress_callback=None,
+        )
+
+    assert graph_builds == [None]
+    assert cast(_FakeTargetCache, target_cache[0]).offset == 2
+    assert agreement.stage_outcomes == []
+
+
+def test_unanimous_progress_cancellation_preserves_original_exception(
+    tmp_path: Path,
+) -> None:
+    class ExpectedCancellationError(Exception):
+        pass
+
+    runtime, _target_cache = _prompt_runtime(tmp_path, _FakeAgreement([]))
+
+    def cancel() -> None:
+        raise ExpectedCancellationError("cancelled on every rank")
+
+    with pytest.raises(ExpectedCancellationError, match="cancelled on every rank"):
+        runtime.agree_local_side_effect("distributed progress", cancel)
+
+
+def test_asymmetric_detokenizer_text_is_rejected_before_stop_control(
+    tmp_path: Path,
+) -> None:
+    # Operation-success fingerprint is call 1; text digest begins at call 2.
+    runtime, _target_cache = _prompt_runtime(
+        tmp_path,
+        _FakeAgreement([], reject_token_call=2),
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="detokenizer output"):
+        runtime.agree_text("detokenizer output", lambda: "rank-local text")
+
+
+def test_asymmetric_response_control_is_rejected_before_callback(
+    tmp_path: Path,
+) -> None:
+    # Operation-success fingerprint is call 1; response token is call 2.
+    runtime, _target_cache = _prompt_runtime(
+        tmp_path,
+        _FakeAgreement([], reject_token_call=2),
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="response control"):
+        runtime.agree_response_control(lambda: (11, None, False, "tail", "piece"))
+
+
+def test_decode_telemetry_observer_failures_are_nonfatal() -> None:
+    engine = _FakeRoundEngine([(11, 12, 13)])
+
+    def fail(*_args: object) -> None:
+        raise RuntimeError("telemetry sink failed")
+
+    decoded = list(
+        dspark_decode_tokens(
+            engine,
+            anchor_token=10,
+            max_tokens=3,
+            eos_token_ids=(),
+            round_observer=fail,
+            token_observer=fail,
+        )
+    )
+
+    assert [item.token for item in decoded] == [11, 12, 13]
 
 
 @dataclass(frozen=True)
@@ -1985,9 +2273,7 @@ class _FakeCompactToken:
 @dataclass
 class _FaithfulReplayTarget:
     posterior_tokens: tuple[int, ...]
-    layers: tuple[object, ...] = field(
-        default_factory=lambda: (object(), object())
-    )
+    layers: tuple[object, ...] = field(default_factory=lambda: (object(), object()))
     events: list[tuple[str, int]] = field(default_factory=list)
     ordinary_token: int = 77
     compact_verifier_banned: list[tuple[int, ...]] = field(default_factory=list)
@@ -2053,8 +2339,7 @@ class _FaithfulReplayTarget:
         return SimpleNamespace(
             logits=_FakeTargetLogits(_FakeTokenLogits((width, 128))),
             aux_hidden_states=tuple(
-                _FakeHidden((1, width, 7168), f"tap-{index}")
-                for index in range(5)
+                _FakeHidden((1, width, 7168), f"tap-{index}") for index in range(5)
             ),
         )
 
@@ -2080,8 +2365,7 @@ class _FaithfulReplayTarget:
         return SimpleNamespace(
             tokens=_FakeTokenArray([list(self.posterior_tokens)]),
             aux_hidden_states=tuple(
-                _FakeHidden((1, width, 7168), f"tap-{index}")
-                for index in range(5)
+                _FakeHidden((1, width, 7168), f"tap-{index}") for index in range(5)
             ),
         )
 

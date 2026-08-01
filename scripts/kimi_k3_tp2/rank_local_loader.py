@@ -29,7 +29,7 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = "1bcf43047a5a2c4a5be64f3c45ed33666981d1c1"
+RUNTIME_MLX_LM_COMMIT = "bf378e33831e745715a88418a44ce20ab1075b9b"
 MLX_LM_KIMI_K3_SHA256 = (
     "3e283240117d298d95e33f7238cb49abc5606aafdd26f70062e841518059088b"
 )
@@ -38,6 +38,18 @@ MLX_LM_KIMI_K3_DSPARK_SHA256 = (
 )
 MLX_LM_GATED_DELTA_SHA256 = (
     "44aef2791ed0cd5cfb84e31ef00cb4df3d40ae184e6c6852b7f0dba7406d2f78"
+)
+MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256 = (
+    "d51bf88fa603846f4ac9876faf724d273a99ca8b6643715f68df5993eb352d68"
+)
+MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256 = (
+    "0aa226e32b992e5bb18a14b4a3ead225b6a6f531431249e1ae6b5bbb35ca29d1"
+)
+MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256 = (
+    "2b9841394f8334e02044f2e6b418f0bc7ff41cc719a877464a311c5e8c899ee9"
+)
+MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256 = (
+    "82076bf9c0098f2fc72a0434a5482e72a6e022fc982574f05867dcce32645435"
 )
 SOURCE_CONFIG_SHA256 = (
     "d041003554810a367bb600d18733976bdd21041bb46e75cc1e27c7b15fe034d0"
@@ -160,9 +172,7 @@ def _verify_metadata_contract(
                 f"malformed rank-local metadata record for {raw_name!r}"
             )
         if set(raw_record) != {"bytes", "sha256"}:
-            raise RankLocalLoadError(
-                f"malformed rank-local metadata record for {name}"
-            )
+            raise RankLocalLoadError(f"malformed rank-local metadata record for {name}")
         byte_count = raw_record.get("bytes")
         checksum = raw_record.get("sha256")
         if (
@@ -172,15 +182,9 @@ def _verify_metadata_contract(
             or not isinstance(checksum, str)
             or SHA256_RE.fullmatch(checksum) is None
         ):
-            raise RankLocalLoadError(
-                f"malformed rank-local metadata record for {name}"
-            )
+            raise RankLocalLoadError(f"malformed rank-local metadata record for {name}")
         path = model_dir / name
-        if (
-            path.is_symlink()
-            or not path.is_file()
-            or path.stat().st_size != byte_count
-        ):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != byte_count:
             raise RankLocalLoadError(f"missing or truncated metadata file {path}")
         if _sha256_file(path) != checksum:
             raise RankLocalLoadError(f"metadata checksum mismatch: {path}")
@@ -268,7 +272,9 @@ def _agree_local_validation(
     if all(row[0] == 1 and row[1] == 0 for row in rows):
         return
     if local_error is not None:
-        raise RankLocalLoadError(f"{label} failed locally: {local_error}") from local_error
+        raise RankLocalLoadError(
+            f"{label} failed locally: {local_error}"
+        ) from local_error
     failures = [
         f"rank {rank} fingerprint {row[1]}"
         for rank, row in enumerate(rows)
@@ -291,7 +297,15 @@ def _agree_metadata_contract(mx: Any, group: Any, digest: str) -> None:
 def _verify_runtime_source() -> None:
     """Fail closed if the pinned execution-time K3 source is not imported."""
 
-    from mlx_lm.models import gated_delta, kimi_k3, kimi_k3_dspark
+    from mlx_lm.models import (
+        gated_delta,
+        kimi_k3,
+        kimi_k3_dspark,
+        kimi_k3_fused_down_reduce,
+        kimi_k3_fused_expert,
+        kimi_k3_fused_switch_glu,
+        kimi_k3_packed_moe_front,
+    )
 
     pinned_sources = (
         (kimi_k3, "kimi_k3.py", MLX_LM_KIMI_K3_SHA256),
@@ -301,6 +315,26 @@ def _verify_runtime_source() -> None:
             MLX_LM_KIMI_K3_DSPARK_SHA256,
         ),
         (gated_delta, "gated_delta.py", MLX_LM_GATED_DELTA_SHA256),
+        (
+            kimi_k3_fused_expert,
+            "kimi_k3_fused_expert.py",
+            MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256,
+        ),
+        (
+            kimi_k3_fused_switch_glu,
+            "kimi_k3_fused_switch_glu.py",
+            MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256,
+        ),
+        (
+            kimi_k3_fused_down_reduce,
+            "kimi_k3_fused_down_reduce.py",
+            MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256,
+        ),
+        (
+            kimi_k3_packed_moe_front,
+            "kimi_k3_packed_moe_front.py",
+            MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256,
+        ),
     )
     for module, filename, expected in pinned_sources:
         source = Path(inspect.getfile(module)).resolve()
@@ -312,6 +346,35 @@ def _verify_runtime_source() -> None:
                 f"Install mlx-lm commit {RUNTIME_MLX_LM_COMMIT} or audit and "
                 "update the execution runtime pin."
             )
+
+
+def _prepare_execution_runtime(model_dir: str | Path, mlx_lm_utils: Any) -> tuple:
+    """Perform every fallible local operation before the first agreement."""
+
+    from mlx.utils import tree_flatten
+
+    checkpoint_path = Path(model_dir)
+    load_config = getattr(mlx_lm_utils, "load_config", None)
+    if not callable(load_config):
+        raise RankLocalLoadError("installed mlx_lm.utils exposes no load_config")
+    get_model_classes = getattr(mlx_lm_utils, "get_model_classes", None)
+    if get_model_classes is None:
+        get_model_classes = getattr(mlx_lm_utils, "_get_classes", None)
+    if not callable(get_model_classes):
+        raise RankLocalLoadError(
+            "installed mlx_lm.utils exposes neither get_model_classes nor _get_classes"
+        )
+    if not callable(tree_flatten):
+        raise RankLocalLoadError("installed mlx.utils exposes no tree_flatten")
+    vocab_parallel_head = _strict_env_flag("EXO_MLX_K3_VOCAB_PARALLEL_HEAD")
+    _verify_runtime_source()
+    return (
+        checkpoint_path,
+        load_config,
+        get_model_classes,
+        tree_flatten,
+        vocab_parallel_head,
+    )
 
 
 def _verify_manifest(
@@ -627,29 +690,26 @@ def load_rank_local_model(
     strict parameter names/shapes are always checked.
     """
 
-    vocab_parallel_head = _strict_env_flag("EXO_MLX_K3_VOCAB_PARALLEL_HEAD")
-
     import mlx.core as mx
     import mlx_lm.utils as mlx_lm_utils
-    from mlx.utils import tree_flatten
 
-    load_config = mlx_lm_utils.load_config
-    get_model_classes = getattr(mlx_lm_utils, "get_model_classes", None)
-    if get_model_classes is None:
-        get_model_classes = getattr(mlx_lm_utils, "_get_classes", None)
-    if get_model_classes is None:
-        raise RankLocalLoadError(
-            "installed mlx_lm.utils exposes neither get_model_classes nor _get_classes"
-        )
-
-    model_dir = Path(model_dir).resolve()
     group = tensor_group or mx.distributed.init()
+    execution_runtime: tuple | None = None
     runtime_error: Exception | None = None
     try:
-        _verify_runtime_source()
+        execution_runtime = _prepare_execution_runtime(model_dir, mlx_lm_utils)
     except Exception as exc:
         runtime_error = exc
     _agree_local_validation(mx, group, "execution runtime validation", runtime_error)
+    if execution_runtime is None:
+        raise RankLocalLoadError("runtime validation produced no execution runtime")
+    (
+        model_dir,
+        load_config,
+        get_model_classes,
+        tree_flatten,
+        vocab_parallel_head,
+    ) = execution_runtime
 
     manifest: dict[str, Any] | None = None
     manifest_error: Exception | None = None

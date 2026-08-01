@@ -1,12 +1,13 @@
+import hashlib
 import json
 import os
 import re
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import VisionProcessor
@@ -67,12 +68,17 @@ from exo.worker.engines.mlx.auto_parallel import (
     tensor_auto_parallel,
 )
 from exo.worker.engines.mlx.rank_local_checkpoint import (
-    load_configured_rank_local_model,
+    RANK_LOCAL_CHECKPOINT_ENV,
+    SUPPORTED_MODEL_ID,
+    PreparedRankLocalLoad,
+    load_preflighted_rank_local_model,
+    preflight_configured_rank_local_model,
 )
 from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
 
 _RANK_LOCAL_TENSOR_PATCH_MARKER = "_exo_rank_local_tensor_patch_applied"
+_RankStageResult = TypeVar("_RankStageResult")
 
 
 def _patch_rank_local_tensor_model_once(model: nn.Module) -> nn.Module:
@@ -207,7 +213,20 @@ def load_mlx_items(
 ) -> Generator[
     ModelLoadingResponse, None, tuple[Model, TokenizerWrapper, "VisionProcessor | None"]
 ]:
-    set_wired_limit_for_model(get_weights_size(bound_instance.bound_shard))
+    def configure_wired_limit() -> int:
+        weights_size = get_weights_size(bound_instance.bound_shard)
+        set_wired_limit_for_model(weights_size)
+        return weights_size.in_bytes
+
+    if group is None:
+        configure_wired_limit()
+    else:
+        rank_agreed_local_stage(
+            "distributed MLX wired-limit setup",
+            group,
+            configure_wired_limit,
+            lambda _weights_size: "configured",
+        )
 
     if group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
@@ -246,9 +265,21 @@ def load_mlx_items(
             f"Time taken to shard and load model: {(end_time - start_time):.2f}s"
         )
 
-    mx.clear_cache()
-
     vision_config = bound_instance.bound_shard.model_card.vision
+    is_kimi_k3_text = (
+        vision_config is None
+        and str(bound_instance.bound_shard.model_card.model_id).casefold()
+        == SUPPORTED_MODEL_ID.casefold()
+    )
+    if group is not None and is_kimi_k3_text:
+        rank_agreed_local_stage(
+            "Kimi K3 post-load cache cleanup",
+            group,
+            mx.clear_cache,
+            lambda _result: "cleared",
+        )
+    else:
+        mx.clear_cache()
 
     if vision_config is not None:
         from exo.worker.engines.mlx.vision import VisionProcessor
@@ -273,26 +304,192 @@ def load_mlx_items(
     return cast(Model, model), tokenizer, vision_processor
 
 
+def _distributed_stage_fingerprint(value: str) -> int:
+    return (
+        int.from_bytes(hashlib.sha256(value.encode("utf-8")).digest()[:4], "big")
+        & 0x7FFFFFFF
+    )
+
+
+def rank_agreed_local_stage(
+    stage_name: str,
+    group: mx.distributed.Group | None,
+    operation: Callable[[], _RankStageResult],
+    success_contract: Callable[[_RankStageResult], str],
+) -> _RankStageResult:
+    """Run a failure-prone local startup stage before fixed-order consensus."""
+
+    result: _RankStageResult | None = None
+    operation_succeeded = False
+    local_error: Exception | None = None
+    success_fingerprint = 0
+    try:
+        result = operation()
+        contract = success_contract(result)
+        success_fingerprint = _distributed_stage_fingerprint(contract)
+        operation_succeeded = True
+    except Exception as exc:
+        local_error = exc
+
+    error_fingerprint = (
+        0
+        if local_error is None
+        else _distributed_stage_fingerprint(
+            f"{type(local_error).__module__}.{type(local_error).__qualname__}:"
+            f"{local_error}"
+        )
+    )
+    any_failed = mx_any(local_error is not None, group)
+    errors_agree = mx_ranks_agree_on_value(error_fingerprint, group)
+    successes_agree = mx_ranks_agree_on_value(success_fingerprint, group)
+    if any_failed:
+        if errors_agree and local_error is not None:
+            # Every rank failed with the same typed/message fingerprint, so
+            # preserving the original exception is itself rank-safe.
+            raise local_error
+        detail = "rank errors differed" if not errors_agree else "rank error agreed"
+        raise RuntimeError(
+            f"{stage_name} failed on at least one distributed rank ({detail})"
+        ) from local_error
+    if not successes_agree:
+        raise RuntimeError(f"{stage_name} result diverged across distributed ranks")
+    if not operation_succeeded:
+        raise RuntimeError(f"{stage_name} produced no result")
+    return cast(_RankStageResult, result)
+
+
+def rank_agreed_fail_stop(
+    stage_name: str,
+    group: mx.distributed.Group | None,
+    operation: Callable[[], _RankStageResult],
+) -> _RankStageResult:
+    """One-collective agreement for a hot-path local side effect."""
+
+    if group is None:
+        return operation()
+    result: _RankStageResult | None = None
+    operation_succeeded = False
+    local_error: Exception | None = None
+    try:
+        result = operation()
+        operation_succeeded = True
+    except Exception as error:
+        local_error = error
+    if mx_any(local_error is not None, group):
+        raise RuntimeError(
+            f"{stage_name} failed on at least one distributed rank"
+        ) from local_error
+    if not operation_succeeded:
+        raise RuntimeError(f"{stage_name} produced no result")
+    return cast(_RankStageResult, result)
+
+
 def shard_and_load(
     shard_metadata: ShardMetadata,
     group: mx.distributed.Group,
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
-    rank_local = load_configured_rank_local_model(shard_metadata, group)
-    if rank_local is not None:
+    rank_local_requested = os.environ.get(
+        RANK_LOCAL_CHECKPOINT_ENV
+    ) is not None and isinstance(shard_metadata, TensorShardMetadata)
+    if not mx_ranks_agree_on_value(int(rank_local_requested), group):
+        raise RuntimeError(
+            "rank-local checkpoint enablement diverged across distributed ranks"
+        )
+    if rank_local_requested:
         # The external loader shards the empty model structure before loading
         # its already-sliced tensors. Never retry this opt-in path through
         # load_model: doing so would materialize the full checkpoint per rank.
-        model_value = rank_local.model
-        if not isinstance(model_value, nn.Module):
-            raise TypeError("rank-local loader did not return an MLX module")
-        # load_rank_local_model already applies K3's native structural shard.
-        # Keep EXO's normal tensor-inference dependency patch, but do not call
-        # tensor_auto_parallel because that would shard the model a second time.
-        model = _patch_rank_local_tensor_model_once(model_value)
-        tokenizer = get_tokenizer(rank_local.checkpoint_path, shard_metadata)
-        yield ModelLoadingResponse(
-            layers_loaded=shard_metadata.n_layers,
-            total=shard_metadata.n_layers,
+        def preflight_local_rank() -> PreparedRankLocalLoad:
+            prepared = preflight_configured_rank_local_model(shard_metadata, group)
+            if prepared is None:
+                raise RuntimeError(
+                    "rank-local loader preflight unexpectedly returned disabled"
+                )
+            return prepared
+
+        prepared = rank_agreed_local_stage(
+            "rank-local loader preflight",
+            group,
+            preflight_local_rank,
+            lambda value: json.dumps(
+                {
+                    "checkpoint_template": value.checkpoint_template,
+                    "loader_path": str(value.runtime.loader_path),
+                    "verify_file_hashes": value.runtime.verify_file_hashes,
+                    "vocab_parallel_head": value.vocab_parallel_head,
+                    "loader_callable": (
+                        f"{type(value.load_model).__module__}."
+                        f"{type(value.load_model).__qualname__}"
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+        rank_local = rank_agreed_local_stage(
+            "external rank-local model load",
+            group,
+            lambda: load_preflighted_rank_local_model(prepared, group),
+            lambda loaded: json.dumps(
+                {
+                    "model_class": (
+                        f"{type(loaded.model).__module__}."
+                        f"{type(loaded.model).__qualname__}"
+                    ),
+                    "model_type": loaded.config.get("model_type"),
+                    "compatibility_transform": loaded.config.get(
+                        "_rank_local_compatibility_transform"
+                    ),
+                    "vocab_parallel_head": loaded.config.get(
+                        "_rank_local_vocab_parallel_head"
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+        def finish_local_rank() -> tuple[
+            nn.Module, TokenizerWrapper, Mapping[str, object]
+        ]:
+            model_value = rank_local.model
+            if not isinstance(model_value, nn.Module):
+                raise TypeError("rank-local loader did not return an MLX module")
+            # load_rank_local_model already applies K3's native structural shard.
+            # Keep EXO's normal tensor-inference dependency patch, but do not call
+            # tensor_auto_parallel because that would shard the model a second time.
+            model = _patch_rank_local_tensor_model_once(model_value)
+            tokenizer = get_tokenizer(rank_local.checkpoint_path, shard_metadata)
+            return model, tokenizer, rank_local.config
+
+        def local_rank_contract(
+            loaded: tuple[nn.Module, TokenizerWrapper, Mapping[str, object]],
+        ) -> str:
+            model, tokenizer, config = loaded
+            return json.dumps(
+                {
+                    "model_class": f"{type(model).__module__}.{type(model).__qualname__}",
+                    "tokenizer_class": (
+                        f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}"
+                    ),
+                    "model_type": config.get("model_type"),
+                    "compatibility_transform": config.get(
+                        "_rank_local_compatibility_transform"
+                    ),
+                    "vocab_parallel_head": config.get(
+                        "_rank_local_vocab_parallel_head"
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        model, tokenizer, _config = rank_agreed_local_stage(
+            "rank-local model/tokenizer finalization",
+            group,
+            finish_local_rank,
+            local_rank_contract,
         )
         mx_barrier(group)
         return model, tokenizer

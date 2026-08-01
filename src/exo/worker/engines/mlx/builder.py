@@ -1,4 +1,5 @@
 import contextlib
+import json
 import os
 from collections.abc import Generator
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ from .types import Model
 from .utils_mlx import (
     initialize_mlx,
     load_mlx_items,
+    rank_agreed_local_stage,
 )
 from .vision import VisionProcessor
 
@@ -55,11 +57,14 @@ class MlxBuilder(Builder):
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
         shard = bound_instance.bound_shard
-        self.dspark_config = kimi_k3_dspark_config(
-            is_pipeline=isinstance(shard, PipelineShardMetadata),
-            is_batch=os.environ.get("EXO_NO_BATCH") != "1",
-        )
-        if self.dspark_config is not None:
+
+        def configure_dspark() -> KimiK3DSparkConfig | None:
+            config = kimi_k3_dspark_config(
+                is_pipeline=isinstance(shard, PipelineShardMetadata),
+                is_batch=os.environ.get("EXO_NO_BATCH") != "1",
+            )
+            if config is None:
+                return None
             preflight_mlx_dspark_segmented_sdpa()
             if not isinstance(shard, TensorShardMetadata) or shard.world_size != 2:
                 raise DSparkConfigurationError(
@@ -69,19 +74,71 @@ class MlxBuilder(Builder):
                 raise DSparkConfigurationError(
                     "Kimi K3 DSpark requires an initialized two-rank MLX group"
                 )
+            return config
+
+        def dspark_config_contract(config: KimiK3DSparkConfig | None) -> str:
+            if config is None:
+                return "disabled"
+            return json.dumps(
+                {
+                    "checkpoint": str(config.checkpoint_path),
+                    "verify_width": config.verify_width,
+                    "round_telemetry": config.round_telemetry,
+                    "model_id": config.model_id,
+                    "revision": config.revision,
+                    "config_sha256": config.config_sha256,
+                    "model_bytes": config.model_bytes,
+                    "model_sha256": config.model_sha256,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        self.dspark_config = rank_agreed_local_stage(
+            "Kimi K3 DSpark configuration preflight",
+            self.group,
+            configure_dspark,
+            dspark_config_contract,
+        )
         (
             self.inference_model,
             self.tokenizer,
             self.vision_processor,
         ) = yield from load_mlx_items(bound_instance, self.group)
         if self.dspark_config is not None:
-            if self.vision_processor is not None:
-                raise DSparkConfigurationError(
-                    "Kimi K3 DSpark does not support vision models"
+            dspark_config = self.dspark_config
+
+            def load_dspark() -> LoadedMlxDSpark:
+                if self.vision_processor is not None:
+                    raise DSparkConfigurationError(
+                        "Kimi K3 DSpark does not support vision models"
+                    )
+                return load_replicated_mlx_dspark(
+                    dspark_config,
+                    self.inference_model,
                 )
-            self.dspark = load_replicated_mlx_dspark(
-                self.dspark_config,
-                self.inference_model,
+
+            self.dspark = rank_agreed_local_stage(
+                "Kimi K3 replicated draft load",
+                self.group,
+                load_dspark,
+                lambda loaded: json.dumps(
+                    {
+                        "vision_processor_present": self.vision_processor is not None,
+                        "placement": loaded.placement,
+                        "verify_width": loaded.verify_width,
+                        "drafter_class": (
+                            f"{type(loaded.drafter).__module__}."
+                            f"{type(loaded.drafter).__qualname__}"
+                        ),
+                        "proposer_class": (
+                            f"{type(loaded.proposer).__module__}."
+                            f"{type(loaded.proposer).__qualname__}"
+                        ),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
             )
 
     def close(self) -> None:

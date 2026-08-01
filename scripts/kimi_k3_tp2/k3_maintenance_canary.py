@@ -24,10 +24,10 @@ SCHEMA: Final = "k3-maintenance-canary/v1"
 INVENTORY_SCHEMA: Final = "k3-maintenance-canary-inventory/v1"
 FACTS_SCHEMA: Final = "k3-maintenance-canary-facts/v1"
 
-# Candidate sources. The separate MLX core pins below are retained only as
-# rollback/baseline evidence; they do not attest the candidate runtime.
+# Candidate sources plus distinct rollback/baseline evidence.
 EXO_DSPARK_CONTRACT_COMMIT: Final = "6eb59a4770d7a2efaa632c0b3f3df26fde545361"
-MLX_LM_DSPARK_COMMIT: Final = "1bcf43047a5a2c4a5be64f3c45ed33666981d1c1"
+MLX_LM_DSPARK_COMMIT: Final = "bf378e33831e745715a88418a44ce20ab1075b9b"
+MLX_DSPARK_COMMIT: Final = "2cfb83040011c273377a25df8ed16def80c6646c"
 MLX_ACCEPTED_COMMIT: Final = "57b87fe47cfce34d6dc59d0e274d8ee36bfb9308"
 MLX_FACTORIZED_COMMIT: Final = "152f01807c8327ac154b8ed56dd9279a6f9506e6"
 MLX_LM_FACTORIZED_WIRE_COMMIT: Final = "53dbe04a0499ffb3e98ede90ff5a82f118f77f04"
@@ -39,6 +39,18 @@ MLX_LM_KIMI_K3_DSPARK_SHA256: Final = (
 )
 MLX_LM_GATED_DELTA_SHA256: Final = (
     "44aef2791ed0cd5cfb84e31ef00cb4df3d40ae184e6c6852b7f0dba7406d2f78"
+)
+MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256: Final = (
+    "d51bf88fa603846f4ac9876faf724d273a99ca8b6643715f68df5993eb352d68"
+)
+MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256: Final = (
+    "0aa226e32b992e5bb18a14b4a3ead225b6a6f531431249e1ae6b5bbb35ca29d1"
+)
+MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256: Final = (
+    "2b9841394f8334e02044f2e6b418f0bc7ff41cc719a877464a311c5e8c899ee9"
+)
+MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256: Final = (
+    "82076bf9c0098f2fc72a0434a5482e72a6e022fc982574f05867dcce32645435"
 )
 
 DSPARK_REVISION: Final = "eb03982e58d4fb79bcfc099e902158f562e2e27b"
@@ -83,7 +95,10 @@ ACCEPTED_FLAGS: Final[dict[str, str]] = {
     "EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4": "0",
     "EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4": "0",
     "MLX_METAL_FAST_SYNCH": "1",
+    "MLX_METAL_K3_AFFINE8_ROWPAIR": "0",
+    "MLX_METAL_K3_PACKED_FRONT_ROWPAIR": "0",
     "MLX_LM_KIMI_K3_FUSED_EXPERTS": "1",
+    "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH2": "0",
     "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE": "1",
     "MLX_LM_KIMI_K3_FUSED_ROUTER": "1",
     "MLX_LM_KIMI_K3_FUSED_ATTNRES_RMS": "1",
@@ -93,6 +108,7 @@ ACCEPTED_FLAGS: Final[dict[str, str]] = {
     "MLX_LM_KIMI_K3_FUSED_POST_KDA_RMS_SIGMOID_GATE": "0",
     "MLX_LM_KIMI_K3_COMPILED_DECODE": "0",
     "MLX_LM_KIMI_K3_PACKED_MOE_FRONT": "0",
+    "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_WIDTH8": "0",
     "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT": "1",
     "MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL": "1",
     "MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE": "0",
@@ -322,6 +338,10 @@ required = {
     "mlx_lm_dspark": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/kimi_k3_dspark.py"),
     "mlx_lm_kimi_k3": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/kimi_k3.py"),
     "mlx_lm_gated_delta": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/gated_delta.py"),
+    "mlx_lm_kimi_k3_fused_expert": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/kimi_k3_fused_expert.py"),
+    "mlx_lm_kimi_k3_fused_switch_glu": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/kimi_k3_fused_switch_glu.py"),
+    "mlx_lm_kimi_k3_fused_down_reduce": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/kimi_k3_fused_down_reduce.py"),
+    "mlx_lm_kimi_k3_packed_moe_front": pathlib.Path(paths["mlx_lm_root"], "mlx_lm/models/kimi_k3_packed_moe_front.py"),
     "factorized_kernel": pathlib.Path(paths["factorized_mlx_root"], "mlx/backend/metal/kernels/steel/attn/kernels/steel_factorized_attention.h"),
     "rank_manifest": pathlib.Path(paths["rank_checkpoint"], "tp_manifest.json"),
     "transport": pathlib.Path(paths["transport_contract"]),
@@ -349,7 +369,15 @@ facts = {
     "required_files": {name: path.is_file() for name, path in required.items()},
     "mlx_lm_source_sha256": {
         name: digest(required[name]) if required[name].is_file() else None
-        for name in ("mlx_lm_kimi_k3", "mlx_lm_dspark", "mlx_lm_gated_delta")
+        for name in (
+            "mlx_lm_kimi_k3",
+            "mlx_lm_dspark",
+            "mlx_lm_gated_delta",
+            "mlx_lm_kimi_k3_fused_expert",
+            "mlx_lm_kimi_k3_fused_switch_glu",
+            "mlx_lm_kimi_k3_fused_down_reduce",
+            "mlx_lm_kimi_k3_packed_moe_front",
+        )
     },
     "dspark": {
         "path": str(dspark),
@@ -426,7 +454,7 @@ def validate_facts(node: Node, facts: Mapping[str, object]) -> list[str]:
     expected_commits = {
         "exo": EXO_DSPARK_CONTRACT_COMMIT,
         "mlx_lm": MLX_LM_DSPARK_COMMIT,
-        "mlx": MLX_ACCEPTED_COMMIT,
+        "mlx": MLX_DSPARK_COMMIT,
         "factorized_mlx": MLX_FACTORIZED_COMMIT,
     }
     for name, expected in expected_commits.items():
@@ -448,6 +476,10 @@ def validate_facts(node: Node, facts: Mapping[str, object]) -> list[str]:
         "mlx_lm_dspark",
         "mlx_lm_kimi_k3",
         "mlx_lm_gated_delta",
+        "mlx_lm_kimi_k3_fused_expert",
+        "mlx_lm_kimi_k3_fused_switch_glu",
+        "mlx_lm_kimi_k3_fused_down_reduce",
+        "mlx_lm_kimi_k3_packed_moe_front",
         "factorized_kernel",
         "rank_manifest",
         "transport",
@@ -459,6 +491,10 @@ def validate_facts(node: Node, facts: Mapping[str, object]) -> list[str]:
         "mlx_lm_kimi_k3": MLX_LM_KIMI_K3_SHA256,
         "mlx_lm_dspark": MLX_LM_KIMI_K3_DSPARK_SHA256,
         "mlx_lm_gated_delta": MLX_LM_GATED_DELTA_SHA256,
+        "mlx_lm_kimi_k3_fused_expert": MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256,
+        "mlx_lm_kimi_k3_fused_switch_glu": (MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256),
+        "mlx_lm_kimi_k3_fused_down_reduce": (MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256),
+        "mlx_lm_kimi_k3_packed_moe_front": (MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256),
     }
     for name, expected in expected_source_hashes.items():
         if source_hashes.get(name) != expected:
@@ -628,6 +664,35 @@ def _action_contract(inventory: Inventory) -> dict[str, object]:
     return contract
 
 
+def _action_prerequisite_errors(
+    action_contract: Mapping[str, object], action: str
+) -> list[str]:
+    """Validate only local immutable files needed to execute an action."""
+
+    errors: list[str] = []
+    action_value = _nested(action_contract, action)
+    if action_value.get("enabled") is not True:
+        return ["action is disabled"]
+    raw_steps = action_value.get("steps")
+    if not isinstance(raw_steps, list):
+        return ["action steps are malformed"]
+    for index, raw_step in enumerate(cast(list[object], raw_steps)):
+        step = _object(raw_step, f"actions.{action}.steps[{index}]")
+        required = _nested(step, "required_file_sha256")
+        for raw_path, expected in required.items():
+            path = Path(raw_path)
+            if not path.is_file():
+                errors.append(f"required local file is missing: {path}")
+                continue
+            digest = hashlib.sha256()
+            with path.open("rb") as source:
+                while chunk := source.read(8 << 20):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected:
+                errors.append(f"required local file hash mismatch: {path}")
+    return errors
+
+
 def build_plan(
     inventory: Inventory,
     facts_by_rank: Mapping[int, Mapping[str, object]],
@@ -652,27 +717,41 @@ def build_plan(
     def configured(action: str) -> bool:
         return _nested(action_contract, action).get("enabled") is True
 
+    action_prerequisites = {
+        action: _action_prerequisite_errors(action_contract, action)
+        for action in ACTIONS
+    }
+
+    def locally_ready(action: str) -> bool:
+        return configured(action) and not action_prerequisites[action]
+
     action_readiness = {
-        # A stop is the only mutation intentionally available when a hash,
-        # topology, or canary gate is bad.  The underlying harness still
-        # re-resolves the isolated two-node target before it stops anything.
-        "stop": configured("stop"),
-        "start-baseline": not all_errors and configured("start-baseline"),
-        "rollback": not all_errors and configured("rollback"),
+        # Stop and the two legacy actions are recovery controls, not candidate
+        # promotion. Their immutable local harness prerequisites remain
+        # fail-closed, while the harness re-resolves its pinned remote legacy
+        # source before mutation. Candidate-only fact failures must not disable
+        # the rollback promised by trigger_on_any_gate_failure.
+        "stop": locally_ready("stop"),
+        "start-baseline": locally_ready("start-baseline"),
+        "rollback": locally_ready("rollback"),
         "start-dspark-width3": (
             not all_errors
             and adapter_wired
             and en5_tb5_correlated
-            and configured("start-dspark-width3")
+            and locally_ready("start-dspark-width3")
         ),
         "start-dspark-width8": (
             not all_errors
             and adapter_wired
             and en5_tb5_correlated
-            and configured("start-dspark-width8")
+            and locally_ready("start-dspark-width8")
         ),
-        "start-factorized-off": (not all_errors and configured("start-factorized-off")),
-        "start-factorized-on": (not all_errors and configured("start-factorized-on")),
+        "start-factorized-off": (
+            not all_errors and locally_ready("start-factorized-off")
+        ),
+        "start-factorized-on": (
+            not all_errors and locally_ready("start-factorized-on")
+        ),
     }
     core: dict[str, object] = {
         "schema": SCHEMA,
@@ -680,9 +759,20 @@ def build_plan(
         "pins": {
             "exo_dspark_contract": EXO_DSPARK_CONTRACT_COMMIT,
             "mlx_lm_dspark": MLX_LM_DSPARK_COMMIT,
+            "mlx_dspark": MLX_DSPARK_COMMIT,
             "mlx_lm_kimi_k3_sha256": MLX_LM_KIMI_K3_SHA256,
             "mlx_lm_kimi_k3_dspark_sha256": MLX_LM_KIMI_K3_DSPARK_SHA256,
             "mlx_lm_gated_delta_sha256": MLX_LM_GATED_DELTA_SHA256,
+            "mlx_lm_kimi_k3_fused_expert_sha256": (MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256),
+            "mlx_lm_kimi_k3_fused_switch_glu_sha256": (
+                MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256
+            ),
+            "mlx_lm_kimi_k3_fused_down_reduce_sha256": (
+                MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256
+            ),
+            "mlx_lm_kimi_k3_packed_moe_front_sha256": (
+                MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256
+            ),
             "mlx_rollback_only_decode": MLX_ACCEPTED_COMMIT,
             "mlx_factorized_rollback_only": MLX_FACTORIZED_COMMIT,
             "mlx_lm_factorized_wire": MLX_LM_FACTORIZED_WIRE_COMMIT,
@@ -710,6 +800,7 @@ def build_plan(
         },
         "accepted_flags": ACCEPTED_FLAGS,
         "actions": action_contract,
+        "action_prerequisite_errors": action_prerequisites,
         "dspark_canary": _abba_plan(),
         "factorized_prefill_canary": _factorized_plan(),
         "rollback": {

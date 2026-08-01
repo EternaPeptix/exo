@@ -1,4 +1,6 @@
+import hashlib
 import itertools
+import json
 import time
 from collections import deque
 from collections.abc import Generator, Iterator
@@ -6,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import BinaryIO
 
 import mlx.core as mx
+from anyio import ClosedResourceError, WouldBlock
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.constants import EXO_MAX_CONCURRENT_REQUESTS
@@ -42,6 +45,8 @@ from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     mx_all_gather_tasks,
     mx_any,
+    rank_agreed_fail_stop,
+    rank_agreed_local_stage,
 )
 from exo.worker.engines.mlx.vision import VisionProcessor
 from exo.worker.runner.bootstrap import logger
@@ -68,6 +73,32 @@ class GeneratorQueue[T]:
 EXO_RUNNER_MUST_FAIL = "EXO RUNNER MUST FAIL"
 EXO_RUNNER_MUST_OOM = "EXO RUNNER MUST OOM"
 EXO_RUNNER_MUST_TIMEOUT = "EXO RUNNER MUST TIMEOUT"
+
+
+def _validate_collective_task_ids(tasks: list[TextGeneration]) -> None:
+    """Preflight task IDs before the first task-agreement collective."""
+
+    for task in tasks:
+        try:
+            encoded = task.task_id.encode("utf-8")
+        except (AttributeError, UnicodeError) as error:
+            raise ValueError(
+                "distributed MLX task IDs must be 36 UTF-8 bytes"
+            ) from error
+        if len(encoded) != 36:
+            raise ValueError("distributed MLX task IDs must be 36 UTF-8 bytes")
+
+
+def _task_digest(task: TextGeneration) -> str:
+    """Canonical request binding used before any DSpark-local side effects."""
+
+    payload = json.dumps(
+        task.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _check_for_debug_prompts(task_params: TextGenerationTaskParams) -> None:
@@ -140,6 +171,16 @@ class SequentialGenerator(Engine):
 
     def agree_on_tasks(self) -> None:
         """Agree between all ranks about the task ordering (some may have received in different order or not at all)."""
+        local_error: Exception | None = None
+        try:
+            _validate_collective_task_ids(self._maybe_queue)
+        except Exception as error:
+            local_error = error
+        if mx_any(local_error is not None, self.group):
+            raise RuntimeError(
+                "distributed MLX task-ID preflight failed on at least one rank"
+            ) from local_error
+
         agreed, different = mx_all_gather_tasks(self._maybe_queue, self.group)
         # Extend from `agreed` (sorted by task_id on all ranks) to guarantee every
         # rank enqueues tasks in the same order, preventing TP collective deadlocks.
@@ -149,12 +190,22 @@ class SequentialGenerator(Engine):
     def agree_on_cancellations(self) -> None:
         """Agree between all ranks about which tasks to cancel."""
         has_cancel_all = False
-        for task_id in self.cancel_receiver.collect():
-            if task_id == CANCEL_ALL_TASKS:
-                has_cancel_all = True
-                continue
-            if task_id in self._all_tasks:
-                self._maybe_cancel.append(self._all_tasks[task_id])
+        local_error: Exception | None = None
+        try:
+            for task_id in self.cancel_receiver.collect():
+                if task_id == CANCEL_ALL_TASKS:
+                    has_cancel_all = True
+                    continue
+                if task_id in self._all_tasks:
+                    self._maybe_cancel.append(self._all_tasks[task_id])
+            _validate_collective_task_ids(self._maybe_cancel)
+        except Exception as error:
+            local_error = error
+
+        if mx_any(local_error is not None, self.group):
+            raise RuntimeError(
+                "distributed MLX cancellation collection failed on at least one rank"
+            ) from local_error
 
         if mx_any(has_cancel_all, self.group):
             self._cancelled_tasks.add(CANCEL_ALL_TASKS)
@@ -187,9 +238,42 @@ class SequentialGenerator(Engine):
         try:
             response = next(gen)
             queue.push(response)
-            # drain potentially many responses every time
-            while (parsed := next(output_generator, None)) is not None:
-                output.append((task.task_id, parsed))
+
+            def drain_parsed() -> list[tuple[TaskId, GenerationChunk]]:
+                parsed_output: list[tuple[TaskId, GenerationChunk]] = []
+                # Drain potentially many responses every time.
+                while (parsed := next(output_generator, None)) is not None:
+                    parsed_output.append((task.task_id, parsed))
+                return parsed_output
+
+            if self.dspark is not None:
+
+                def drain_and_publish() -> None:
+                    for _task_id, parsed in drain_parsed():
+                        if self.device_rank == 0:
+                            # A blocking queue put would prevent rank 0 from
+                            # reaching the fail-stop collective when the runner
+                            # channel is full. Convert full/closed channels into
+                            # rank-agreed request failure instead.
+                            self.event_sender.send_nowait(
+                                ChunkGenerated(
+                                    command_id=task.command_id,
+                                    chunk=parsed,
+                                )
+                            )
+
+                # DSpark must not let one rank enter the next speculative round or
+                # queued request when local parsing or rank-0 publication failed.
+                # Publication is completed here, so these chunks must not also
+                # reach Runner. This is one scalar collective for every yielded
+                # DSpark response, including the terminal response.
+                rank_agreed_fail_stop(
+                    "Kimi K3 DSpark parser/publication",
+                    self.group,
+                    drain_and_publish,
+                )
+            else:
+                output.extend(drain_parsed())
 
         except (StopIteration, PrefillCancelled):
             output.append((task.task_id, FinishedResponse()))
@@ -215,40 +299,81 @@ class SequentialGenerator(Engine):
     def _start_next(self) -> None:
         task = self._queue.popleft()
         try:
-            gen = self._build_generator(task)
+            if self.dspark is not None:
+                task_digest = rank_agreed_local_stage(
+                    "Kimi K3 DSpark task binding",
+                    self.group,
+                    lambda: _task_digest(task),
+                    lambda digest: digest,
+                )
+
+                def prepare_request() -> tuple[
+                    Generator[GenerationResponse],
+                    GeneratorQueue[GenerationResponse],
+                    Iterator[GenerationChunk | None],
+                ]:
+                    gen = self._build_generator(task)
+                    queue = GeneratorQueue[GenerationResponse]()
+                    return gen, queue, self._build_output_generator(task, queue)
+
+                gen, queue, output_generator = rank_agreed_local_stage(
+                    "Kimi K3 DSpark request preparation",
+                    self.group,
+                    prepare_request,
+                    lambda prepared: (
+                        f"{task_digest}:"
+                        f"{type(prepared[0]).__module__}."
+                        f"{type(prepared[0]).__qualname__}:"
+                        f"{type(prepared[2]).__module__}."
+                        f"{type(prepared[2]).__qualname__}"
+                    ),
+                )
+            else:
+                gen = self._build_generator(task)
+                queue = GeneratorQueue[GenerationResponse]()
+                output_generator = self._build_output_generator(task, queue)
         except Exception as e:
             self._send_error(task, e)
             raise
-        queue = GeneratorQueue[GenerationResponse]()
-
-        if task.task_params.bench:
-            output_generator: Iterator[GenerationChunk | None] = map(
-                lambda r: map_responses_to_chunks(r, self.model_id), queue.gen()
-            )
-        else:
-            output_generator = apply_all_parsers(
-                queue.gen(),
-                apply_chat_template(self.tokenizer, task.task_params),
-                self.tool_parser,
-                self.tokenizer,
-                type(self.model),
-                self.model_id,
-                task.task_params.tools,
-            )
         self._active = (task, gen, queue, output_generator)
+
+    def _build_output_generator(
+        self,
+        task: TextGeneration,
+        queue: GeneratorQueue[GenerationResponse],
+    ) -> Iterator[GenerationChunk | None]:
+        if task.task_params.bench:
+            return map(lambda r: map_responses_to_chunks(r, self.model_id), queue.gen())
+        return apply_all_parsers(
+            queue.gen(),
+            apply_chat_template(self.tokenizer, task.task_params),
+            self.tool_parser,
+            self.tokenizer,
+            type(self.model),
+            self.model_id,
+            task.task_params.tools,
+        )
 
     def _send_error(self, task: TextGeneration, e: Exception) -> None:
         if self.device_rank == 0:
-            self.event_sender.send(
-                ChunkGenerated(
-                    command_id=task.command_id,
-                    chunk=ErrorChunk(
-                        model=self.model_id,
-                        finish_reason="error",
-                        error_message=str(e),
-                    ),
-                )
+            event = ChunkGenerated(
+                command_id=task.command_id,
+                chunk=ErrorChunk(
+                    model=self.model_id,
+                    finish_reason="error",
+                    error_message=str(e),
+                ),
             )
+            if self.dspark is None:
+                self.event_sender.send(event)
+                return
+            try:
+                self.event_sender.send_nowait(event)
+            except (ClosedResourceError, WouldBlock):
+                logger.warning(
+                    "Kimi K3 DSpark error event could not be published without "
+                    "blocking; the rank-agreed request failure is preserved"
+                )
 
     def _build_generator(self, task: TextGeneration) -> Generator[GenerationResponse]:
         _check_for_debug_prompts(task.task_params)
@@ -256,16 +381,21 @@ class SequentialGenerator(Engine):
 
         def on_prefill_progress(processed: int, total: int) -> None:
             if self.device_rank == 0:
-                self.event_sender.send(
-                    ChunkGenerated(
-                        command_id=task.command_id,
-                        chunk=PrefillProgressChunk(
-                            model=self.model_id,
-                            processed_tokens=processed,
-                            total_tokens=total,
-                        ),
-                    )
+                event = ChunkGenerated(
+                    command_id=task.command_id,
+                    chunk=PrefillProgressChunk(
+                        model=self.model_id,
+                        processed_tokens=processed,
+                        total_tokens=total,
+                    ),
                 )
+                if self.dspark is None:
+                    self.event_sender.send(event)
+                else:
+                    # DSpark wraps this callback in its rank-agreed local-side-
+                    # effect stage. A blocking put would keep rank 0 from
+                    # reaching that agreement when the runner queue is full.
+                    self.event_sender.send_nowait(event)
 
         def distributed_prompt_progress_callback() -> None:
             self.agree_on_cancellations()

@@ -57,10 +57,10 @@ MLX_LM_KIMI_K3_SHA256 = (
 SOURCE_CONFIG_SHA256 = (
     "d041003554810a367bb600d18733976bdd21041bb46e75cc1e27c7b15fe034d0"
 )
-SOURCE_INDEX_SHA256 = (
-    "ac65bcb3cd9e07cab3e7942ff455dde33879a9e02211bae40938e22fc204ae09"
-)
+SOURCE_INDEX_SHA256 = "ac65bcb3cd9e07cab3e7942ff455dde33879a9e02211bae40938e22fc204ae09"
 SCHEMA = "k3-rank-local-tp/v2"
+LEGACY_SCHEMA = "k3-rank-local-tp/v1"
+JOURNAL_SCHEMAS = frozenset({LEGACY_SCHEMA, SCHEMA})
 SHARD_AUDIT_SCHEMA = "k3-rank-local-tp-shard-audit/v1"
 SHARD_CONVERSION_SCHEMA = "k3-rank-local-tp-shard-conversion/v1"
 CONTRACT_VERSION = "mlx-lm-kimi-k3-shard@7d505c2"
@@ -266,8 +266,7 @@ class SafeTensorFile:
         for name, info in header.items():
             if name == "__metadata__":
                 if not isinstance(info, dict) or not all(
-                    isinstance(k, str) and isinstance(v, str)
-                    for k, v in info.items()
+                    isinstance(k, str) and isinstance(v, str) for k, v in info.items()
                 ):
                     raise ConversionError(f"{self.path}: invalid __metadata__")
                 self.metadata = dict(info)
@@ -309,9 +308,7 @@ class SafeTensorFile:
         previous_end = 0
         for start, end, name in occupied:
             if start < previous_end:
-                raise ConversionError(
-                    f"{self.path}:{name}: overlapping tensor data"
-                )
+                raise ConversionError(f"{self.path}:{name}: overlapping tensor data")
             previous_end = end
 
         self._mmap = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
@@ -383,9 +380,7 @@ def _copy_plan(
     suffix = math.prod(plan.source.shape[axis + 1 :])
     reshaped = array.reshape(prefix, axis_size, suffix)
     output_axis = sum(end - start for start, end in plan.intervals)
-    bytes_per_prefix = max(
-        1, output_axis * suffix * plan.source.itemsize
-    )
+    bytes_per_prefix = max(1, output_axis * suffix * plan.source.itemsize)
     rows_per_chunk = max(1, max_buffer_bytes // bytes_per_prefix)
 
     for row in range(0, prefix, rows_per_chunk):
@@ -466,12 +461,9 @@ def write_rank_shard(
                 f"{tmp}: wrote {tmp.stat().st_size}, expected {expected_size}"
             )
         with SafeTensorFile(tmp) as check:
-            expected = {
-                p.source.name: (p.source.dtype, p.output_shape) for p in plans
-            }
+            expected = {p.source.name: (p.source.dtype, p.output_shape) for p in plans}
             actual = {
-                name: (desc.dtype, desc.shape)
-                for name, desc in check.tensors.items()
+                name: (desc.dtype, desc.shape) for name, desc in check.tensors.items()
             }
             if actual != expected:
                 raise ConversionError(
@@ -621,9 +613,7 @@ class KimiK3ShardingContract:
                 return self._a2s("MLA output gate heads")
             if suffix.startswith("self_attn.o_proj."):
                 return self._s2a("MLA output projection input")
-            if suffix.startswith(
-                ("self_attn.embed_q.", "self_attn.unembed_out.")
-            ):
+            if suffix.startswith(("self_attn.embed_q.", "self_attn.unembed_out.")):
                 return self._axis(0, "MLA per-head MultiLinear")
 
         if self.is_moe(layer):
@@ -752,6 +742,240 @@ def _safe_repo_relative_name(name: str) -> str:
     return name
 
 
+def _safe_checkpoint_basename(name: object, field: str) -> str:
+    """Return a journal-controlled output basename or fail closed."""
+
+    if not isinstance(name, str):
+        raise ConversionError(f"existing journal {field} must be a string")
+    _safe_repo_relative_name(name)
+    if "/" in name or Path(name).name != name:
+        raise ConversionError(
+            f"existing journal {field} must be a safe checkpoint basename"
+        )
+    return name
+
+
+def _journal_int(value: object, field: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ConversionError(
+            f"existing journal {field} must be an integer >= {minimum}"
+        )
+    return value
+
+
+def _journal_sha256(value: object, field: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ConversionError(
+            f"existing journal {field} must be a lowercase SHA-256 digest"
+        )
+    return value
+
+
+def _validate_journal_source_record(value: object, field: str) -> None:
+    if not isinstance(value, dict):
+        raise ConversionError(f"existing journal {field} must be an object")
+    _journal_int(value.get("bytes"), f"{field}.bytes")
+    _journal_sha256(value.get("sha256"), f"{field}.sha256")
+    url = value.get("url")
+    if url is not None and not isinstance(url, str):
+        raise ConversionError(f"existing journal {field}.url must be a string or null")
+    if type(value.get("resumed")) is not bool:
+        raise ConversionError(f"existing journal {field}.resumed must be a boolean")
+
+
+def _validate_journal_rank_record(
+    value: object,
+    *,
+    filename: str,
+    indexed_keys: set[str],
+    contract: KimiK3ShardingContract,
+    rank: int,
+    field: str,
+) -> tuple[TensorPlan, ...]:
+    if not isinstance(value, dict):
+        raise ConversionError(f"existing journal {field} must be an object")
+    record_name = _safe_checkpoint_basename(value.get("name"), f"{field}.name")
+    if record_name != filename:
+        raise ConversionError(
+            f"existing journal {field}.name does not match its file key"
+        )
+    _journal_int(value.get("bytes"), f"{field}.bytes", minimum=1)
+    _journal_sha256(value.get("sha256"), f"{field}.sha256")
+    tensor_count = _journal_int(
+        value.get("tensor_count"), f"{field}.tensor_count", minimum=1
+    )
+    tensors = value.get("tensors")
+    if not isinstance(tensors, dict):
+        raise ConversionError(f"existing journal {field}.tensors must be an object")
+
+    expected_keys = {
+        name for name in indexed_keys if contract.classify(name, 1).kind != "excluded"
+    }
+    if set(tensors) != expected_keys:
+        raise ConversionError(
+            f"existing journal {field}.tensors does not match the pinned weight index"
+        )
+    if tensor_count != len(tensors):
+        raise ConversionError(
+            f"existing journal {field}.tensor_count does not match its tensor map"
+        )
+
+    plans: list[TensorPlan] = []
+    for tensor_name, tensor_value in tensors.items():
+        tensor_field = f"{field}.tensors[{tensor_name!r}]"
+        if not isinstance(tensor_name, str) or not tensor_name:
+            raise ConversionError(
+                f"existing journal {field}.tensors keys must be non-empty strings"
+            )
+        if not isinstance(tensor_value, dict):
+            raise ConversionError(f"existing journal {tensor_field} must be an object")
+        dtype = tensor_value.get("dtype")
+        if not isinstance(dtype, str) or dtype not in DTYPES:
+            raise ConversionError(
+                f"existing journal {tensor_field}.dtype is unsupported"
+            )
+        source_shape = tensor_value.get("source_shape")
+        if (
+            not isinstance(source_shape, list)
+            or not source_shape
+            or any(
+                type(dimension) is not int or dimension <= 0
+                for dimension in source_shape
+            )
+        ):
+            raise ConversionError(
+                f"existing journal {tensor_field}.source_shape is invalid"
+            )
+        desc = TensorDesc(
+            tensor_name,
+            dtype,
+            tuple(source_shape),
+            0,
+            math.prod(source_shape) * DTYPES[dtype][1],
+        )
+        plan = contract.plan(desc, rank)
+        if plan is None or tensor_value != _tensor_manifest(plan, filename):
+            raise ConversionError(
+                f"existing journal {tensor_field} does not match the TP contract"
+            )
+        plans.append(plan)
+    return tuple(plans)
+
+
+def _validate_resume_journal(
+    journal: dict,
+    *,
+    config_sha256: str,
+    index_sha256: str,
+    world_size: int,
+    contract: KimiK3ShardingContract,
+    keys_by_file: Mapping[str, set[str]],
+) -> dict:
+    """Authenticate every field later trusted by source-free resume.
+
+    Version 1 journals used the same committed-shard record layout.  They are
+    deliberately accepted, fully revalidated, and marked v2 so the normal
+    final journal write completes the metadata-only migration.
+    """
+
+    schema = journal.get("schema")
+    if schema not in JOURNAL_SCHEMAS:
+        raise ConversionError(f"existing journal has unsupported schema {schema!r}")
+    expected_scalars: tuple[tuple[str, object], ...] = (
+        ("source_repo", SOURCE_REPO),
+        ("source_revision", SOURCE_REVISION),
+        ("config_sha256", config_sha256),
+        ("index_sha256", index_sha256),
+        ("world_size", world_size),
+        ("contract_digest", contract.contract_digest()),
+    )
+    for field, expected in expected_scalars:
+        value = journal.get(field)
+        if type(value) is not type(expected) or value != expected:
+            raise ConversionError(
+                f"existing journal {field} does not match the pinned conversion"
+            )
+    if type(journal.get("complete")) is not bool:
+        raise ConversionError("existing journal complete must be a boolean")
+    if journal["complete"] and not isinstance(journal.get("completed_at"), str):
+        raise ConversionError(
+            "existing completed journal must contain a completed_at string"
+        )
+
+    files = journal.get("files")
+    if not isinstance(files, dict):
+        raise ConversionError("existing journal files must be an object")
+    known_files = set(keys_by_file)
+    for filename_value, entry in files.items():
+        filename = _safe_checkpoint_basename(filename_value, "files key")
+        if filename not in known_files:
+            raise ConversionError(
+                f"existing journal contains unindexed checkpoint file {filename!r}"
+            )
+        field = f"files[{filename!r}]"
+        if not isinstance(entry, dict):
+            raise ConversionError(f"existing journal {field} must be an object")
+        committed = entry.get("committed")
+        excluded = entry.get("excluded")
+        if type(committed) is not bool or type(excluded) is not bool:
+            raise ConversionError(
+                f"existing journal {field} committed/excluded must be booleans"
+            )
+        _validate_journal_source_record(entry.get("source"), f"{field}.source")
+        ranks = entry.get("ranks")
+        if not isinstance(ranks, dict):
+            raise ConversionError(f"existing journal {field}.ranks must be an object")
+        if not committed:
+            if ranks:
+                raise ConversionError(
+                    f"existing uncommitted journal {field} cannot contain rank records"
+                )
+            continue
+
+        indexed_keys = keys_by_file[filename]
+        expected_tensor_keys = {
+            name
+            for name in indexed_keys
+            if contract.classify(name, 1).kind != "excluded"
+        }
+        if excluded != (not expected_tensor_keys):
+            raise ConversionError(
+                f"existing journal {field}.excluded disagrees with the TP contract"
+            )
+        expected_rank_keys = (
+            set() if excluded else {str(rank) for rank in range(world_size)}
+        )
+        if set(ranks) != expected_rank_keys:
+            raise ConversionError(
+                f"existing journal {field}.ranks does not match TP world size"
+            )
+        for rank_key, record in ranks.items():
+            if (
+                not isinstance(rank_key, str)
+                or not rank_key.isascii()
+                or not rank_key.isdecimal()
+            ):
+                raise ConversionError(
+                    f"existing journal {field}.ranks keys must be canonical rank strings"
+                )
+            rank = int(rank_key)
+            if str(rank) != rank_key:
+                raise ConversionError(
+                    f"existing journal {field}.ranks keys must be canonical rank strings"
+                )
+            _validate_journal_rank_record(
+                record,
+                filename=filename,
+                indexed_keys=indexed_keys,
+                contract=contract,
+                rank=rank,
+                field=f"{field}.ranks[{rank_key!r}]",
+            )
+
+    journal["schema"] = SCHEMA
+    return journal
+
+
 def _validate_pinned_metadata_objects(
     config: dict, index: dict, source: str = "metadata"
 ) -> tuple[dict, dict]:
@@ -792,9 +1016,7 @@ def _validate_pinned_metadata(config_path: Path, index_path: Path) -> tuple[dict
 
 def _download_url(repo: str, revision: str, filename: str) -> str:
     safe_repo = "/".join(urllib.parse.quote(x, safe="") for x in repo.split("/"))
-    safe_file = "/".join(
-        urllib.parse.quote(x, safe="") for x in filename.split("/")
-    )
+    safe_file = "/".join(urllib.parse.quote(x, safe="") for x in filename.split("/"))
     return f"https://huggingface.co/{safe_repo}/resolve/{revision}/{safe_file}"
 
 
@@ -870,7 +1092,9 @@ def _open_regular_readonly(path: Path) -> int:
     try:
         fd = os.open(path, flags)
     except OSError as exc:
-        raise ConversionError(f"{path}: cannot safely open metadata file: {exc}") from exc
+        raise ConversionError(
+            f"{path}: cannot safely open metadata file: {exc}"
+        ) from exc
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ConversionError(f"{path}: metadata entry must be a regular file")
@@ -988,9 +1212,7 @@ def _copy_metadata_files(
     published: list[tuple[Path, Path]] = []
     try:
         for src, dst, expected_sha256 in destinations:
-            staged.append(
-                (_stage_metadata_file(src, dst, expected_sha256), dst)
-            )
+            staged.append((_stage_metadata_file(src, dst, expected_sha256), dst))
         for tmp, dst in staged:
             try:
                 os.link(tmp, dst)
@@ -1036,7 +1258,7 @@ def _existing_output_valid(
     rank: int,
     world_size: int,
 ) -> bool:
-    if not path.exists():
+    if path.is_symlink() or not path.is_file():
         return False
     try:
         with SafeTensorFile(path) as safe:
@@ -1049,9 +1271,7 @@ def _existing_output_valid(
             expected_headers = {
                 p.source.name: (p.source.dtype, p.output_shape) for p in expected
             }
-            actual_headers = {
-                k: (v.dtype, v.shape) for k, v in safe.tensors.items()
-            }
+            actual_headers = {k: (v.dtype, v.shape) for k, v in safe.tensors.items()}
             return expected_headers == actual_headers
     except (OSError, ConversionError):
         return False
@@ -1118,13 +1338,14 @@ def convert_checkpoint(
 
     journal_path = metadata_dir / "tp-conversion-journal.json"
     if journal_path.exists():
-        journal = _load_json(journal_path)
-        if journal.get("source_revision") != SOURCE_REVISION:
-            raise ConversionError("existing journal is for a different revision")
-        if journal.get("config_sha256") != config_sha:
-            raise ConversionError("config changed since conversion began")
-        if journal.get("index_sha256") != index_sha:
-            raise ConversionError("weight index changed since conversion began")
+        journal = _validate_resume_journal(
+            _load_json(journal_path),
+            config_sha256=config_sha,
+            index_sha256=index_sha,
+            world_size=world_size,
+            contract=contract,
+            keys_by_file=keys_by_file,
+        )
     else:
         journal = {
             "schema": SCHEMA,
@@ -1171,10 +1392,25 @@ def convert_checkpoint(
                     all_present = False
                     break
                 path = root / record["name"]
+                expected_plans = _validate_journal_rank_record(
+                    record,
+                    filename=filename,
+                    indexed_keys=indexed_keys,
+                    contract=contract,
+                    rank=rank,
+                    field=f"files[{filename!r}].ranks[{rank!r}]",
+                )
                 if (
-                    not path.exists()
+                    path.is_symlink()
+                    or not path.is_file()
                     or path.stat().st_size != record["bytes"]
                     or _sha256_file(path) != record["sha256"]
+                    or not _existing_output_valid(
+                        path,
+                        expected_plans,
+                        rank,
+                        world_size,
+                    )
                 ):
                     all_present = False
                     break
@@ -1287,9 +1523,7 @@ def convert_checkpoint(
         index_payload = {
             "metadata": {
                 "total_size": rank_total_data[rank],
-                "source_total_parameters": source_index["metadata"][
-                    "total_parameters"
-                ],
+                "source_total_parameters": source_index["metadata"]["total_parameters"],
                 "tp_rank": rank,
                 "tp_world_size": world_size,
                 "source_revision": SOURCE_REVISION,
@@ -1414,9 +1648,7 @@ def audit_shard(metadata_dir: Path, shard_path: Path) -> dict:
                 f"bytes, physical payload has {physical_payload_bytes}"
             )
 
-        plans_by_rank: list[list[TensorPlan]] = [
-            [] for _ in range(DEFAULT_WORLD_SIZE)
-        ]
+        plans_by_rank: list[list[TensorPlan]] = [[] for _ in range(DEFAULT_WORLD_SIZE)]
         for desc in source.tensors.values():
             rule = contract.classify(desc.name, len(desc.shape))
             if rule.kind == "excluded":
@@ -1468,7 +1700,9 @@ def audit_shard(metadata_dir: Path, shard_path: Path) -> dict:
                             "rank_bytes": plan.output_nbytes,
                             "rule": plan.rule.canonical(),
                             "resolved_axis": plan.axis,
-                            "intervals": [list(interval) for interval in plan.intervals],
+                            "intervals": [
+                                list(interval) for interval in plan.intervals
+                            ],
                         }
                         for plan in plans
                     ],
@@ -1543,8 +1777,7 @@ def _validated_rank_output(
     checksum = _sha256_file(path)
     if checksum != record["sha256"]:
         raise ConversionError(
-            f"{path}: post-write checksum {checksum} does not match "
-            f"{record['sha256']}"
+            f"{path}: post-write checksum {checksum} does not match {record['sha256']}"
         )
     return checksum
 
@@ -1625,9 +1858,7 @@ def convert_shard(
     published_paths: list[Path] = []
     records: list[dict] = []
     checksums: list[str] = []
-    plans_by_rank: list[list[TensorPlan]] = [
-        [] for _ in range(DEFAULT_WORLD_SIZE)
-    ]
+    plans_by_rank: list[list[TensorPlan]] = [[] for _ in range(DEFAULT_WORLD_SIZE)]
     try:
         write_partial_paths: list[Path] = []
         for rank, directory in enumerate(rank_dirs):

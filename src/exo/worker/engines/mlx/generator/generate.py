@@ -1,5 +1,6 @@
 import contextlib
 import functools
+import hashlib
 import math
 import os
 import time
@@ -66,6 +67,8 @@ from exo.worker.engines.mlx.constants import (
     MAX_TOKENS,
 )
 from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
+    DSparkDecodedToken,
+    DSparkDistributedStateError,
     DSparkRoundTelemetry,
     KimiK3DSparkRequestRuntime,
     LoadedMlxDSpark,
@@ -81,6 +84,7 @@ from exo.worker.engines.mlx.utils_mlx import (
     fix_unmatched_think_end_tokens,
     mx_barrier,
     mx_ranks_agree_on_value,
+    rank_agreed_local_stage,
     system_prompt_token_count,
 )
 from exo.worker.engines.mlx.vision import (
@@ -106,12 +110,46 @@ class _PromptLookupConfig:
     round_telemetry: bool
 
 
+class _DSparkDetokenizer(Protocol):
+    last_segment: str
+
+    def reset(self) -> None: ...
+
+    def add_token(self, token: int) -> None: ...
+
+    def finalize(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class _DSparkRequestSetup:
+    """Local DSpark request state agreed before any target TP collective."""
+
+    is_pipeline: bool
+    prompt_lookup_configuration: _PromptLookupConfig | None
+    all_prompt_tokens: mx.array
+    caches: KVCacheType
+    logits_processors: list[Callable[[mx.array, mx.array], mx.array]]
+    sampler: Callable[[mx.array], mx.array]
+    stop_sequences: tuple[str, ...]
+    max_stop_len: int
+    max_tokens: int
+    is_bench: bool
+    eos_token_ids: tuple[int, ...]
+    anchor_token: int
+    detokenizer: _DSparkDetokenizer
+    empty_logprobs: mx.array
+    prefill_step_size: int
+    runtime: KimiK3DSparkRequestRuntime
+    fingerprint: tuple[int, ...]
+
+
 @dataclass
 class _PromptLookupTelemetry:
     rounds: int = 0
     drafted_tokens: int = 0
     accepted_tokens: int = 0
     committed_tokens: int = 0
+    visible_accepted_tokens: int = 0
     fallback_rounds: int = 0
     error_rounds: int = 0
 
@@ -136,6 +174,11 @@ class _PromptLookupTelemetry:
         self.committed_tokens += stats.emitted
         self.fallback_rounds += int(stats.fallback)
         self.error_rounds += int(stats.error is not None)
+
+    def observe_visible_token(self, *, from_draft: bool) -> None:
+        """Track accepted predictions that remain in the public completion."""
+
+        self.visible_accepted_tokens += int(from_draft)
 
 
 class _SpeculativeRoundStatsLike(Protocol):
@@ -171,16 +214,6 @@ class _PromptLookupStreamGenerate(Protocol):
         ),
         **kwargs: object,
     ) -> Generator[MlxGenerationResponse, None, None]: ...
-
-
-class _DSparkDetokenizer(Protocol):
-    last_segment: str
-
-    def reset(self) -> None: ...
-
-    def add_token(self, token: int) -> None: ...
-
-    def finalize(self) -> None: ...
 
 
 def _strict_env_int(name: str, value: str, *, minimum: int, maximum: int) -> int:
@@ -864,38 +897,61 @@ def warmup_inference(
 ) -> int:
     logger.info(f"warming up inference for instance: {model_id}")
 
-    content = InputMessageContent(
-        "Prompt to warm up the inference engine. Repeat this."
-    )
-
-    default_warmup_tokens = (
-        4 if model_id == ModelId("kernelpool/Kimi-K3-2bit-UVMAX") else 50
-    )
-    try:
-        warmup_tokens = int(
-            os.environ.get(
-                "EXO_MLX_WARMUP_OUTPUT_TOKENS",
-                str(default_warmup_tokens),
-            )
+    def prepare_warmup() -> tuple[TextGenerationTaskParams, str, int, int]:
+        content = InputMessageContent(
+            "Prompt to warm up the inference engine. Repeat this."
         )
-    except ValueError as error:
-        raise ValueError("EXO_MLX_WARMUP_OUTPUT_TOKENS must be an integer") from error
-    if not 1 <= warmup_tokens <= 256:
-        raise ValueError("EXO_MLX_WARMUP_OUTPUT_TOKENS must be between 1 and 256")
-    if dspark is not None:
-        warmup_tokens = max(warmup_tokens, 2 * dspark.verify_width)
+        default_warmup_tokens = (
+            4 if model_id == ModelId("kernelpool/Kimi-K3-2bit-UVMAX") else 50
+        )
+        try:
+            warmup_tokens = int(
+                os.environ.get(
+                    "EXO_MLX_WARMUP_OUTPUT_TOKENS",
+                    str(default_warmup_tokens),
+                )
+            )
+        except ValueError as error:
+            raise ValueError(
+                "EXO_MLX_WARMUP_OUTPUT_TOKENS must be an integer"
+            ) from error
+        if not 1 <= warmup_tokens <= 256:
+            raise ValueError("EXO_MLX_WARMUP_OUTPUT_TOKENS must be between 1 and 256")
+        verify_width = 0
+        if dspark is not None:
+            verify_width = dspark.verify_width
+            warmup_tokens = max(warmup_tokens, 2 * verify_width)
 
-    warmup_task_params = TextGenerationTaskParams(
-        model=model_id,
-        input=[InputMessage(role="user", content=content)],
-        max_output_tokens=warmup_tokens,
-        temperature=0.0,
-        bench=dspark is not None,
-    )
+        task = TextGenerationTaskParams(
+            model=model_id,
+            input=[InputMessage(role="user", content=content)],
+            max_output_tokens=warmup_tokens,
+            temperature=0.0,
+            bench=dspark is not None,
+        )
+        prompt = apply_chat_template(
+            tokenizer=tokenizer,
+            task_params=task,
+        )
+        return task, prompt, warmup_tokens, verify_width
 
-    warmup_prompt = apply_chat_template(
-        tokenizer=tokenizer,
-        task_params=warmup_task_params,
+    def warmup_contract(
+        setup: tuple[TextGenerationTaskParams, str, int, int],
+    ) -> str:
+        _task, prompt, warmup_tokens, verify_width = setup
+        prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        return (
+            f"{model_id}\0{int(dspark is not None)}\0{verify_width}\0"
+            f"{warmup_tokens}\0{prompt_digest}"
+        )
+
+    warmup_task_params, warmup_prompt, _warmup_tokens, verify_width = (
+        rank_agreed_local_stage(
+            "inference warmup setup",
+            group,
+            prepare_warmup,
+            warmup_contract,
+        )
     )
 
     tokens_generated = 0
@@ -920,24 +976,41 @@ def warmup_inference(
         if response.stats is not None:
             final_stats = response.stats
 
-    if dspark is not None:
-        required_drafted = 2 * (dspark.verify_width - 1)
-        if tokens_generated < 2 * dspark.verify_width or final_stats is None:
-            raise RuntimeError(
-                "Kimi K3 DSpark warmup did not complete its two-round output budget"
+    def validate_warmup() -> tuple[int, tuple[int, ...]]:
+        if dspark is not None:
+            required_drafted = 2 * (verify_width - 1)
+            if tokens_generated < 2 * verify_width or final_stats is None:
+                raise RuntimeError(
+                    "Kimi K3 DSpark warmup did not complete its two-round output budget"
+                )
+            if (
+                final_stats.speculative_rounds < 2
+                or final_stats.speculative_drafted_tokens < required_drafted
+                or final_stats.speculative_fallback_rounds != 0
+                or final_stats.speculative_error_rounds != 0
+            ):
+                raise RuntimeError(
+                    "Kimi K3 DSpark warmup did not complete two clean speculative rounds"
+                )
+            counters = (
+                tokens_generated,
+                verify_width,
+                final_stats.speculative_rounds,
+                final_stats.speculative_drafted_tokens,
+                final_stats.speculative_fallback_rounds,
+                final_stats.speculative_error_rounds,
             )
-        if (
-            final_stats.speculative_rounds < 2
-            or final_stats.speculative_drafted_tokens < required_drafted
-            or final_stats.speculative_fallback_rounds != 0
-            or final_stats.speculative_error_rounds != 0
-        ):
-            raise RuntimeError(
-                "Kimi K3 DSpark warmup did not complete two clean speculative rounds"
-            )
+        else:
+            counters = (tokens_generated, 0)
+        elapsed = max(time.monotonic() - t, 0.001)
+        cadence = min(math.ceil(tokens_generated / elapsed), 100)
+        return cadence, counters
 
-    check_for_cancel_every = min(
-        math.ceil(tokens_generated / min(time.monotonic() - t, 0.001)), 100
+    check_for_cancel_every, _warmup_counters = rank_agreed_local_stage(
+        "inference warmup validation",
+        group,
+        validate_warmup,
+        lambda validated: repr(validated[1]),
     )
 
     mx_barrier(group)
@@ -1023,21 +1096,291 @@ def _validate_dspark_request(
     )
 
 
+def _dspark_setup_fingerprint(
+    *,
+    prompt_tokens: mx.array,
+    max_tokens: int,
+    prefill_step_size: int,
+    capacity_hint: int,
+    verify_width: int,
+    seed: int,
+    is_bench: bool,
+    compact_greedy: bool,
+    generation_progress: bool,
+    eos_token_ids: tuple[int, ...],
+    banned_token_ids: tuple[int, ...],
+    terminal_token_ids: tuple[int, ...],
+    stop_sequences: tuple[str, ...],
+) -> tuple[int, ...]:
+    """Bind every local choice that can alter DSpark graph or loop ordering."""
+
+    tolist = getattr(prompt_tokens, "tolist", None)
+    if not callable(tolist):
+        raise TypeError("Kimi K3 DSpark prompt tokens must be an MLX array")
+    raw_prompt_tokens: object = tolist()
+    if not isinstance(raw_prompt_tokens, list):
+        raise ValueError("Kimi K3 DSpark prompt tokens must be one-dimensional")
+    raw_prompt_values = cast(list[object], raw_prompt_tokens)
+    if any(type(token) is not int for token in raw_prompt_values):
+        raise ValueError("Kimi K3 DSpark prompt must contain integer tokens")
+    logical_prompt_tokens = cast(tuple[int, ...], tuple(raw_prompt_values))
+
+    digest = hashlib.sha256(b"exo-kimi-k3-dspark-setup/v1\0")
+
+    def add_integer(value: int, *, name: str) -> None:
+        if type(value) is not int or not 0 <= value <= 0x7FFFFFFFFFFFFFFF:
+            raise ValueError(f"Kimi K3 DSpark {name} must fit non-negative int64")
+        digest.update(value.to_bytes(8, "big"))
+
+    def add_tokens(tokens: tuple[int, ...], *, name: str) -> None:
+        add_integer(len(tokens), name=f"{name} length")
+        for token in tokens:
+            if type(token) is not int or not 0 <= token <= 0x7FFFFFFF:
+                raise ValueError(
+                    f"Kimi K3 DSpark {name} must contain non-negative int32 tokens"
+                )
+            digest.update(token.to_bytes(4, "big"))
+
+    add_tokens(logical_prompt_tokens, name="prompt")
+    add_integer(max_tokens, name="max tokens")
+    add_integer(prefill_step_size, name="prefill step size")
+    add_integer(capacity_hint, name="capacity hint")
+    add_integer(verify_width, name="verify width")
+    add_integer(seed, name="seed")
+    add_integer(int(is_bench), name="benchmark flag")
+    add_integer(int(compact_greedy), name="compact greedy flag")
+    add_integer(int(generation_progress), name="generation progress flag")
+    add_tokens(eos_token_ids, name="EOS tokens")
+    add_tokens(banned_token_ids, name="banned tokens")
+    add_tokens(terminal_token_ids, name="terminal tokens")
+    add_integer(len(stop_sequences), name="stop sequence count")
+    for stop in stop_sequences:
+        encoded = stop.encode("utf-8")
+        add_integer(len(encoded), name="stop sequence byte length")
+        digest.update(encoded)
+
+    raw = digest.digest()
+    return tuple(
+        int.from_bytes(raw[offset : offset + 4], "big") & 0x7FFFFFFF
+        for offset in range(0, 16, 4)
+    )
+
+
+def _dspark_setup_error_fingerprint(error: str | None) -> int:
+    if error is None:
+        return 0
+    return (
+        int.from_bytes(hashlib.sha256(error.encode()).digest()[:4], "big") & 0x7FFFFFFF
+    ) or 1
+
+
+def _rank_agreed_dspark_setup(
+    agreement: MlxRankAgreement,
+    operation: Callable[[], _DSparkRequestSetup],
+) -> _DSparkRequestSetup:
+    """Run local setup, then fixed-order agree success and its full contract."""
+
+    result: _DSparkRequestSetup | None = None
+    local_error: str | None = None
+    try:
+        result = operation()
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+
+    outcome = agreement.agree_stage_success(local_error is None)
+    error_fingerprint = agreement.agree_token(
+        _dspark_setup_error_fingerprint(local_error)
+    )
+    local_fingerprint = result.fingerprint if result is not None else (0, 0, 0, 0)
+    fingerprint_agreement = tuple(
+        agreement.agree_token(word) for word in local_fingerprint
+    )
+
+    if (
+        outcome is not True
+        or error_fingerprint != 0
+        or fingerprint_agreement != local_fingerprint
+    ):
+        detail = (
+            f"failed on every rank: {local_error}"
+            if outcome is False and local_error is not None
+            else "outcomes or request controls disagreed across ranks"
+        )
+        raise DSparkDistributedStateError(
+            f"Kimi K3 DSpark setup {detail}; no target TP graph was built"
+        ) from None
+    return cast(_DSparkRequestSetup, result)
+
+
+def _prepare_dspark_request_setup(
+    *,
+    dspark: LoadedMlxDSpark,
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    task: TextGenerationTaskParams,
+    prompt: str,
+    kv_prefix_cache: KVPrefixCache | None,
+    group: mx.distributed.Group,
+    vision_processor: VisionProcessor | None,
+    agreement: MlxRankAgreement,
+    generation_progress: bool,
+) -> _DSparkRequestSetup:
+    """Build all failure-prone local request state without entering TP graphs."""
+
+    mx.reset_peak_memory()
+    is_pipeline = _has_pipeline_communication_layer(model)
+    prompt_lookup_configuration = prompt_lookup_config(
+        is_pipeline=is_pipeline,
+        is_batch=False,
+    )
+    _validate_dspark_request(
+        dspark,
+        model=model,
+        task=task,
+        group=group,
+        kv_prefix_cache=kv_prefix_cache,
+        vision_processor=vision_processor,
+        is_pipeline=is_pipeline,
+        prompt_lookup_configuration=prompt_lookup_configuration,
+    )
+
+    seed = task.seed or 42
+    mx.random.seed(seed)
+    all_prompt_tokens = fix_unmatched_think_end_tokens(
+        encode_prompt(tokenizer, prompt),
+        tokenizer,
+    )
+    if len(all_prompt_tokens) < 2:
+        raise ValueError("Kimi K3 DSpark requires at least two prompt tokens")
+    anchor_token = int(all_prompt_tokens[-1].item())
+    if not 0 <= anchor_token <= 0x7FFFFFFF:
+        raise ValueError("Kimi K3 DSpark anchor token must fit non-negative int32")
+
+    detokenizer = cast(_DSparkDetokenizer, cast(object, tokenizer.detokenizer))
+    if not all(
+        callable(getattr(detokenizer, name, None))
+        for name in ("reset", "add_token", "finalize")
+    ):
+        raise TypeError("Kimi K3 DSpark tokenizer has no streaming detokenizer")
+    detokenizer.reset()
+    empty_logprobs = mx.array([], dtype=mx.float32)
+
+    is_bench = task.bench
+    caches = make_kv_cache(model=model)
+    logits_processors = make_logits_processors(
+        repetition_penalty=task.repetition_penalty,
+        repetition_context_size=(
+            task.repetition_context_size
+            if task.repetition_context_size is not None
+            else 20
+        ),
+        presence_penalty=task.presence_penalty,
+        frequency_penalty=task.frequency_penalty,
+    )
+    if is_bench:
+        logits_processors = [
+            ban_token_ids(eos_ids_from_tokenizer(tokenizer)),
+            *logits_processors,
+        ]
+    sampler = make_sampler(
+        temp=task.temperature if task.temperature is not None else 0.7,
+        top_p=task.top_p if task.top_p is not None else 1.0,
+        min_p=task.min_p if task.min_p is not None else 0.05,
+        top_k=task.top_k if task.top_k is not None else 0,
+    )
+
+    stop_sequences = tuple(
+        ([task.stop] if isinstance(task.stop, str) else task.stop)
+        if task.stop is not None
+        else ()
+    )
+    max_stop_len = max((len(stop) for stop in stop_sequences), default=0)
+    max_tokens = task.max_output_tokens or MAX_TOKENS
+    eos_token_ids = tuple(eos_ids_from_tokenizer(tokenizer))
+    banned_token_ids = eos_token_ids if is_bench else ()
+    terminal_token_ids = () if is_bench else eos_token_ids
+    compact_greedy = bool(
+        greedy_vocab_parallel_stream_kwargs(
+            temperature=0.0,
+            logprobs=False,
+            has_logits_processors=False,
+            is_pipeline=False,
+            speculative=False,
+        )
+    )
+    prefill_step_size = _prefill_step_size(
+        len(all_prompt_tokens) - 1,
+        is_pipeline=False,
+    )
+    capacity_hint = dspark_context_capacity_hint(
+        prompt_tokens=len(all_prompt_tokens),
+        max_tokens=max_tokens,
+        verify_width=dspark.verify_width,
+    )
+    runtime = KimiK3DSparkRequestRuntime.create(
+        dspark,
+        model,
+        caches,
+        agreement,
+        capacity_hint=capacity_hint,
+        banned_token_ids=banned_token_ids,
+        terminal_token_ids=terminal_token_ids,
+        compact_greedy=compact_greedy,
+    )
+    fingerprint = _dspark_setup_fingerprint(
+        prompt_tokens=all_prompt_tokens,
+        max_tokens=max_tokens,
+        prefill_step_size=prefill_step_size,
+        capacity_hint=capacity_hint,
+        verify_width=dspark.verify_width,
+        seed=seed,
+        is_bench=is_bench,
+        compact_greedy=compact_greedy,
+        generation_progress=generation_progress,
+        eos_token_ids=eos_token_ids,
+        banned_token_ids=banned_token_ids,
+        terminal_token_ids=terminal_token_ids,
+        stop_sequences=stop_sequences,
+    )
+    return _DSparkRequestSetup(
+        is_pipeline=is_pipeline,
+        prompt_lookup_configuration=prompt_lookup_configuration,
+        all_prompt_tokens=all_prompt_tokens,
+        caches=caches,
+        logits_processors=logits_processors,
+        sampler=sampler,
+        stop_sequences=stop_sequences,
+        max_stop_len=max_stop_len,
+        max_tokens=max_tokens,
+        is_bench=is_bench,
+        eos_token_ids=eos_token_ids,
+        anchor_token=anchor_token,
+        detokenizer=detokenizer,
+        empty_logprobs=empty_logprobs,
+        prefill_step_size=prefill_step_size,
+        runtime=runtime,
+        fingerprint=fingerprint,
+    )
+
+
 def _dspark_mlx_responses(
     runtime: KimiK3DSparkRequestRuntime,
-    tokenizer: TokenizerWrapper,
+    detokenizer: _DSparkDetokenizer,
+    empty_logprobs: mx.array,
     *,
     anchor_token: int,
     max_tokens: int,
-    is_bench: bool,
+    eos_token_ids: tuple[int, ...],
     telemetry: _PromptLookupTelemetry,
 ) -> Generator[MlxGenerationResponse, None, None]:
-    detokenizer = cast(_DSparkDetokenizer, cast(object, tokenizer.detokenizer))
-    detokenizer.reset()
-    eos_token_ids = () if is_bench else tuple(eos_ids_from_tokenizer(tokenizer))
-    engine = runtime.make_round_engine()
-    started = time.perf_counter()
-    empty_logprobs = mx.array([], dtype=mx.float32)
+    engine = runtime.agree_local_value(
+        "round engine construction",
+        runtime.make_round_engine,
+    )
+    started = runtime.agree_local_value(
+        "decode timing initialization",
+        time.perf_counter,
+    )
     for generation_tokens, decoded in enumerate(
         dspark_decode_tokens(
             engine,
@@ -1048,24 +1391,42 @@ def _dspark_mlx_responses(
         ),
         start=1,
     ):
-        if decoded.finish_reason == "stop":
-            detokenizer.finalize()
-        else:
-            detokenizer.add_token(decoded.token)
-            if decoded.finish_reason == "length":
+
+        def render_token(decoded: object = decoded) -> str:
+            decoded = cast(DSparkDecodedToken, decoded)
+            if decoded.finish_reason == "stop":
                 detokenizer.finalize()
-        elapsed = time.perf_counter() - started
-        yield MlxGenerationResponse(
-            text=detokenizer.last_segment,
-            token=decoded.token,
-            logprobs=empty_logprobs,
-            from_draft=decoded.from_draft,
-            prompt_tokens=1,
-            prompt_tps=0.0,
-            generation_tokens=generation_tokens,
-            generation_tps=generation_tokens / elapsed if elapsed > 0 else 0.0,
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason=decoded.finish_reason,
+            else:
+                detokenizer.add_token(decoded.token)
+                if decoded.finish_reason == "length":
+                    detokenizer.finalize()
+            return detokenizer.last_segment
+
+        text = runtime.agree_text("detokenizer output", render_token)
+
+        def build_response(
+            decoded: object = decoded,
+            text: str = text,
+            generation_tokens: int = generation_tokens,
+        ) -> MlxGenerationResponse:
+            decoded = cast(DSparkDecodedToken, decoded)
+            elapsed = time.perf_counter() - started
+            return MlxGenerationResponse(
+                text=text,
+                token=decoded.token,
+                logprobs=empty_logprobs,
+                from_draft=decoded.from_draft,
+                prompt_tokens=1,
+                prompt_tps=0.0,
+                generation_tokens=generation_tokens,
+                generation_tps=(generation_tokens / elapsed if elapsed > 0 else 0.0),
+                peak_memory=mx.get_peak_memory() / 1e9,
+                finish_reason=decoded.finish_reason,
+            )
+
+        yield runtime.agree_local_value(
+            "response construction",
+            build_response,
         )
 
 
@@ -1131,54 +1492,73 @@ def mlx_generate(
     vision_processor: VisionProcessor | None = None,
     dspark: LoadedMlxDSpark | None = None,
 ) -> Generator[GenerationResponse]:
-    # Ensure that generation stats only contains peak memory for this generation
-    mx.reset_peak_memory()
-    is_pipeline = _has_pipeline_communication_layer(model)
-    prompt_lookup_configuration = prompt_lookup_config(
-        is_pipeline=is_pipeline,
-        is_batch=False,
-    )
+    dspark_setup: _DSparkRequestSetup | None = None
     if dspark is not None:
-        _validate_dspark_request(
-            dspark,
-            model=model,
-            task=task,
-            group=group,
-            kv_prefix_cache=kv_prefix_cache,
-            vision_processor=vision_processor,
-            is_pipeline=is_pipeline,
-            prompt_lookup_configuration=prompt_lookup_configuration,
-        )
-    # TODO: Randomise task seed and set in taskparams, instead of hard coding as 42.
-    seed = task.seed or 42
-    mx.random.seed(seed)
-
-    # Encode prompt once at the top and fix unmatched think tags
-    all_prompt_tokens = encode_prompt(tokenizer, prompt)
-    all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
-    if dspark is not None and len(all_prompt_tokens) < 2:
-        raise ValueError("Kimi K3 DSpark requires at least two prompt tokens")
-    min_prefix_hit_length = max(1000, system_prompt_token_count(task, tokenizer))
-
-    vision: VisionResult | None = None
-    if vision_processor is not None:
-        try:
-            vision = prepare_vision(
-                images=task.images,
-                chat_template_messages=task.chat_template_messages,
-                vision_processor=vision_processor,
-                tokenizer=tokenizer,
+        if group is None:
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark setup requires a tensor-parallel group"
+            )
+        agreement = MlxRankAgreement(group)
+        dspark_setup = _rank_agreed_dspark_setup(
+            agreement,
+            lambda: _prepare_dspark_request_setup(
+                dspark=dspark,
                 model=model,
-                model_id=task.model,
-                task_params=task,
-            )
-        except Exception:
-            logger.opt(exception=True).warning(
-                "Vision processing failed, falling back to text-only"
-            )
-    if vision is not None:
-        all_prompt_tokens = vision.prompt_tokens
-    media_regions: list[MediaRegion] = vision.media_regions if vision else []
+                tokenizer=tokenizer,
+                task=task,
+                prompt=prompt,
+                kv_prefix_cache=kv_prefix_cache,
+                group=group,
+                vision_processor=vision_processor,
+                agreement=agreement,
+                generation_progress=on_generation_token is not None,
+            ),
+        )
+        is_pipeline = dspark_setup.is_pipeline
+        prompt_lookup_configuration = dspark_setup.prompt_lookup_configuration
+        all_prompt_tokens = dspark_setup.all_prompt_tokens
+        min_prefix_hit_length = 1000
+        vision: VisionResult | None = None
+        media_regions: list[MediaRegion] = []
+    else:
+        # Ensure that generation stats only contains this request's peak memory.
+        mx.reset_peak_memory()
+        is_pipeline = _has_pipeline_communication_layer(model)
+        prompt_lookup_configuration = prompt_lookup_config(
+            is_pipeline=is_pipeline,
+            is_batch=False,
+        )
+        # TODO: Randomise task seed and set in taskparams, instead of hard coding as 42.
+        seed = task.seed or 42
+        mx.random.seed(seed)
+
+        # Encode prompt once at the top and fix unmatched think tags
+        all_prompt_tokens = encode_prompt(tokenizer, prompt)
+        all_prompt_tokens = fix_unmatched_think_end_tokens(
+            all_prompt_tokens,
+            tokenizer,
+        )
+        min_prefix_hit_length = max(1000, system_prompt_token_count(task, tokenizer))
+
+        vision = None
+        if vision_processor is not None:
+            try:
+                vision = prepare_vision(
+                    images=task.images,
+                    chat_template_messages=task.chat_template_messages,
+                    vision_processor=vision_processor,
+                    tokenizer=tokenizer,
+                    model=model,
+                    model_id=task.model,
+                    task_params=task,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "Vision processing failed, falling back to text-only"
+                )
+        if vision is not None:
+            all_prompt_tokens = vision.prompt_tokens
+        media_regions = vision.media_regions if vision else []
 
     # Do not use the prefix cache if we are trying to do benchmarks.
     is_bench = task.bench
@@ -1189,7 +1569,11 @@ def mlx_generate(
     prefix_hit_length = 0
     matched_index: int | None = None
     is_exact_hit = False
-    if kv_prefix_cache is None:
+    if dspark_setup is not None:
+        kv_prefix_cache = None
+        caches = dspark_setup.caches
+        prompt_tokens = all_prompt_tokens
+    elif kv_prefix_cache is None:
         caches = make_kv_cache(model=model)
         prompt_tokens = all_prompt_tokens
     else:
@@ -1216,8 +1600,11 @@ def mlx_generate(
                 f"KV cache hit: {prefix_hit_length}/{len(all_prompt_tokens)} tokens cached ({100 * prefix_hit_length / len(all_prompt_tokens):.1f}%)"
             )
 
-    logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
-        make_logits_processors(
+    if dspark_setup is not None:
+        logits_processors = dspark_setup.logits_processors
+        sampler = dspark_setup.sampler
+    else:
+        logits_processors = make_logits_processors(
             repetition_penalty=task.repetition_penalty,
             repetition_context_size=task.repetition_context_size
             if task.repetition_context_size is not None
@@ -1225,27 +1612,31 @@ def mlx_generate(
             presence_penalty=task.presence_penalty,
             frequency_penalty=task.frequency_penalty,
         )
-    )
-    if is_bench:
-        # Only sample length eos tokens
-        eos_ids = eos_ids_from_tokenizer(tokenizer)
-        logits_processors = [ban_token_ids(eos_ids)] + logits_processors
+        if is_bench:
+            # Only sample length eos tokens
+            eos_ids = eos_ids_from_tokenizer(tokenizer)
+            logits_processors = [ban_token_ids(eos_ids)] + logits_processors
 
-    sampler = make_sampler(
-        temp=task.temperature if task.temperature is not None else 0.7,
-        top_p=task.top_p if task.top_p is not None else 1.0,
-        min_p=task.min_p if task.min_p is not None else 0.05,
-        top_k=task.top_k if task.top_k is not None else 0,
-    )
+        sampler = make_sampler(
+            temp=task.temperature if task.temperature is not None else 0.7,
+            top_p=task.top_p if task.top_p is not None else 1.0,
+            min_p=task.min_p if task.min_p is not None else 0.05,
+            top_k=task.top_k if task.top_k is not None else 0,
+        )
 
     # Normalize stop sequences to a list
-    stop_sequences: list[str] = (
-        ([task.stop] if isinstance(task.stop, str) else task.stop)
-        if task.stop is not None
-        else []
-    )
-    max_stop_len = max((len(s) for s in stop_sequences), default=0)
-    max_tokens = task.max_output_tokens or MAX_TOKENS
+    if dspark_setup is not None:
+        stop_sequences = dspark_setup.stop_sequences
+        max_stop_len = dspark_setup.max_stop_len
+        max_tokens = dspark_setup.max_tokens
+    else:
+        stop_sequences = tuple(
+            ([task.stop] if isinstance(task.stop, str) else task.stop)
+            if task.stop is not None
+            else ()
+        )
+        max_stop_len = max((len(s) for s in stop_sequences), default=0)
+        max_tokens = task.max_output_tokens or MAX_TOKENS
 
     maybe_vision_ctx = (
         patch_embed_tokens(
@@ -1268,41 +1659,13 @@ def mlx_generate(
     ssm_snapshots_list: list[CacheSnapshot] = []
     dspark_runtime: KimiK3DSparkRequestRuntime | None = None
     with maybe_vision_ctx:
-        if dspark is not None:
-            assert group is not None
-            eos_token_ids = tuple(eos_ids_from_tokenizer(tokenizer))
-            banned_token_ids = eos_token_ids if is_bench else ()
-            terminal_token_ids = () if is_bench else eos_token_ids
-            compact_greedy = bool(
-                greedy_vocab_parallel_stream_kwargs(
-                    temperature=0.0,
-                    logprobs=False,
-                    has_logits_processors=False,
-                    is_pipeline=False,
-                    speculative=False,
-                )
-            )
-            dspark_runtime = KimiK3DSparkRequestRuntime.create(
-                dspark,
-                model,
-                caches,
-                MlxRankAgreement(group),
-                capacity_hint=dspark_context_capacity_hint(
-                    prompt_tokens=len(all_prompt_tokens),
-                    max_tokens=max_tokens,
-                    verify_width=dspark.verify_width,
-                ),
-                banned_token_ids=banned_token_ids,
-                terminal_token_ids=terminal_token_ids,
-                compact_greedy=compact_greedy,
-            )
-            mx_barrier(group)
+        if dspark_setup is not None:
+            dspark_runtime = dspark_setup.runtime
             prefill_tps, prefill_tokens = dspark_runtime.seed_prompt(
                 prompt_tokens[:-1],
-                prefill_step_size=_prefill_step_size(
-                    len(prompt_tokens) - 1,
-                    is_pipeline=False,
-                ),
+                prefill_step_size=dspark_setup.prefill_step_size,
+                max_tokens=max_tokens,
+                stop_sequences=stop_sequences,
                 progress_callback=on_prefill_progress or (lambda _done, _total: None),
                 distributed_progress_callback=distributed_prompt_progress_callback,
             )
@@ -1374,7 +1737,7 @@ def mlx_generate(
 
     # stream_generate starts from the last two tokens. DSpark instead owns the
     # exact prompt[:-1] target/draft boundary and starts from prompt[-1].
-    last_token = prompt_tokens[-2:]
+    last_token = prompt_tokens[-2:] if dspark_runtime is None else None
     relay_enabled = is_pipeline and not task.logprobs
     decode_sampler = sampler
     with _pipeline_token_relay_scope(model, relay_enabled):
@@ -1393,7 +1756,6 @@ def mlx_generate(
         generated_text_parts: list[str] = []
         generation_start_time = time.perf_counter()
         prompt_lookup_telemetry = _PromptLookupTelemetry()
-        usage: Usage | None = None
         logger.info("Starting decode")
         # Pipeline prefill and decode share one ordered P2P stream. A collective
         # here can race a sender whose final prefill frame was already received but
@@ -1408,28 +1770,34 @@ def mlx_generate(
             all_prompt_tokens,
             prompt_lookup_telemetry,
         )
-        greedy_vocab_parallel_kwargs = greedy_vocab_parallel_stream_kwargs(
-            temperature=task.temperature if task.temperature is not None else 0.7,
-            logprobs=task.logprobs,
-            has_logits_processors=bool(logits_processors),
-            is_pipeline=is_pipeline,
-            speculative=prompt_lookup_kwargs is not None or dspark_runtime is not None,
+        greedy_vocab_parallel_kwargs: _GreedyVocabParallelStreamKwargs = (
+            {}
+            if dspark_runtime is not None
+            else greedy_vocab_parallel_stream_kwargs(
+                temperature=(task.temperature if task.temperature is not None else 0.7),
+                logprobs=task.logprobs,
+                has_logits_processors=bool(logits_processors),
+                is_pipeline=is_pipeline,
+                speculative=prompt_lookup_kwargs is not None,
+            )
         )
         # MLX-LM normally launches token N+1 before yielding token N. If token N
         # is EOS (or EXO matches a stop sequence), abandoning that lookahead
         # leaves pipeline rank zero in an unmatched send while the final rank
         # enters the completion barrier.
         if dspark_runtime is not None:
-            anchor_token = int(prompt_tokens[-1].item())
+            assert dspark_setup is not None
             decode_outputs = _dspark_mlx_responses(
                 dspark_runtime,
-                tokenizer,
-                anchor_token=anchor_token,
+                dspark_setup.detokenizer,
+                dspark_setup.empty_logprobs,
+                anchor_token=dspark_setup.anchor_token,
                 max_tokens=max_tokens,
-                is_bench=is_bench,
+                eos_token_ids=(() if is_bench else dspark_setup.eos_token_ids),
                 telemetry=prompt_lookup_telemetry,
             )
         elif prompt_lookup_kwargs is None:
+            assert last_token is not None
             decode_outputs = stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -1445,6 +1813,7 @@ def mlx_generate(
                 **greedy_vocab_parallel_kwargs,
             )
         else:
+            assert last_token is not None
             prompt_lookup_generate = cast(
                 _PromptLookupStreamGenerate,
                 stream_generate,
@@ -1465,143 +1834,209 @@ def mlx_generate(
             )
 
         for completion_tokens, out in enumerate(decode_outputs, start=1):
-            generated_text_parts.append(out.text)
-            accumulated_text += out.text
 
-            # Check for stop sequences
-            text = out.text
-            finish_reason: FinishReason | None = cast(
-                FinishReason | None, out.finish_reason
-            )
-            stop_matched = False
+            def resolve_response_control(
+                out: MlxGenerationResponse = out,
+                previous_text: str = accumulated_text,
+            ) -> tuple[
+                int,
+                str | None,
+                bool,
+                str,
+                str,
+            ]:
+                candidate_text = previous_text + out.text
+                text = out.text
+                finish_reason = out.finish_reason
+                stop_matched = False
 
-            if stop_sequences:
                 for stop_seq in stop_sequences:
-                    if stop_seq in accumulated_text:
-                        # Trim text to just before the stop sequence
-                        stop_index = accumulated_text.find(stop_seq)
-                        text_before_stop = accumulated_text[:stop_index]
-                        chunk_start = len(accumulated_text) - len(out.text)
+                    if stop_seq in candidate_text:
+                        # Trim text to just before the stop sequence.
+                        stop_index = candidate_text.find(stop_seq)
+                        text_before_stop = candidate_text[:stop_index]
+                        chunk_start = len(candidate_text) - len(out.text)
                         text = text_before_stop[chunk_start:]
                         finish_reason = "stop"
                         stop_matched = True
                         break
 
+                future_text = candidate_text[-max_stop_len:] if max_stop_len > 0 else ""
+                return (
+                    int(out.token),
+                    finish_reason,
+                    stop_matched,
+                    future_text,
+                    text,
+                )
+
+            if dspark_runtime is not None:
+                (
+                    _agreed_token,
+                    raw_finish_reason,
+                    stop_matched,
+                    accumulated_text,
+                    text,
+                ) = dspark_runtime.agree_response_control(resolve_response_control)
+            else:
+                (
+                    _agreed_token,
+                    raw_finish_reason,
+                    stop_matched,
+                    accumulated_text,
+                    text,
+                ) = resolve_response_control()
+            finish_reason = cast(FinishReason | None, raw_finish_reason)
+
             is_done = finish_reason is not None
 
-            stats: GenerationStats | None = None
-            if is_done:
-                # MLX-LM reports a speculative round only after its emitted
-                # tokens have been consumed.  Its terminal response is yielded
-                # before the inner token generator is resumed, so close it now
-                # to resolve the final cache transaction and account for that
-                # round before serializing telemetry.
-                decode_outputs.close()
-                decode_elapsed_seconds = time.perf_counter() - generation_start_time
-                effective_generation_tps = (
-                    completion_tokens / decode_elapsed_seconds
-                    if decode_elapsed_seconds > 0
-                    else 0.0
+            def build_public_response(
+                out: MlxGenerationResponse = out,
+                is_done: bool = is_done,
+                completion_tokens: int = completion_tokens,
+                stop_matched: bool = stop_matched,
+                text: str = text,
+                agreed_token: int = _agreed_token,
+                finish_reason: FinishReason | None = finish_reason,
+            ) -> GenerationResponse:
+                prompt_lookup_telemetry.observe_visible_token(
+                    from_draft=bool(out.from_draft)
                 )
-                prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
-                if prefix_hit_length > 0:
-                    prefix_cache_hit = "exact" if is_exact_hit else "partial"
-                stats = GenerationStats(
-                    prompt_tps=float(prefill_tps or out.prompt_tps),
-                    generation_tps=float(out.generation_tps),
-                    prompt_tokens=int(prefill_tokens + out.prompt_tokens),
-                    generation_tokens=int(out.generation_tokens),
-                    peak_memory_usage=_memory_from_mlx_decimal_gb(out.peak_memory),
-                    prefix_cache_hit=prefix_cache_hit,
-                    decode_elapsed_seconds=decode_elapsed_seconds,
-                    effective_generation_tps=effective_generation_tps,
-                    speculative_rounds=prompt_lookup_telemetry.rounds,
-                    speculative_drafted_tokens=(prompt_lookup_telemetry.drafted_tokens),
-                    speculative_accepted_tokens=(
-                        prompt_lookup_telemetry.accepted_tokens
-                    ),
-                    speculative_committed_tokens=(
-                        prompt_lookup_telemetry.committed_tokens
-                    ),
-                    speculative_fallback_rounds=(
-                        prompt_lookup_telemetry.fallback_rounds
-                    ),
-                    speculative_error_rounds=prompt_lookup_telemetry.error_rounds,
-                )
-                if not stop_matched and out.finish_reason not in get_args(FinishReason):
-                    logger.warning(
-                        f"Model generated unexpected finish_reason: {out.finish_reason}"
+                generated_text_parts.append(out.text)
+                stats: GenerationStats | None = None
+                response_usage: Usage | None = None
+                if is_done:
+                    # Resolve the terminal inner generator and its committed
+                    # speculative telemetry before serializing public stats.
+                    decode_outputs.close()
+                    decode_elapsed_seconds = time.perf_counter() - generation_start_time
+                    effective_generation_tps = (
+                        completion_tokens / decode_elapsed_seconds
+                        if decode_elapsed_seconds > 0
+                        else 0.0
                     )
-
-                total_prompt_tokens = len(all_prompt_tokens)
-                usage = Usage(
-                    prompt_tokens=total_prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=total_prompt_tokens + completion_tokens,
-                    prompt_tokens_details=PromptTokensDetails(
-                        cached_tokens=prefix_hit_length
-                    ),
-                    completion_tokens_details=CompletionTokensDetails(
-                        reasoning_tokens=0,
-                        accepted_prediction_tokens=(
+                    prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
+                    if prefix_hit_length > 0:
+                        prefix_cache_hit = "exact" if is_exact_hit else "partial"
+                    stats = GenerationStats(
+                        prompt_tps=float(prefill_tps or out.prompt_tps),
+                        generation_tps=float(out.generation_tps),
+                        prompt_tokens=int(prefill_tokens + out.prompt_tokens),
+                        generation_tokens=int(out.generation_tokens),
+                        peak_memory_usage=_memory_from_mlx_decimal_gb(out.peak_memory),
+                        prefix_cache_hit=prefix_cache_hit,
+                        decode_elapsed_seconds=decode_elapsed_seconds,
+                        effective_generation_tps=effective_generation_tps,
+                        speculative_rounds=prompt_lookup_telemetry.rounds,
+                        speculative_drafted_tokens=(
+                            prompt_lookup_telemetry.drafted_tokens
+                        ),
+                        speculative_accepted_tokens=(
                             prompt_lookup_telemetry.accepted_tokens
                         ),
-                        rejected_prediction_tokens=max(
-                            0,
-                            prompt_lookup_telemetry.drafted_tokens
-                            - prompt_lookup_telemetry.accepted_tokens,
+                        speculative_committed_tokens=(
+                            prompt_lookup_telemetry.committed_tokens
                         ),
-                    ),
-                )
+                        speculative_fallback_rounds=(
+                            prompt_lookup_telemetry.fallback_rounds
+                        ),
+                        speculative_error_rounds=(prompt_lookup_telemetry.error_rounds),
+                    )
+                    if not stop_matched and out.finish_reason not in get_args(
+                        FinishReason
+                    ):
+                        logger.warning(
+                            "Model generated unexpected finish_reason: "
+                            f"{out.finish_reason}"
+                        )
 
-            # Extract logprobs from the full vocabulary logprobs array
-            logprob: float | None = None
-            top_logprobs: list[TopLogprobItem] | None = None
-            if task.logprobs:
-                with mx.stream(generation_stream):
-                    logprob, top_logprobs = extract_top_logprobs(
-                        logprobs=out.logprobs,
-                        tokenizer=tokenizer,
-                        top_logprobs=task.top_logprobs or DEFAULT_TOP_LOGPROBS,
-                        selected_token=out.token,
+                    total_prompt_tokens = len(all_prompt_tokens)
+                    response_usage = Usage(
+                        prompt_tokens=total_prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_prompt_tokens + completion_tokens,
+                        prompt_tokens_details=PromptTokensDetails(
+                            cached_tokens=prefix_hit_length
+                        ),
+                        completion_tokens_details=CompletionTokensDetails(
+                            reasoning_tokens=0,
+                            accepted_prediction_tokens=(
+                                prompt_lookup_telemetry.visible_accepted_tokens
+                            ),
+                            rejected_prediction_tokens=max(
+                                0,
+                                prompt_lookup_telemetry.drafted_tokens
+                                - prompt_lookup_telemetry.accepted_tokens,
+                            ),
+                        ),
                     )
 
-            if is_done:
-                # Log generation stats
-                generation_elapsed = (
-                    stats.decode_elapsed_seconds
-                    if stats is not None and stats.decode_elapsed_seconds is not None
-                    else time.perf_counter() - generation_start_time
-                )
-                generated_tokens = len(generated_text_parts)
-                generation_tps = (
-                    generated_tokens / generation_elapsed
-                    if generation_elapsed > 0
-                    else 0.0
-                )
-                logger.debug(
-                    f"Generation complete: prefill {prompt_tokens} tokens @ "
-                    f"{prefill_tps:.1f} tok/s, generated {generated_tokens} "
-                    f"tokens @ {generation_tps:.1f} tok/s"
-                )
-            if on_generation_token is not None:
-                on_generation_token()
+                logprob: float | None = None
+                top_logprobs: list[TopLogprobItem] | None = None
+                if task.logprobs:
+                    with mx.stream(generation_stream):
+                        logprob, top_logprobs = extract_top_logprobs(
+                            logprobs=out.logprobs,
+                            tokenizer=tokenizer,
+                            top_logprobs=(task.top_logprobs or DEFAULT_TOP_LOGPROBS),
+                            selected_token=out.token,
+                        )
 
-            yield GenerationResponse(
-                text=text,
-                token=out.token,
-                logprob=logprob,
-                top_logprobs=top_logprobs,
-                finish_reason=finish_reason,
-                stats=stats,
-                usage=usage,
+                if is_done:
+                    generation_elapsed = (
+                        stats.decode_elapsed_seconds
+                        if stats is not None
+                        and stats.decode_elapsed_seconds is not None
+                        else time.perf_counter() - generation_start_time
+                    )
+                    generated_tokens = len(generated_text_parts)
+                    generation_tps = (
+                        generated_tokens / generation_elapsed
+                        if generation_elapsed > 0
+                        else 0.0
+                    )
+                    logger.debug(
+                        f"Generation complete: prefill {prompt_tokens} tokens @ "
+                        f"{prefill_tps:.1f} tok/s, generated {generated_tokens} "
+                        f"tokens @ {generation_tps:.1f} tok/s"
+                    )
+
+                return GenerationResponse(
+                    text=text,
+                    token=agreed_token,
+                    logprob=logprob,
+                    top_logprobs=top_logprobs,
+                    finish_reason=finish_reason,
+                    stats=stats,
+                    usage=response_usage,
+                )
+
+            response = (
+                dspark_runtime.agree_local_value(
+                    "public response construction",
+                    build_public_response,
+                )
+                if dspark_runtime is not None
+                else build_public_response()
             )
 
+            if on_generation_token is not None:
+                if dspark_runtime is not None:
+                    dspark_runtime.agree_local_side_effect(
+                        "generation progress callback",
+                        on_generation_token,
+                    )
+                else:
+                    on_generation_token()
+
+            if is_done and dspark_runtime is not None and not is_pipeline:
+                # Complete the distributed terminal boundary before yielding;
+                # a downstream parser may not resume this generator.
+                mx_barrier(group)
+
+            yield response
+
             if is_done:
-                if not is_pipeline:
+                if dspark_runtime is None and not is_pipeline:
                     mx_barrier(group)
                 break
-
-            # Limit accumulated_text to what's needed for stop sequence detection
-            if max_stop_len > 0 and len(accumulated_text) > max_stop_len:
-                accumulated_text = accumulated_text[-max_stop_len:]

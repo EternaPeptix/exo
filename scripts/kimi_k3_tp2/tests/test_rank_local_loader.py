@@ -136,9 +136,7 @@ def _checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, 
         },
         "rank_data_bytes": 32,
         "metadata_files": metadata_files,
-        "metadata_contract_sha256": loader._canonical_metadata_contract(
-            metadata_files
-        ),
+        "metadata_contract_sha256": loader._canonical_metadata_contract(metadata_files),
         "files": {
             filename: {
                 "name": filename,
@@ -185,9 +183,7 @@ def test_manifest_always_hashes_tokenizer_metadata(
         "bytes": tokenizer.stat().st_size,
         "sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
     }
-    manifest["metadata_contract_sha256"] = loader._canonical_metadata_contract(
-        metadata
-    )
+    manifest["metadata_contract_sha256"] = loader._canonical_metadata_contract(metadata)
     (root / "tp_manifest.json").write_text(json.dumps(manifest))
 
     tokenizer.write_text('{"version":"2"}')
@@ -220,7 +216,9 @@ def test_manifest_rejects_missing_metadata_and_contract_tamper(
 ):
     root, manifest = _checkpoint(tmp_path, monkeypatch)
     (root / "LICENSE").unlink()
-    with pytest.raises(loader.RankLocalLoadError, match="missing or truncated metadata"):
+    with pytest.raises(
+        loader.RankLocalLoadError, match="missing or truncated metadata"
+    ):
         loader._verify_manifest(
             root,
             FakeGroup(),
@@ -283,51 +281,90 @@ def test_metadata_digest_must_agree_across_ranks():
 def test_runtime_source_verification_uses_execution_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    runtime_source = tmp_path / "kimi_k3.py"
-    dspark_source = tmp_path / "kimi_k3_dspark.py"
-    gated_delta_source = tmp_path / "gated_delta.py"
-    runtime_source.write_bytes(b"pinned execution runtime")
-    dspark_source.write_bytes(b"pinned DSpark execution runtime")
-    gated_delta_source.write_bytes(b"pinned gated-delta execution runtime")
-    digest = hashlib.sha256(runtime_source.read_bytes()).hexdigest()
-    dspark_digest = hashlib.sha256(dspark_source.read_bytes()).hexdigest()
-    gated_delta_digest = hashlib.sha256(gated_delta_source.read_bytes()).hexdigest()
-    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_SHA256", digest)
-    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_DSPARK_SHA256", dspark_digest)
-    monkeypatch.setattr(loader, "MLX_LM_GATED_DELTA_SHA256", gated_delta_digest)
-
     mlx_lm = types.ModuleType("mlx_lm")
     models = types.ModuleType("mlx_lm.models")
-    gated_delta = types.ModuleType("mlx_lm.models.gated_delta")
-    kimi_k3 = types.ModuleType("mlx_lm.models.kimi_k3")
-    kimi_k3_dspark = types.ModuleType("mlx_lm.models.kimi_k3_dspark")
-    gated_delta.__file__ = str(gated_delta_source)
-    kimi_k3.__file__ = str(runtime_source)
-    kimi_k3_dspark.__file__ = str(dspark_source)
-    models.gated_delta = gated_delta
-    models.kimi_k3 = kimi_k3
-    models.kimi_k3_dspark = kimi_k3_dspark
     mlx_lm.models = models
     monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm)
     monkeypatch.setitem(sys.modules, "mlx_lm.models", models)
-    monkeypatch.setitem(sys.modules, "mlx_lm.models.gated_delta", gated_delta)
-    monkeypatch.setitem(sys.modules, "mlx_lm.models.kimi_k3", kimi_k3)
-    monkeypatch.setitem(sys.modules, "mlx_lm.models.kimi_k3_dspark", kimi_k3_dspark)
+
+    pins = {
+        "gated_delta": "MLX_LM_GATED_DELTA_SHA256",
+        "kimi_k3": "MLX_LM_KIMI_K3_SHA256",
+        "kimi_k3_dspark": "MLX_LM_KIMI_K3_DSPARK_SHA256",
+        "kimi_k3_fused_down_reduce": "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256",
+        "kimi_k3_fused_expert": "MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256",
+        "kimi_k3_fused_switch_glu": "MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256",
+        "kimi_k3_packed_moe_front": "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256",
+    }
+    expected: dict[str, str] = {}
+    for module_name, constant_name in pins.items():
+        source = tmp_path / f"{module_name}.py"
+        source.write_bytes(f"pinned {module_name} execution runtime".encode())
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        module = types.ModuleType(f"mlx_lm.models.{module_name}")
+        module.__file__ = str(source)
+        setattr(models, module_name, module)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        monkeypatch.setattr(loader, constant_name, digest)
+        expected[constant_name] = digest
 
     loader._verify_runtime_source()
-    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_SHA256", "0" * 64)
-    with pytest.raises(loader.RankLocalLoadError, match="execution runtime pin"):
-        loader._verify_runtime_source()
+    for module_name, constant_name in pins.items():
+        monkeypatch.setattr(loader, constant_name, "0" * 64)
+        with pytest.raises(loader.RankLocalLoadError, match=f"{module_name}.py"):
+            loader._verify_runtime_source()
+        monkeypatch.setattr(loader, constant_name, expected[constant_name])
 
-    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_SHA256", digest)
-    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_DSPARK_SHA256", "0" * 64)
-    with pytest.raises(loader.RankLocalLoadError, match="kimi_k3_dspark.py"):
-        loader._verify_runtime_source()
 
-    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_DSPARK_SHA256", dspark_digest)
-    monkeypatch.setattr(loader, "MLX_LM_GATED_DELTA_SHA256", "0" * 64)
-    with pytest.raises(loader.RankLocalLoadError, match="gated_delta.py"):
-        loader._verify_runtime_source()
+@pytest.mark.parametrize("failure_rank", (0, 1))
+def test_execution_runtime_preinner_failure_never_enters_checkpoint_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_rank: int,
+):
+    mlx_package = types.ModuleType("mlx")
+    mlx_package.__path__ = []  # type: ignore[attr-defined]
+    mlx_core = types.ModuleType("mlx.core")
+    mlx_lm_package = types.ModuleType("mlx_lm")
+    mlx_lm_package.__path__ = []  # type: ignore[attr-defined]
+    mlx_lm_utils = types.ModuleType("mlx_lm.utils")
+    monkeypatch.setitem(sys.modules, "mlx", mlx_package)
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx_core)
+    monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm_package)
+    monkeypatch.setitem(sys.modules, "mlx_lm.utils", mlx_lm_utils)
+
+    checkpoint_validations: list[None] = []
+
+    def prepare(_model_dir: object, _utils: object) -> tuple:
+        if failure_rank == 0:
+            raise OSError("rank-local path preparation failed")
+        return (tmp_path, object(), object(), object(), False)
+
+    def agree(
+        _mx: object,
+        _group: object,
+        label: str,
+        local_error: BaseException | None,
+    ) -> None:
+        assert label == "execution runtime validation"
+        if failure_rank == 0:
+            assert isinstance(local_error, OSError)
+            raise loader.RankLocalLoadError("local pre-inner failure")
+        assert local_error is None
+        raise loader.RankLocalLoadError("peer pre-inner failure")
+
+    monkeypatch.setattr(loader, "_prepare_execution_runtime", prepare)
+    monkeypatch.setattr(loader, "_agree_local_validation", agree)
+    monkeypatch.setattr(
+        loader,
+        "_verify_manifest",
+        lambda *_args, **_kwargs: checkpoint_validations.append(None),
+    )
+
+    with pytest.raises(loader.RankLocalLoadError, match="pre-inner failure"):
+        loader.load_rank_local_model(tmp_path, tensor_group=FakeGroup())
+
+    assert checkpoint_validations == []
 
 
 def test_manifest_rejects_path_traversal(

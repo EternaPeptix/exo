@@ -119,7 +119,7 @@ def _facts(
         "commits": {
             "exo": canary.EXO_DSPARK_CONTRACT_COMMIT,
             "mlx_lm": canary.MLX_LM_DSPARK_COMMIT,
-            "mlx": canary.MLX_ACCEPTED_COMMIT,
+            "mlx": canary.MLX_DSPARK_COMMIT,
             "factorized_mlx": canary.MLX_FACTORIZED_COMMIT,
         },
         "git_clean": {
@@ -135,6 +135,10 @@ def _facts(
             "mlx_lm_dspark": True,
             "mlx_lm_kimi_k3": True,
             "mlx_lm_gated_delta": True,
+            "mlx_lm_kimi_k3_fused_expert": True,
+            "mlx_lm_kimi_k3_fused_switch_glu": True,
+            "mlx_lm_kimi_k3_fused_down_reduce": True,
+            "mlx_lm_kimi_k3_packed_moe_front": True,
             "factorized_kernel": True,
             "rank_manifest": True,
             "transport": True,
@@ -143,6 +147,16 @@ def _facts(
             "mlx_lm_kimi_k3": canary.MLX_LM_KIMI_K3_SHA256,
             "mlx_lm_dspark": canary.MLX_LM_KIMI_K3_DSPARK_SHA256,
             "mlx_lm_gated_delta": canary.MLX_LM_GATED_DELTA_SHA256,
+            "mlx_lm_kimi_k3_fused_expert": (canary.MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256),
+            "mlx_lm_kimi_k3_fused_switch_glu": (
+                canary.MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256
+            ),
+            "mlx_lm_kimi_k3_fused_down_reduce": (
+                canary.MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256
+            ),
+            "mlx_lm_kimi_k3_packed_moe_front": (
+                canary.MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256
+            ),
         },
         "dspark": {
             "path": canary.DSPARK_PATH,
@@ -190,6 +204,19 @@ def test_plan_pins_abba_gates_and_disabled_unwired_actions(
         "mlx_lm_kimi_k3_sha256": canary.MLX_LM_KIMI_K3_SHA256,
         "mlx_lm_kimi_k3_dspark_sha256": canary.MLX_LM_KIMI_K3_DSPARK_SHA256,
         "mlx_lm_gated_delta_sha256": canary.MLX_LM_GATED_DELTA_SHA256,
+        "mlx_lm_kimi_k3_fused_expert_sha256": (
+            canary.MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256
+        ),
+        "mlx_lm_kimi_k3_fused_switch_glu_sha256": (
+            canary.MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256
+        ),
+        "mlx_lm_kimi_k3_fused_down_reduce_sha256": (
+            canary.MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256
+        ),
+        "mlx_lm_kimi_k3_packed_moe_front_sha256": (
+            canary.MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256
+        ),
+        "mlx_dspark": canary.MLX_DSPARK_COMMIT,
         "mlx_rollback_only_decode": canary.MLX_ACCEPTED_COMMIT,
         "mlx_factorized_rollback_only": canary.MLX_FACTORIZED_COMMIT,
         "mlx_lm_factorized_wire": canary.MLX_LM_FACTORIZED_WIRE_COMMIT,
@@ -209,6 +236,10 @@ def test_plan_pins_abba_gates_and_disabled_unwired_actions(
     assert readiness["start-dspark-width8"] is False
     accepted_flags = _mapping(plan["accepted_flags"])
     assert accepted_flags["EXO_MLX_K3_VOCAB_PARALLEL_GREEDY"] == "1"
+    assert accepted_flags["MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH2"] == "0"
+    assert accepted_flags["MLX_LM_KIMI_K3_PACKED_MOE_FRONT_WIDTH8"] == "0"
+    assert accepted_flags["MLX_METAL_K3_AFFINE8_ROWPAIR"] == "0"
+    assert accepted_flags["MLX_METAL_K3_PACKED_FRONT_ROWPAIR"] == "0"
     assert accepted_flags["MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"] == "0"
     assert accepted_flags["MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE"] == "0"
 
@@ -251,7 +282,8 @@ def test_checked_in_inventory_is_candidate_pinned_and_legacy_actions_are_rollbac
     )
 
     assert inventory.nodes[0].paths["exo_root"].endswith("6eb59a4")
-    assert inventory.nodes[0].paths["mlx_lm_root"].endswith("1bcf430")
+    assert inventory.nodes[0].paths["mlx_lm_root"].endswith("bf378e3")
+    assert inventory.nodes[0].paths["mlx_root"].endswith("2cfb830")
     for action in ("start-baseline", "rollback"):
         contract = _mapping(inventory.actions[action])
         assert "rollback-only" in str(contract["reason"]).lower()
@@ -260,6 +292,10 @@ def test_checked_in_inventory_is_candidate_pinned_and_legacy_actions_are_rollbac
             if "K3_REMOTE_EXO_SOURCE" in environment:
                 assert environment["MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"] == "0"
                 assert environment["MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE"] == "0"
+                assert environment["MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH2"] == "0"
+                assert environment["MLX_LM_KIMI_K3_PACKED_MOE_FRONT_WIDTH8"] == "0"
+                assert environment["MLX_METAL_K3_AFFINE8_ROWPAIR"] == "0"
+                assert environment["MLX_METAL_K3_PACKED_FRONT_ROWPAIR"] == "0"
     for action in ("start-dspark-width3", "start-dspark-width8"):
         contract = _mapping(inventory.actions[action])
         assert contract["enabled"] is False
@@ -431,7 +467,7 @@ def test_apply_rejects_disabled_dspark_even_when_adapter_is_wired(
         )
 
 
-def test_failed_topology_blocks_start_but_retains_confirmed_stop(
+def test_failed_topology_blocks_candidate_but_retains_recovery_actions(
     tmp_path: Path,
 ) -> None:
     inventory = canary.load_inventory(_write_inventory(tmp_path))
@@ -447,9 +483,45 @@ def test_failed_topology_blocks_start_but_retains_confirmed_stop(
     assert any(
         "en5 must be active" in str(error) for error in _list(preflight["errors"])
     )
-    assert readiness["start-baseline"] is False
-    assert readiness["rollback"] is False
+    assert readiness["start-baseline"] is True
+    assert readiness["rollback"] is True
     assert readiness["stop"] is True
+
+
+def test_candidate_only_hash_failure_keeps_rollback_ready(tmp_path: Path) -> None:
+    inventory = canary.load_inventory(_write_inventory(tmp_path))
+    facts_by_rank = {node.rank: _facts(node) for node in inventory.nodes}
+    hashes = _mutable_mapping(facts_by_rank[0]["mlx_lm_source_sha256"])
+    hashes["mlx_lm_dspark"] = "0" * 64
+
+    plan = canary.build_plan(inventory, facts_by_rank)
+
+    preflight = _mapping(plan["preflight"])
+    readiness = _mapping(plan["action_readiness"])
+    assert preflight["pass"] is False
+    assert any(
+        "mlx_lm_dspark SHA-256" in str(error) for error in _list(preflight["errors"])
+    )
+    assert readiness["rollback"] is True
+    assert readiness["start-baseline"] is True
+
+
+def test_recovery_action_requires_its_immutable_local_harness(tmp_path: Path) -> None:
+    data = _inventory_data()
+    actions = _mutable_mapping(data["actions"])
+    rollback = _mutable_mapping(actions["rollback"])
+    steps = _list(rollback["steps"])
+    step = _mutable_mapping(steps[0])
+    step["required_file_sha256"] = {str(tmp_path / "missing-harness.py"): "0" * 64}
+    inventory = canary.load_inventory(_write_inventory(tmp_path, data))
+    facts = {node.rank: _facts(node) for node in inventory.nodes}
+
+    plan = canary.build_plan(inventory, facts)
+
+    readiness = _mapping(plan["action_readiness"])
+    prerequisite_errors = _mapping(plan["action_prerequisite_errors"])
+    assert readiness["rollback"] is False
+    assert "required local file is missing" in str(prerequisite_errors["rollback"])
 
 
 def test_main_apply_missing_confirmation_does_not_execute(

@@ -89,18 +89,275 @@ def expected_half(array: np.ndarray, axis: int, rank: int) -> np.ndarray:
     return np.split(array, 2, axis=axis)[rank]
 
 
+def valid_v1_resume_journal() -> tuple[dict, dict[str, set[str]], object]:
+    filename = "model-00001-of-00185.safetensors"
+    tensor_name = "language_model.model.layers.0.self_attn.A_log"
+    contract = KimiK3ShardingContract(synthetic_config(), world_size=2)
+    desc = checkpoint.TensorDesc(tensor_name, "F32", (6,), 0, 24)
+    ranks = {}
+    for rank in range(2):
+        plan = contract.plan(desc, rank)
+        assert plan is not None
+        ranks[str(rank)] = {
+            "name": filename,
+            "bytes": 128,
+            "sha256": f"{rank + 1}" * 64,
+            "tensor_count": 1,
+            "tensors": {
+                tensor_name: checkpoint._tensor_manifest(plan, filename),
+            },
+        }
+    journal = {
+        "schema": checkpoint.LEGACY_SCHEMA,
+        "source_repo": checkpoint.SOURCE_REPO,
+        "source_revision": checkpoint.SOURCE_REVISION,
+        "config_sha256": "a" * 64,
+        "index_sha256": "b" * 64,
+        "contract_digest": contract.contract_digest(),
+        "world_size": 2,
+        "files": {
+            filename: {
+                "source": {
+                    "bytes": 256,
+                    "sha256": "c" * 64,
+                    "url": None,
+                    "resumed": False,
+                },
+                "ranks": ranks,
+                "excluded": False,
+                "committed": True,
+            }
+        },
+        "complete": False,
+    }
+    return journal, {filename: {tensor_name}}, contract
+
+
+def validate_resume_journal(journal: dict) -> dict:
+    _original, keys_by_file, contract = valid_v1_resume_journal()
+    return checkpoint._validate_resume_journal(
+        journal,
+        config_sha256="a" * 64,
+        index_sha256="b" * 64,
+        world_size=2,
+        contract=contract,
+        keys_by_file=keys_by_file,
+    )
+
+
+def test_v1_resume_journal_is_strictly_validated_and_migrated_to_v2():
+    journal, _keys_by_file, _contract = valid_v1_resume_journal()
+
+    validated = validate_resume_journal(journal)
+
+    assert validated is journal
+    assert validated["schema"] == checkpoint.SCHEMA
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("world_size", 3, "world_size"),
+        ("contract_digest", "d" * 64, "contract_digest"),
+        ("schema", "k3-rank-local-tp/v99", "unsupported schema"),
+    ],
+)
+def test_resume_journal_rejects_incompatible_root_contract(
+    field: str,
+    value: object,
+    message: str,
+):
+    journal, _keys_by_file, _contract = valid_v1_resume_journal()
+    journal[field] = value
+
+    with pytest.raises(ConversionError, match=message):
+        validate_resume_journal(journal)
+
+
+def test_resume_journal_rejects_path_like_rank_record_name():
+    journal, _keys_by_file, _contract = valid_v1_resume_journal()
+    entry = next(iter(journal["files"].values()))
+    entry["ranks"]["0"]["name"] = "nested/model-00001-of-00185.safetensors"
+
+    with pytest.raises(ConversionError, match="safe checkpoint basename"):
+        validate_resume_journal(journal)
+
+
+@pytest.mark.parametrize("files", [[], "not-an-object", None])
+def test_resume_journal_rejects_malformed_files_mapping(files: object):
+    journal, _keys_by_file, _contract = valid_v1_resume_journal()
+    journal["files"] = files
+
+    with pytest.raises(ConversionError, match="files must be an object"):
+        validate_resume_journal(journal)
+
+
+def write_source_free_resume_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, list[Path], Path, Path, str, dict]:
+    tensor_name = "language_model.model.layers.0.self_attn.A_log"
+    filename = "model-00001-of-00185.safetensors"
+    metadata_dir = tmp_path / "metadata"
+    write_pinned_test_metadata(
+        metadata_dir,
+        monkeypatch,
+        {tensor_name: filename},
+    )
+    (metadata_dir / "LICENSE").write_text("Kimi K3 license text\n")
+    source_path = tmp_path / "template" / filename
+    write_synthetic_safetensors(
+        source_path,
+        {tensor_name: ("F32", seq((6,), np.float32))},
+    )
+    contract = KimiK3ShardingContract(synthetic_config(), world_size=2)
+    rank_dirs = [tmp_path / "rank0", tmp_path / "rank1"]
+    ranks: dict[str, dict] = {}
+    with SafeTensorFile(source_path) as source:
+        for rank, rank_dir in enumerate(rank_dirs):
+            desc = source.tensors[tensor_name]
+            plan = contract.plan(desc, rank)
+            assert plan is not None
+            record = write_rank_shard(
+                source,
+                rank_dir / filename,
+                [plan],
+                rank=rank,
+                world_size=2,
+                max_buffer_bytes=64,
+            )
+            record["tensors"] = {
+                tensor_name: checkpoint._tensor_manifest(plan, filename)
+            }
+            ranks[str(rank)] = record
+
+    journal = {
+        "schema": checkpoint.LEGACY_SCHEMA,
+        "source_repo": checkpoint.SOURCE_REPO,
+        "source_revision": checkpoint.SOURCE_REVISION,
+        "config_sha256": checkpoint._sha256_file(metadata_dir / "config.json"),
+        "index_sha256": checkpoint._sha256_file(
+            metadata_dir / "model.safetensors.index.json"
+        ),
+        "contract_digest": contract.contract_digest(),
+        "world_size": 2,
+        "files": {
+            filename: {
+                "source": {
+                    "bytes": source_path.stat().st_size,
+                    "sha256": checkpoint._sha256_file(source_path),
+                    "url": None,
+                    "resumed": False,
+                },
+                "ranks": ranks,
+                "excluded": False,
+                "committed": True,
+            }
+        },
+        "complete": False,
+    }
+    journal_path = metadata_dir / "tp-conversion-journal.json"
+    journal_path.write_text(json.dumps(journal, sort_keys=True))
+    return (
+        metadata_dir,
+        rank_dirs,
+        tmp_path / "unavailable-source",
+        tmp_path / "cache",
+        filename,
+        journal,
+    )
+
+
+def test_v1_source_free_resume_revalidates_outputs_and_writes_v2_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    metadata_dir, rank_dirs, source_dir, cache_dir, _filename, _journal = (
+        write_source_free_resume_fixture(tmp_path, monkeypatch)
+    )
+
+    completed = checkpoint.convert_checkpoint(
+        metadata_dir=metadata_dir,
+        rank_dirs=rank_dirs,
+        source_dir=source_dir,
+        cache_dir=cache_dir,
+    )
+
+    assert completed["schema"] == checkpoint.SCHEMA
+    assert completed["complete"] is True
+    for rank_dir in rank_dirs:
+        manifest = json.loads((rank_dir / "tp_manifest.json").read_text())
+        assert manifest["schema"] == checkpoint.SCHEMA
+
+
+def test_source_free_resume_rejects_symlinked_rank_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    metadata_dir, rank_dirs, source_dir, cache_dir, filename, _journal = (
+        write_source_free_resume_fixture(tmp_path, monkeypatch)
+    )
+    rank_path = rank_dirs[0] / filename
+    symlink_target = tmp_path / "symlink-target.safetensors"
+    rank_path.replace(symlink_target)
+    rank_path.symlink_to(symlink_target)
+
+    with pytest.raises(ConversionError, match="missing source shard"):
+        checkpoint.convert_checkpoint(
+            metadata_dir=metadata_dir,
+            rank_dirs=rank_dirs,
+            source_dir=source_dir,
+            cache_dir=cache_dir,
+        )
+
+
+def test_source_free_resume_rejects_file_with_mismatched_safetensors_header(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    metadata_dir, rank_dirs, source_dir, cache_dir, filename, journal = (
+        write_source_free_resume_fixture(tmp_path, monkeypatch)
+    )
+    rank_path = rank_dirs[0] / filename
+    tensor_name = "language_model.model.layers.0.self_attn.A_log"
+    write_synthetic_safetensors(
+        rank_path,
+        {tensor_name: ("F32", seq((2,), np.float32))},
+        metadata={
+            "format": "mlx",
+            "schema": checkpoint.SCHEMA,
+            "source_repo": checkpoint.SOURCE_REPO,
+            "source_revision": checkpoint.SOURCE_REVISION,
+            "source_file": filename,
+            "tp_rank": "0",
+            "tp_world_size": "2",
+            "sharding_contract": checkpoint.CONTRACT_VERSION,
+        },
+    )
+    rank_record = journal["files"][filename]["ranks"]["0"]
+    rank_record["bytes"] = rank_path.stat().st_size
+    rank_record["sha256"] = checkpoint._sha256_file(rank_path)
+    (metadata_dir / "tp-conversion-journal.json").write_text(
+        json.dumps(journal, sort_keys=True)
+    )
+
+    with pytest.raises(ConversionError, match="missing source shard"):
+        checkpoint.convert_checkpoint(
+            metadata_dir=metadata_dir,
+            rank_dirs=rank_dirs,
+            source_dir=source_dir,
+            cache_dir=cache_dir,
+        )
+
+
 def test_rule_classification_exact_model_shard_contract():
     contract = KimiK3ShardingContract(synthetic_config(), world_size=2)
     cases = {
         "language_model.model.embed_tokens.weight": "replicated",
         "vision_tower.encoder.weight": "excluded",
-        "language_model.model.layers.0.self_attn.qkv_proj.weight": (
-            "all-to-sharded"
-        ),
+        "language_model.model.layers.0.self_attn.qkv_proj.weight": ("all-to-sharded"),
         "language_model.model.layers.0.self_attn.qkv_conv.conv.weight": "axis",
-        "language_model.model.layers.0.self_attn.o_proj.scales": (
-            "sharded-to-all"
-        ),
+        "language_model.model.layers.0.self_attn.o_proj.scales": ("sharded-to-all"),
         "language_model.model.layers.0.mlp.gate_proj.weight": "all-to-sharded",
         "language_model.model.layers.0.mlp.down_proj.biases": "sharded-to-all",
         "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight": (
@@ -114,14 +371,10 @@ def test_rule_classification_exact_model_shard_contract():
         "language_model.model.layers.1.mlp.routed_expert_down_proj.weight": (
             "replicated"
         ),
-        "language_model.model.layers.3.self_attn.q_b_proj.weight": (
-            "all-to-sharded"
-        ),
+        "language_model.model.layers.3.self_attn.q_b_proj.weight": ("all-to-sharded"),
         "language_model.model.layers.3.self_attn.embed_q.weight": "axis",
         "language_model.model.layers.3.self_attn.unembed_out.scales": "axis",
-        "language_model.model.layers.3.self_attn.o_proj.weight": (
-            "sharded-to-all"
-        ),
+        "language_model.model.layers.3.self_attn.o_proj.weight": ("sharded-to-all"),
     }
     for name, expected in cases.items():
         assert contract.classify(name, 3).kind == expected, name
@@ -181,9 +434,7 @@ def test_streaming_writer_matches_numpy_reference_for_both_ranks(tmp_path: Path)
         ),
         "router": "language_model.model.layers.1.mlp.gate.weight",
         "embed_q": "language_model.model.layers.3.self_attn.embed_q.weight",
-        "unembed_s": (
-            "language_model.model.layers.3.self_attn.unembed_out.scales"
-        ),
+        "unembed_s": ("language_model.model.layers.3.self_attn.unembed_out.scales"),
         "bf16_norm": "language_model.model.layers.3.input_layernorm.weight",
         "vision": "vision_tower.encoder.weight",
     }
@@ -264,9 +515,7 @@ def test_streaming_writer_matches_numpy_reference_for_both_ranks(tmp_path: Path)
             actual[names["switch_down"]],
             expected_half(references[names["switch_down"]], 2, rank),
         )
-        assert np.array_equal(
-            actual[names["router"]], references[names["router"]]
-        )
+        assert np.array_equal(actual[names["router"]], references[names["router"]])
         assert np.array_equal(
             actual[names["embed_q"]],
             expected_half(references[names["embed_q"]], 0, rank),

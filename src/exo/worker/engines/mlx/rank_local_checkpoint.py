@@ -26,6 +26,7 @@ from exo.shared.types.worker.shards import ShardMetadata, TensorShardMetadata
 RANK_LOCAL_CHECKPOINT_ENV = "EXO_MLX_RANK_LOCAL_CHECKPOINT"
 RANK_LOCAL_LOADER_ENV = "EXO_MLX_RANK_LOCAL_LOADER"
 RANK_LOCAL_VERIFY_HASHES_ENV = "EXO_MLX_RANK_LOCAL_VERIFY_HASHES"
+RANK_LOCAL_VOCAB_PARALLEL_HEAD_ENV = "EXO_MLX_K3_VOCAB_PARALLEL_HEAD"
 
 SUPPORTED_MODEL_ID = "kernelpool/Kimi-K3-2bit-UVMAX"
 SUPPORTED_LOADER_SCHEMA = "k3-rank-local-tp/v2"
@@ -45,7 +46,7 @@ SUPPORTED_TP_CONTRACT_DIGEST = (
     "1b7fdf1b28433fb08fff7e0e26a7bccc2ca0fcd51f29498ab611892c9fc48da5"
 )
 SUPPORTED_LOADER_SHA256 = (
-    "2add4bc5405201437b0f3e0df968532ed717bdf7bff0587ba94d00d0811eb557"
+    "4110c28148be2172d9f0d0e9b6acff92c33806f1f003e9dad142435f42c61c29"
 )
 ALLOWED_RANK_LOCAL_METADATA_FILENAMES = frozenset(
     {
@@ -74,9 +75,7 @@ ALLOWED_RANK_LOCAL_METADATA_FILENAMES = frozenset(
     }
 )
 REQUIRED_RANK_LOCAL_METADATA_FILENAMES = frozenset({"config.json"})
-RANK_LOCAL_LICENSE_FILENAMES = frozenset(
-    {"LICENSE", "LICENSE.md", "LICENSE.txt"}
-)
+RANK_LOCAL_LICENSE_FILENAMES = frozenset({"LICENSE", "LICENSE.md", "LICENSE.txt"})
 _ALLOWED_CHECKPOINT_TEMPLATE_FIELDS = frozenset({"rank", "world_size"})
 
 
@@ -111,6 +110,15 @@ class RankLocalModelLoader(Protocol):
         *,
         verify_file_hashes: bool,
     ) -> object: ...
+
+
+@dataclass(frozen=True)
+class PreparedRankLocalLoad:
+    checkpoint_path: Path
+    checkpoint_template: str
+    runtime: RankLocalRuntimePreflight
+    vocab_parallel_head: bool
+    load_model: RankLocalModelLoader
 
 
 def parse_rank_local_verify_hashes() -> bool:
@@ -270,16 +278,11 @@ def preflight_rank_local_runtime() -> RankLocalRuntimePreflight:
     )
 
 
-def load_configured_rank_local_model(
+def preflight_configured_rank_local_model(
     shard_metadata: ShardMetadata,
     group: DistributedGroup,
-) -> RankLocalLoad | None:
-    """Load the configured rank checkpoint, or return ``None`` when disabled.
-
-    For tensor shards, once ``EXO_MLX_RANK_LOCAL_CHECKPOINT`` is set, every
-    validation or loader error is fatal. Pipeline and CFG shards ignore this
-    tensor-only opt-in, matching the path resolver.
-    """
+) -> PreparedRankLocalLoad | None:
+    """Finish every local check before the external loader's collectives."""
 
     checkpoint_template = os.environ.get(RANK_LOCAL_CHECKPOINT_ENV)
     if checkpoint_template is None or not isinstance(
@@ -302,6 +305,11 @@ def load_configured_rank_local_model(
     checkpoint_path = resolve_configured_rank_local_checkpoint_path(shard_metadata)
     assert checkpoint_path is not None
     runtime = preflight_rank_local_runtime()
+    vocab_raw = os.environ.get(RANK_LOCAL_VOCAB_PARALLEL_HEAD_ENV, "0")
+    if vocab_raw not in {"0", "1"}:
+        raise RankLocalConfigurationError(
+            f"{RANK_LOCAL_VOCAB_PARALLEL_HEAD_ENV} must be exactly 0 or 1"
+        )
     module = _load_external_module(runtime.loader_path)
     if cast(object, getattr(module, "SCHEMA", None)) != SUPPORTED_LOADER_SCHEMA:
         raise RankLocalConfigurationError(
@@ -316,12 +324,25 @@ def load_configured_rank_local_model(
         raise RankLocalConfigurationError(
             "external rank-local loader has no callable load_rank_local_model"
         )
-    load_model = cast(RankLocalModelLoader, load_model_value)
+    return PreparedRankLocalLoad(
+        checkpoint_path=checkpoint_path,
+        checkpoint_template=checkpoint_template,
+        runtime=runtime,
+        vocab_parallel_head=vocab_raw == "1",
+        load_model=cast(RankLocalModelLoader, load_model_value),
+    )
 
-    loaded: object = load_model(
-        checkpoint_path,
+
+def load_preflighted_rank_local_model(
+    prepared: PreparedRankLocalLoad,
+    group: DistributedGroup,
+) -> RankLocalLoad:
+    """Enter the external loader only after every rank agreed on preflight."""
+
+    loaded: object = prepared.load_model(
+        prepared.checkpoint_path,
         tensor_group=group,
-        verify_file_hashes=runtime.verify_file_hashes,
+        verify_file_hashes=prepared.runtime.verify_file_hashes,
     )
     if not isinstance(loaded, tuple):
         raise RankLocalConfigurationError(
@@ -355,6 +376,23 @@ def load_configured_rank_local_model(
         )
     return RankLocalLoad(
         model=model,
-        checkpoint_path=checkpoint_path,
+        checkpoint_path=prepared.checkpoint_path,
         config=config,
     )
+
+
+def load_configured_rank_local_model(
+    shard_metadata: ShardMetadata,
+    group: DistributedGroup,
+) -> RankLocalLoad | None:
+    """Load the configured rank checkpoint, or return ``None`` when disabled.
+
+    For tensor shards, once ``EXO_MLX_RANK_LOCAL_CHECKPOINT`` is set, every
+    validation or loader error is fatal. Pipeline and CFG shards ignore this
+    tensor-only opt-in, matching the path resolver.
+    """
+
+    prepared = preflight_configured_rank_local_model(shard_metadata, group)
+    if prepared is None:
+        return None
+    return load_preflighted_rank_local_model(prepared, group)
