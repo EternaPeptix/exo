@@ -281,7 +281,7 @@ def test_checked_in_inventory_is_candidate_pinned_and_legacy_actions_are_rollbac
         SCRIPT_DIR / "k3_maintenance_canary.inventory.json"
     )
 
-    assert inventory.nodes[0].paths["exo_root"].endswith("6eb59a4")
+    assert inventory.nodes[0].paths["exo_root"].endswith("04d616d")
     assert inventory.nodes[0].paths["mlx_lm_root"].endswith("bf378e3")
     assert inventory.nodes[0].paths["mlx_root"].endswith("2cfb830")
     for action in ("start-baseline", "rollback"):

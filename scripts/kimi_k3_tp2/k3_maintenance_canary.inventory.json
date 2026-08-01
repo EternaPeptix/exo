@@ -11,7 +11,7 @@
         "jeweled@512S1.local"
       ],
       "paths": {
-        "exo_root": "/Users/jeweled/exo-k3-dspark-runtime-6eb59a4",
+        "exo_root": "/Users/jeweled/exo-k3-dspark-runtime-04d616d",
         "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-maintenance-bf378e3",
         "mlx_root": "/Users/jeweled/.exo/mlx-overrides/2cfb830",
         "factorized_mlx_root": "/Users/jeweled/mlx-k3-factorized-152f018",
@@ -34,7 +34,7 @@
         "jeweled@169.254.199.64"
       ],
       "paths": {
-        "exo_root": "/Users/jeweled/exo-k3-dspark-runtime-6eb59a4",
+        "exo_root": "/Users/jeweled/exo-k3-dspark-runtime-04d616d",
         "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-maintenance-bf378e3",
         "mlx_root": "/Users/jeweled/.exo/mlx-overrides/2cfb830",
         "factorized_mlx_root": "/Users/jeweled/mlx-k3-factorized-152f018",

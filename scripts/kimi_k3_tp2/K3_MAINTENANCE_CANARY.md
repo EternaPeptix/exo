@@ -7,7 +7,7 @@ prints a deterministic JSON plan.  No command in this runbook was executed on
 either Mac while this offline package was prepared.
 
 The plan is rooted at the default-off EXO generator integration
-`6eb59a4770d7a2efaa632c0b3f3df26fde545361`. It pins and source-attests the
+`04d616d5dafc07dd0146f49a70cc39ee03ef3158`. It pins and source-attests the
 consolidated MLX-LM candidate, but both DSpark actions remain disabled until a
 real two-Mac TP2 Builder-to-`mlx_generate` hardware canary exercises reject and
 full-accept rounds. No confirmation string can bypass that block. Segmented
@@ -21,11 +21,16 @@ The preflight accepts only this source and data set:
 
 | Component | Required value |
 | --- | --- |
-| EXO DSpark generator candidate | `6eb59a4770d7a2efaa632c0b3f3df26fde545361` |
-| Consolidated MLX-LM candidate | `1bcf43047a5a2c4a5be64f3c45ed33666981d1c1` |
+| EXO DSpark generator candidate | `04d616d5dafc07dd0146f49a70cc39ee03ef3158` |
+| Consolidated MLX-LM candidate | `bf378e33831e745715a88418a44ce20ab1075b9b` |
+| Default-off MLX kernel candidate | `2cfb83040011c273377a25df8ed16def80c6646c` |
 | MLX-LM `kimi_k3.py` SHA-256 | `3e283240117d298d95e33f7238cb49abc5606aafdd26f70062e841518059088b` |
 | MLX-LM `kimi_k3_dspark.py` SHA-256 | `5ba010755e703f39b86aed1ad999576a18f2f93c041b502bbe3f57b197af2f01` |
 | MLX-LM `gated_delta.py` SHA-256 | `44aef2791ed0cd5cfb84e31ef00cb4df3d40ae184e6c6852b7f0dba7406d2f78` |
+| MLX-LM `kimi_k3_fused_expert.py` SHA-256 | `d51bf88fa603846f4ac9876faf724d273a99ca8b6643715f68df5993eb352d68` |
+| MLX-LM `kimi_k3_fused_switch_glu.py` SHA-256 | `0aa226e32b992e5bb18a14b4a3ead225b6a6f531431249e1ae6b5bbb35ca29d1` |
+| MLX-LM `kimi_k3_fused_down_reduce.py` SHA-256 | `2b9841394f8334e02044f2e6b418f0bc7ff41cc719a877464a311c5e8c899ee9` |
+| MLX-LM `kimi_k3_packed_moe_front.py` SHA-256 | `82076bf9c0098f2fc72a0434a5482e72a6e022fc982574f05867dcce32645435` |
 | Rollback-only MLX/JACCL decode runtime | `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
 | Rollback-only factorized MLX core | `152f01807c8327ac154b8ed56dd9279a6f9506e6` |
 | Factorized MLX-LM wiring ancestor | `53dbe04a0499ffb3e98ede90ff5a82f118f77f04` |
@@ -53,7 +58,7 @@ for rank 1.  A node with less than 500 GiB physical RAM or 16 GiB free in its
 artifact filesystem fails preflight.
 
 Those hashes identify the legacy schema-v1 manifests and are retained only as
-drift evidence. Candidate commit `6eb59a4` requires schema v2, which signs all
+drift evidence. Candidate commit `04d616d` requires schema v2, which signs all
 tokenizer/config/remote-code metadata and agrees its digest across ranks.
 Before either DSpark start action can be enabled, rerun the converter to refresh
 both manifests, inspect the resulting metadata inventory, and replace both
@@ -63,12 +68,12 @@ The exact host routes and intended staging paths are in
 `k3_maintenance_canary.inventory.json`.  Four paths are staging contracts, not
 a claim that deployment has occurred:
 
-- `/Users/jeweled/exo-k3-dspark-runtime-6eb59a4` must resolve to the candidate
+- `/Users/jeweled/exo-k3-dspark-runtime-04d616d` must resolve to the candidate
   EXO commit;
-- `/Users/jeweled/mlx-lm-k3-maintenance-1bcf430` must resolve to the candidate
-  MLX-LM commit and all three source hashes above;
-- `/Users/jeweled/.exo/mlx-overrides/57b87fe` must resolve to the rollback-only
-  MLX commit;
+- `/Users/jeweled/mlx-lm-k3-maintenance-bf378e3` must resolve to the candidate
+  MLX-LM commit and all seven source hashes above;
+- `/Users/jeweled/.exo/mlx-overrides/2cfb830` must resolve to the default-off
+  MLX kernel candidate;
 - `/Users/jeweled/mlx-k3-factorized-152f018` must resolve to the rollback-only
   factorized MLX commit.
 

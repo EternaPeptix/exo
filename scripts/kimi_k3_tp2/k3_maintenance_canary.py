@@ -25,7 +25,7 @@ INVENTORY_SCHEMA: Final = "k3-maintenance-canary-inventory/v1"
 FACTS_SCHEMA: Final = "k3-maintenance-canary-facts/v1"
 
 # Candidate sources plus distinct rollback/baseline evidence.
-EXO_DSPARK_CONTRACT_COMMIT: Final = "6eb59a4770d7a2efaa632c0b3f3df26fde545361"
+EXO_DSPARK_CONTRACT_COMMIT: Final = "04d616d5dafc07dd0146f49a70cc39ee03ef3158"
 MLX_LM_DSPARK_COMMIT: Final = "bf378e33831e745715a88418a44ce20ab1075b9b"
 MLX_DSPARK_COMMIT: Final = "2cfb83040011c273377a25df8ed16def80c6646c"
 MLX_ACCEPTED_COMMIT: Final = "57b87fe47cfce34d6dc59d0e274d8ee36bfb9308"
