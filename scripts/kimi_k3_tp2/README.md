@@ -47,6 +47,12 @@ parallel checkpoints.
   set `K3_DECODER_LAYER_LOCALIZER_EXACT_WIDE_SHORT_CONV=1` for the explicit
   candidate run. The selector is validated as exactly `0` or `1` and is
   attested in the artifact.
+- `k3_maintenance_canary.py` is the fail-closed, default-read-only two-rank
+  maintenance planner pinned to the offline DSpark scaffold. Its local
+  maintenance inventory binds exact staging paths, ordered action argv and
+  environment, and the existing harness hash into an inspected plan digest;
+  all candidate start actions remain disabled until their adapter/runtime
+  gates are implemented. See `K3_MAINTENANCE_CANARY.md`.
 - `transport-jaccl-tp2.example.json` documents the explicit topology contract
   that both ranks must receive; it contains placeholders, not deployment
   inventory.
@@ -56,5 +62,7 @@ parallel checkpoints.
 The full, sanitized procedure and exact dependency pins are in
 [`../../docs/kimi_k3_tp2.md`](../../docs/kimi_k3_tp2.md).
 
-This package intentionally excludes credentials, machine inventories,
-hostfiles, generated benchmark artifacts, and model weights.
+This package intentionally excludes credentials, hostfiles, generated
+benchmark artifacts, and model weights. The maintenance-only inventory names
+the two already-documented hosts and absolute staging paths but contains no
+credential material.

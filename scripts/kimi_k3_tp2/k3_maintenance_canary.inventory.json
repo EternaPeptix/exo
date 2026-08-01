@@ -1,0 +1,265 @@
+{
+  "schema": "k3-maintenance-canary-inventory/v1",
+  "nodes": [
+    {
+      "name": "512S1",
+      "rank": 0,
+      "ssh": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "jeweled@512S1.local"
+      ],
+      "paths": {
+        "exo_root": "/Users/jeweled/exo-k3-dspark-a583614",
+        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-dspark-replayssm-factorized-53dbe04",
+        "mlx_root": "/Users/jeweled/mlx-k3-accepted-57b87fe",
+        "factorized_mlx_root": "/Users/jeweled/mlx-k3-factorized-152f018",
+        "rank_checkpoint": "/Users/jeweled/.exo/models/kernelpool--Kimi-K3-2bit-UVMAX-tp2-rank0",
+        "dspark_checkpoint": "/Users/jeweled/.exo/models/RadixArk--Kimi-K3-DSpark-eb03982e58d4fb79bcfc099e902158f562e2e27b",
+        "transport_contract": "/Users/jeweled/.exo-k3/transport-jaccl-tp2-en5.json",
+        "artifact_root": "/Users/jeweled/.exo-k3/canary-artifacts"
+      },
+      "rank_manifest_sha256": "2da4db586e81a61fbea990e95fcfa14d14a0563c6cdafc6767373f5a74e12b21"
+    },
+    {
+      "name": "512S2",
+      "rank": 1,
+      "ssh": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-J",
+        "jeweled@512S1.local",
+        "jeweled@169.254.42.123"
+      ],
+      "paths": {
+        "exo_root": "/Users/jeweled/exo-k3-dspark-a583614",
+        "mlx_lm_root": "/Users/jeweled/mlx-lm-k3-dspark-replayssm-factorized-53dbe04",
+        "mlx_root": "/Users/jeweled/mlx-k3-accepted-57b87fe",
+        "factorized_mlx_root": "/Users/jeweled/mlx-k3-factorized-152f018",
+        "rank_checkpoint": "/Users/jeweled/.exo/models/kernelpool--Kimi-K3-2bit-UVMAX-tp2-rank1",
+        "dspark_checkpoint": "/Users/jeweled/.exo/models/RadixArk--Kimi-K3-DSpark-eb03982e58d4fb79bcfc099e902158f562e2e27b",
+        "transport_contract": "/Users/jeweled/.exo-k3/transport-jaccl-tp2-en5.json",
+        "artifact_root": "/Users/jeweled/.exo-k3/canary-artifacts"
+      },
+      "rank_manifest_sha256": "c91c25a9439471ba115d45ae3371341954bbb0453677549c1fb6eeb2ace0d23f"
+    }
+  ],
+  "actions": {
+    "stop": {
+      "enabled": true,
+      "reason": "Emergency stop of the isolated accepted K3 service remains available even when a preflight gate fails.",
+      "steps": [
+        {
+          "argv": [
+            "/usr/bin/python3",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py",
+            "--api-url",
+            "http://512S1.local:52415",
+            "stop",
+            "--apply"
+          ],
+          "environment": {
+            "K3_REMOTE_EXO_HOME": ".exo-k3",
+            "K3_S1_SSH_HOST": "512S1.local",
+            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+          },
+          "required_file_sha256": {
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
+          }
+        }
+      ]
+    },
+    "start-baseline": {
+      "enabled": true,
+      "reason": "Launch and explicitly place the accepted non-speculative one-rail TP2 stack.",
+      "steps": [
+        {
+          "argv": [
+            "/usr/bin/python3",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py",
+            "--api-url",
+            "http://512S1.local:52415",
+            "--artifact-dir",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-a583614",
+            "launch",
+            "--namespace",
+            "kimi-k3-maintenance-a583614",
+            "--tensor",
+            "--jaccl-force-mesh",
+            "--vocab-parallel-head",
+            "--fused-experts",
+            "--fused-down-reduce",
+            "--fused-router",
+            "--fused-attnres-rms",
+            "--packed-kda-skinny",
+            "--packed-kda-wide",
+            "--fused-routed-up-add",
+            "--authoritative-packed-moe-front",
+            "--kda-row-prefill",
+            "--async-decode-boundaries",
+            "laguna8",
+            "--async-decode-state",
+            "hidden",
+            "--apply"
+          ],
+          "environment": {
+            "K3_REMOTE_EXO_HOME": ".exo-k3",
+            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3",
+            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-overlay",
+            "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
+            "K3_S1_SSH_HOST": "512S1.local",
+            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+          },
+          "required_file_sha256": {
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
+          }
+        },
+        {
+          "argv": [
+            "/usr/bin/python3",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py",
+            "--api-url",
+            "http://512S1.local:52415",
+            "--artifact-dir",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-a583614",
+            "place",
+            "--backend",
+            "MlxJaccl",
+            "--sharding",
+            "Tensor",
+            "--coordinator-ip",
+            "169.254.205.255",
+            "--apply"
+          ],
+          "environment": {
+            "K3_REMOTE_EXO_HOME": ".exo-k3",
+            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3",
+            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-overlay",
+            "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
+            "K3_S1_SSH_HOST": "512S1.local",
+            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+          },
+          "required_file_sha256": {
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
+          }
+        }
+      ]
+    },
+    "start-dspark-width3": {
+      "enabled": false,
+      "reason": "Blocked: EXO scaffold a583614 is not wired into generate.py and the adapter contract audit is unresolved.",
+      "steps": []
+    },
+    "start-dspark-width8": {
+      "enabled": false,
+      "reason": "Blocked: native gamma-7 width-8 must not run until the EXO adapter and collective commit protocol are repaired.",
+      "steps": []
+    },
+    "rollback": {
+      "enabled": true,
+      "reason": "Stop the maintenance service, relaunch the accepted non-speculative stack, and recreate the explicit TP2 placement.",
+      "steps": [
+        {
+          "argv": [
+            "/usr/bin/python3",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py",
+            "--api-url",
+            "http://512S1.local:52415",
+            "stop",
+            "--apply"
+          ],
+          "environment": {
+            "K3_REMOTE_EXO_HOME": ".exo-k3",
+            "K3_S1_SSH_HOST": "512S1.local",
+            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+          },
+          "required_file_sha256": {
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
+          }
+        },
+        {
+          "argv": [
+            "/usr/bin/python3",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py",
+            "--api-url",
+            "http://512S1.local:52415",
+            "--artifact-dir",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-a583614",
+            "launch",
+            "--namespace",
+            "kimi-k3-maintenance-a583614",
+            "--tensor",
+            "--jaccl-force-mesh",
+            "--vocab-parallel-head",
+            "--fused-experts",
+            "--fused-down-reduce",
+            "--fused-router",
+            "--fused-attnres-rms",
+            "--packed-kda-skinny",
+            "--packed-kda-wide",
+            "--fused-routed-up-add",
+            "--authoritative-packed-moe-front",
+            "--kda-row-prefill",
+            "--async-decode-boundaries",
+            "laguna8",
+            "--async-decode-state",
+            "hidden",
+            "--apply"
+          ],
+          "environment": {
+            "K3_REMOTE_EXO_HOME": ".exo-k3",
+            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3",
+            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-overlay",
+            "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
+            "K3_S1_SSH_HOST": "512S1.local",
+            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+          },
+          "required_file_sha256": {
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
+          }
+        },
+        {
+          "argv": [
+            "/usr/bin/python3",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py",
+            "--api-url",
+            "http://512S1.local:52415",
+            "--artifact-dir",
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/artifacts/maintenance-a583614",
+            "place",
+            "--backend",
+            "MlxJaccl",
+            "--sharding",
+            "Tensor",
+            "--coordinator-ip",
+            "169.254.205.255",
+            "--apply"
+          ],
+          "environment": {
+            "K3_REMOTE_EXO_HOME": ".exo-k3",
+            "K3_REMOTE_EXO_SOURCE": "/Users/jeweled/exo-k3",
+            "K3_REMOTE_MLX_OVERLAY": "/Users/jeweled/mlx-lm-k3-overlay",
+            "K3_RUNTIME_LABEL": "k3-accepted-57b87fe-one-rail-en5",
+            "K3_S1_SSH_HOST": "512S1.local",
+            "K3_S2_TUNNEL_HOST": "169.254.42.123"
+          },
+          "required_file_sha256": {
+            "/Users/jeweled/Documents/Codex/2026-07-24/we/work/kimi_k3_exo_harness/k3_exo_harness.py": "5a06020d6ea5330d6dca12c9c1a4cb6ba9ee0f8d0374a2000f9265d16a8c6a7b"
+          }
+        }
+      ]
+    },
+    "start-factorized-off": {
+      "enabled": false,
+      "reason": "Blocked: factorized-prefill is a separate canary and the maintenance harness does not yet bind its staged core.",
+      "steps": []
+    },
+    "start-factorized-on": {
+      "enabled": false,
+      "reason": "Blocked: factorized-prefill remains default-off pending model-level gates and a pinned runtime launcher.",
+      "steps": []
+    }
+  }
+}
