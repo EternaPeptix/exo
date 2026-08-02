@@ -46,36 +46,71 @@ SUPPORTED_TP_CONTRACT_DIGEST = (
     "1b7fdf1b28433fb08fff7e0e26a7bccc2ca0fcd51f29498ab611892c9fc48da5"
 )
 SUPPORTED_LOADER_SHA256 = (
-    "f5a120300e7db6ad24c8061ef282b887c5a128810ff17d0e2377e56f11180735"
+    "cd3407fa7724e2fe0faca020a4b5fd327a010dde447285c3094e868d209b9f9f"
 )
-ALLOWED_RANK_LOCAL_METADATA_FILENAMES = frozenset(
-    {
-        "LICENSE",
-        "LICENSE.md",
-        "LICENSE.txt",
-        "README.md",
-        "added_tokens.json",
-        "chat_template.jinja",
-        "config.json",
-        "configuration_kimi_k3.py",
-        "encoding_k3.py",
-        "generation_config.json",
-        "kimi_k3_processor.py",
-        "kimi_k3_vision_processing.py",
-        "media_utils.py",
-        "merges.txt",
-        "preprocessor_config.json",
-        "processor_config.json",
-        "special_tokens_map.json",
-        "tokenization_kimi.py",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "video_preprocessor_config.json",
-        "vocab.json",
-    }
-)
-REQUIRED_RANK_LOCAL_METADATA_FILENAMES = frozenset({"config.json"})
-RANK_LOCAL_LICENSE_FILENAMES = frozenset({"LICENSE", "LICENSE.md", "LICENSE.txt"})
+# Exact non-weight inventory from SOURCE_REPO@SUPPORTED_SOURCE_REVISION.  Some
+# of these files execute under ``trust_remote_code=True``.  Pinning only their
+# names would authorize substituted Python, so the runtime authenticates the
+# complete inventory, size, and digest before importing the loader.
+PINNED_RANK_LOCAL_METADATA_FILES: dict[str, dict[str, int | str]] = {
+    "README.md": {
+        "bytes": 1923,
+        "sha256": "d0d7a4d1a5af37c542594449d2ce893b9e3c33ccb031afb71cf13e4f23a5349d",
+    },
+    "added_tokens.json": {
+        "bytes": 200,
+        "sha256": "27373c2f39a52c87e674caf7e9604ec6756c68c5f8d5f140657299048b6ab8ba",
+    },
+    "config.json": {"bytes": 459349, "sha256": SUPPORTED_SOURCE_CONFIG_SHA256},
+    "configuration_kimi_k3.py": {
+        "bytes": 11343,
+        "sha256": "735eb9ebe593e17d231e08e1df7f7be9b5ee0e079f511aa201f9572077b416ae",
+    },
+    "encoding_k3.py": {
+        "bytes": 22827,
+        "sha256": "b9cb7ae100fed34b9337f80dacee5abbf7e261fe9b74bc0e76366701d46f5333",
+    },
+    "generation_config.json": {
+        "bytes": 53,
+        "sha256": "c6648c25e9705af7fba8847e243840d21b5cc63ddeb6297f750a7ddbb6a02836",
+    },
+    "kimi_k3_processor.py": {
+        "bytes": 7660,
+        "sha256": "ec9f7e86d2ab0eee07a8e7e7c037046e77ac3c25a710ad1298ec13be3b585b54",
+    },
+    "kimi_k3_vision_processing.py": {
+        "bytes": 6686,
+        "sha256": "d122b30bfd3a51a6f05d4bfcfda1e657827322b1353f7caefeebc2835d7736b5",
+    },
+    "media_utils.py": {
+        "bytes": 13844,
+        "sha256": "78403540328f9847d6b7ebc5c44eb2e6a752863de0afb7d0710728bb161dc60d",
+    },
+    "modeling_kimi_k3.py": {
+        "bytes": 53444,
+        "sha256": "b9171c96726eda55234c92ac8dfae7e24c512fda68968ae8f2c3782b42665ea2",
+    },
+    "modeling_kimi_linear.py": {
+        "bytes": 51506,
+        "sha256": "9e3564c70ac21854ce5a090cc946c5dc76b70d1050ef50840449181a20fff44a",
+    },
+    "preprocessor_config.json": {
+        "bytes": 1011,
+        "sha256": "4be333605990c53a816e586dee9d5dd545afb7a59947c17f8f7ef26b4782668e",
+    },
+    "tiktoken.model": {
+        "bytes": 2795286,
+        "sha256": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
+    },
+    "tokenization_kimi.py": {
+        "bytes": 16145,
+        "sha256": "f28ea66e2d862a2a5814970b2ce40c2f7d8296ff09aed90a7e7def689b906944",
+    },
+    "tokenizer_config.json": {
+        "bytes": 4790,
+        "sha256": "d06a6e8a2ef0a09d62031591d0ea2b7c5128fd28a17ea693984bf85eafade1df",
+    },
+}
 _ALLOWED_CHECKPOINT_TEMPLATE_FIELDS = frozenset({"rank", "world_size"})
 
 

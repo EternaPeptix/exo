@@ -71,6 +71,25 @@ def write_pinned_test_metadata(
     monkeypatch.setattr(
         checkpoint, "SOURCE_INDEX_SHA256", checkpoint._sha256_file(index_path)
     )
+    pin_test_metadata(monkeypatch, metadata_dir, {"config.json"})
+
+
+def pin_test_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_dir: Path,
+    names: set[str],
+) -> dict[str, dict[str, int | str]]:
+    records = {
+        name: {
+            "bytes": (metadata_dir / name).stat().st_size,
+            "sha256": checkpoint._sha256_file(metadata_dir / name),
+        }
+        for name in sorted(names)
+    }
+    monkeypatch.setattr(checkpoint, "PINNED_METADATA_FILES", records)
+    monkeypatch.setattr(checkpoint, "ALLOWED_METADATA_FILENAMES", frozenset(records))
+    monkeypatch.setattr(checkpoint, "REQUIRED_METADATA_FILENAMES", frozenset(records))
+    return records
 
 
 def seq(shape, dtype=np.uint32):
@@ -840,7 +859,9 @@ def test_convert_shard_refuses_duplicate_dirs_and_existing_outputs(
     assert not rank1.exists()
 
 
-def test_copy_metadata_uses_allowlist_and_preserves_license(tmp_path: Path):
+def test_copy_metadata_uses_authenticated_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
@@ -849,6 +870,9 @@ def test_copy_metadata_uses_allowlist_and_preserves_license(tmp_path: Path):
     (metadata / ".exo_shard.json").write_text('{"start_layer": 0}')
     (metadata / "model.safetensors.index.json").write_text("{}")
     (metadata / "unexpected.txt").write_text("not part of the allowlist")
+    pin_test_metadata(
+        monkeypatch, metadata, {"LICENSE", "config.json", "tokenizer.json"}
+    )
     rank_dirs = [tmp_path / "rank0", tmp_path / "rank1"]
 
     records = checkpoint._copy_metadata_files(metadata, rank_dirs)
@@ -871,12 +895,27 @@ def test_copy_metadata_uses_allowlist_and_preserves_license(tmp_path: Path):
         assert not list(rank_dir.glob(".*.metadata.partial"))
 
 
-def test_copy_metadata_requires_kimi_license(tmp_path: Path):
+def test_copy_metadata_requires_complete_authenticated_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
+    monkeypatch.setattr(
+        checkpoint,
+        "PINNED_METADATA_FILES",
+        {
+            "config.json": {
+                "bytes": 2,
+                "sha256": checkpoint._sha256_file(metadata / "config.json"),
+            },
+            "tiktoken.model": {"bytes": 1, "sha256": "0" * 64},
+        },
+    )
 
-    with pytest.raises(ConversionError, match="missing Kimi K3 license"):
+    with pytest.raises(
+        ConversionError, match="missing required metadata: tiktoken.model"
+    ):
         checkpoint._copy_metadata_files(
             metadata,
             [tmp_path / "rank0", tmp_path / "rank1"],
@@ -901,11 +940,14 @@ def test_copy_metadata_rejects_source_symlinks(tmp_path: Path):
         )
 
 
-def test_copy_metadata_rejects_destination_symlinks(tmp_path: Path):
+def test_copy_metadata_rejects_destination_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
     (metadata / "LICENSE").write_text("Kimi K3 license text\n")
+    pin_test_metadata(monkeypatch, metadata, {"LICENSE", "config.json"})
     outside = tmp_path / "outside-config"
     outside.write_text("must remain unchanged")
     rank0 = tmp_path / "rank0"
@@ -921,11 +963,13 @@ def test_copy_metadata_rejects_destination_symlinks(tmp_path: Path):
 
 def test_copy_metadata_reuses_identical_files_without_replacing_them(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
     (metadata / "LICENSE").write_text("Kimi K3 license text\n")
+    pin_test_metadata(monkeypatch, metadata, {"LICENSE", "config.json"})
     rank0 = tmp_path / "rank0"
     rank0.mkdir()
     existing = rank0 / "config.json"
@@ -940,11 +984,13 @@ def test_copy_metadata_reuses_identical_files_without_replacing_them(
 
 def test_copy_metadata_refuses_different_existing_file_before_publish(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     metadata = tmp_path / "metadata"
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
     (metadata / "LICENSE").write_text("Kimi K3 license text\n")
+    pin_test_metadata(monkeypatch, metadata, {"LICENSE", "config.json"})
     rank0 = tmp_path / "rank0"
     rank0.mkdir()
     existing = rank0 / "config.json"
@@ -967,6 +1013,7 @@ def test_copy_metadata_rolls_back_if_atomic_publish_fails(
     metadata.mkdir()
     (metadata / "config.json").write_text("{}")
     (metadata / "LICENSE").write_text("Kimi K3 license text\n")
+    pin_test_metadata(monkeypatch, metadata, {"LICENSE", "config.json"})
     rank_dirs = [tmp_path / "rank0", tmp_path / "rank1"]
     real_link = checkpoint.os.link
     calls = 0

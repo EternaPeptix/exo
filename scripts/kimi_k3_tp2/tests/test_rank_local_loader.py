@@ -166,6 +166,12 @@ def _checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, 
             "sha256": config_sha,
         },
     }
+    monkeypatch.setattr(loader, "PINNED_METADATA_FILES", metadata_files)
+    monkeypatch.setattr(
+        loader,
+        "ALLOWED_METADATA_FILENAMES",
+        frozenset(metadata_files),
+    )
 
     weight_name = "language_model.model.embed_tokens.weight"
     filename = "model-00001-of-00185.safetensors"
@@ -250,6 +256,12 @@ def test_manifest_always_hashes_tokenizer_metadata(
         "bytes": tokenizer.stat().st_size,
         "sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
     }
+    monkeypatch.setattr(loader, "PINNED_METADATA_FILES", dict(metadata))
+    monkeypatch.setattr(
+        loader,
+        "ALLOWED_METADATA_FILENAMES",
+        frozenset(metadata),
+    )
     manifest["metadata_contract_sha256"] = loader._canonical_metadata_contract(metadata)
     (root / "tp_manifest.json").write_text(json.dumps(manifest))
 
