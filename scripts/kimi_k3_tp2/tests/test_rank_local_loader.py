@@ -39,6 +39,38 @@ class FakeArray:
         return FakeArray(dtype, self.shape)
 
 
+class FakeLoadModel:
+    def __init__(self, events: list[str], *, fail_load: bool = False):
+        self.events = events
+        self.fail_load = fail_load
+
+    def load_weights(self, items, *, strict: bool):
+        self.events.append("load_weights")
+        assert strict is True
+        assert items == [("weight", "raw-array")]
+        if self.fail_load:
+            raise RuntimeError("strict load failed")
+
+    def eval(self):
+        self.events.append("model.eval")
+
+    def parameters(self):
+        self.events.append("model.parameters")
+        return "parameters"
+
+
+class FakeMX:
+    def __init__(self, events: list[str]):
+        self.events = events
+
+    def clear_cache(self):
+        self.events.append("mx.clear_cache")
+
+    def eval(self, parameters):
+        assert parameters == "parameters"
+        self.events.append("mx.eval")
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     ((None, False), ("0", False), ("1", True)),
@@ -65,6 +97,41 @@ def test_strict_env_flag_rejects_ambiguous_values(
     monkeypatch.setenv(name, raw)
     with pytest.raises(loader.RankLocalLoadError, match="must be 0 or 1"):
         loader._strict_env_flag(name)
+
+
+def test_strict_load_releases_raw_weights_before_model_evaluation():
+    events: list[str] = []
+    weights = {"weight": "raw-array"}
+
+    loader._strict_load_release_and_evaluate(
+        FakeLoadModel(events),
+        weights,
+        FakeMX(events),
+    )
+
+    assert weights == {}
+    assert events == [
+        "load_weights",
+        "mx.clear_cache",
+        "model.eval",
+        "model.parameters",
+        "mx.eval",
+    ]
+
+
+def test_strict_load_failure_retains_raw_weights_and_skips_evaluation():
+    events: list[str] = []
+    weights = {"weight": "raw-array"}
+
+    with pytest.raises(RuntimeError, match="strict load failed"):
+        loader._strict_load_release_and_evaluate(
+            FakeLoadModel(events, fail_load=True),
+            weights,
+            FakeMX(events),
+        )
+
+    assert weights == {"weight": "raw-array"}
+    assert events == ["load_weights"]
 
 
 def _dtype_fix_config() -> dict:
@@ -290,11 +357,14 @@ def test_runtime_source_verification_uses_execution_pin(
     pins = {
         "gated_delta": "MLX_LM_GATED_DELTA_SHA256",
         "kimi_k3": "MLX_LM_KIMI_K3_SHA256",
+        "kimi_k3_derived_bias": "MLX_LM_KIMI_K3_DERIVED_BIAS_SHA256",
         "kimi_k3_dspark": "MLX_LM_KIMI_K3_DSPARK_SHA256",
         "kimi_k3_fused_down_reduce": "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256",
         "kimi_k3_fused_expert": "MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256",
         "kimi_k3_fused_switch_glu": "MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256",
         "kimi_k3_packed_moe_front": "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256",
+        "kimi_k3_tuned_gather_qmv": "MLX_LM_KIMI_K3_TUNED_GATHER_QMV_SHA256",
+        "switch_layers": "MLX_LM_SWITCH_LAYERS_SHA256",
     }
     expected: dict[str, str] = {}
     for module_name, constant_name in pins.items():

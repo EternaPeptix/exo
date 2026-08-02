@@ -68,8 +68,8 @@ checkpoint, so they remain research evidence rather than production defaults.
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
 | Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v6) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
-| Execution-time MLX-LM v8 candidate | [`EternaPeptix/mlx-lm`](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v8) commit `bf378e33831e745715a88418a44ce20ab1075b9b` |
-| Default-off MLX v8 kernel candidate | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v8) commit `2cfb83040011c273377a25df8ed16def80c6646c` |
+| Execution-time MLX-LM v8 affine2 candidate | v8-rooted commit `738df4ebd667d763e49a003cb0287fad12e759b3` |
+| Default-off MLX v8 hybrid/affine2 candidate | v8-rooted commit `21d518384e845c1adf5c4be43d204152572fcce2` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v2` |
 
@@ -92,15 +92,16 @@ rank-sliced weight files are reused; the migration does not require reslicing
 them.
 
 The compact vocabulary-parallel greedy target path is default-off in ordinary
-runs. The maintenance canary enables it explicitly and requires MLX-LM commit
-`bf378e33831e745715a88418a44ce20ab1075b9b`, whose exact verifier accepts the
+runs. The maintenance canary enables it explicitly and the combined candidate
+requires MLX-LM commit `738df4ebd667d763e49a003cb0287fad12e759b3`,
+whose exact verifier accepts the
 full banned-token set without materializing full-vocabulary logits on every
 rank.
 Install the EXO-compatible dependency at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@bf378e33831e745715a88418a44ce20ab1075b9b"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@738df4ebd667d763e49a003cb0287fad12e759b3"
 ```
 
 ## License and trust boundary
@@ -193,6 +194,26 @@ detection.
 
 The loader file is hash-pinned by EXO. `.gitattributes` forces LF line endings
 so a checkout cannot silently change that hash.
+
+After strict weight loading succeeds, the rank-local loader clears its raw
+checkpoint dictionary and the MLX allocator cache before eager model
+evaluation. If strict loading fails, it retains the dictionary and skips cache
+clearing and evaluation so the original failure remains inspectable.
+
+The v8 affine2 allocation-elision and TP2 mesh/ring hybrid remain default-off.
+They require the exact candidate pins above and explicit, rank-consistent
+flags:
+
+```bash
+export MLX_LM_KIMI_K3_DERIVE_AFFINE2_BIAS=1
+export MLX_LM_KIMI_K3_ELIDE_AFFINE2_BIAS=1
+export MLX_JACCL_TP2_HYBRID=1
+```
+
+MLX-LM validates the full affine2 relation and the patched core operation
+before releasing any bias array. JACCL requires the hybrid value to agree on
+both ranks and otherwise fails before dedicated mesh-QP initialization. EXO
+does not set any of these flags by default.
 
 The vocabulary-parallel option row-shards Kimi K3's untied output projection
 after the rank-local weights are loaded. Each tensor rank computes half of the

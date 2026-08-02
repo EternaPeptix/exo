@@ -29,9 +29,9 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = "bf378e33831e745715a88418a44ce20ab1075b9b"
+RUNTIME_MLX_LM_COMMIT = "738df4ebd667d763e49a003cb0287fad12e759b3"
 MLX_LM_KIMI_K3_SHA256 = (
-    "3e283240117d298d95e33f7238cb49abc5606aafdd26f70062e841518059088b"
+    "6c102952e39789573bd4395960c92a9f60b372aadec8cd54d00e0cef273f62f0"
 )
 MLX_LM_KIMI_K3_DSPARK_SHA256 = (
     "5ba010755e703f39b86aed1ad999576a18f2f93c041b502bbe3f57b197af2f01"
@@ -39,14 +39,23 @@ MLX_LM_KIMI_K3_DSPARK_SHA256 = (
 MLX_LM_GATED_DELTA_SHA256 = (
     "44aef2791ed0cd5cfb84e31ef00cb4df3d40ae184e6c6852b7f0dba7406d2f78"
 )
+MLX_LM_KIMI_K3_DERIVED_BIAS_SHA256 = (
+    "d9025e323239a27dfb5869530444fbe428d6f704eac45063d184ad006a4161c5"
+)
+MLX_LM_SWITCH_LAYERS_SHA256 = (
+    "793679ed80ab4051858ac76ab32b9b9abcabe21eb02bac7c3fde75b6c15de840"
+)
 MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256 = (
-    "d51bf88fa603846f4ac9876faf724d273a99ca8b6643715f68df5993eb352d68"
+    "f4ed5d23faac8e5ae3408072a4ff8b8563204e75cde38c36ba1df5b3ce560969"
 )
 MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256 = (
-    "0aa226e32b992e5bb18a14b4a3ead225b6a6f531431249e1ae6b5bbb35ca29d1"
+    "aedb82dd3946d847c4622a3b878c94cc29a8084db99ccf1935eee1e21785e464"
 )
 MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256 = (
-    "2b9841394f8334e02044f2e6b418f0bc7ff41cc719a877464a311c5e8c899ee9"
+    "2401fa7c58ad095e0b48bd617387df8fd30403b4e11416c56620879b0044c7b7"
+)
+MLX_LM_KIMI_K3_TUNED_GATHER_QMV_SHA256 = (
+    "ec702446d3b3fe72cd95b0ee24497de54bcfde1ea2de9f78bad96e2f98ac4de2"
 )
 MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256 = (
     "82076bf9c0098f2fc72a0434a5482e72a6e022fc982574f05867dcce32645435"
@@ -300,11 +309,14 @@ def _verify_runtime_source() -> None:
     from mlx_lm.models import (
         gated_delta,
         kimi_k3,
+        kimi_k3_derived_bias,
         kimi_k3_dspark,
         kimi_k3_fused_down_reduce,
         kimi_k3_fused_expert,
         kimi_k3_fused_switch_glu,
         kimi_k3_packed_moe_front,
+        kimi_k3_tuned_gather_qmv,
+        switch_layers,
     )
 
     pinned_sources = (
@@ -315,6 +327,12 @@ def _verify_runtime_source() -> None:
             MLX_LM_KIMI_K3_DSPARK_SHA256,
         ),
         (gated_delta, "gated_delta.py", MLX_LM_GATED_DELTA_SHA256),
+        (
+            kimi_k3_derived_bias,
+            "kimi_k3_derived_bias.py",
+            MLX_LM_KIMI_K3_DERIVED_BIAS_SHA256,
+        ),
+        (switch_layers, "switch_layers.py", MLX_LM_SWITCH_LAYERS_SHA256),
         (
             kimi_k3_fused_expert,
             "kimi_k3_fused_expert.py",
@@ -329,6 +347,11 @@ def _verify_runtime_source() -> None:
             kimi_k3_fused_down_reduce,
             "kimi_k3_fused_down_reduce.py",
             MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256,
+        ),
+        (
+            kimi_k3_tuned_gather_qmv,
+            "kimi_k3_tuned_gather_qmv.py",
+            MLX_LM_KIMI_K3_TUNED_GATHER_QMV_SHA256,
         ),
         (
             kimi_k3_packed_moe_front,
@@ -375,6 +398,26 @@ def _prepare_execution_runtime(model_dir: str | Path, mlx_lm_utils: Any) -> tupl
         tree_flatten,
         vocab_parallel_head,
     )
+
+
+def _strict_load_release_and_evaluate(
+    model: Any,
+    weights: dict[str, Any],
+    mx_module: Any,
+) -> None:
+    """Strictly install weights, then release raw checkpoint allocations.
+
+    ``load_weights`` must complete before any references are released. Once it
+    succeeds, the model owns its parameters, so retaining the rank-local shard
+    dictionary only duplicates references and delays allocator reclamation
+    during the first full-model evaluation.
+    """
+
+    model.load_weights(list(weights.items()), strict=True)
+    weights.clear()
+    mx_module.clear_cache()
+    model.eval()
+    mx_module.eval(model.parameters())
 
 
 def _verify_manifest(
@@ -786,9 +829,7 @@ def load_rank_local_model(
         bfloat16_dtype=mx.bfloat16,
     )
 
-    model.load_weights(list(weights.items()), strict=True)
-    model.eval()
-    mx.eval(model.parameters())
+    _strict_load_release_and_evaluate(model, weights, mx)
     if vocab_parallel_head:
         shard_vocab_head = getattr(model, "shard_vocab_head", None)
         if shard_vocab_head is None:
