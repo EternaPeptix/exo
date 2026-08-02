@@ -187,6 +187,44 @@ def test_dspark_warmup_rejects_fallback_only_readiness(
         )
 
 
+def test_dspark_aligned_control_warmup_requires_target_only_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_tokens = 6
+
+    def fake_generate(**_kwargs: object):
+        for index in range(expected_tokens):
+            stats = (
+                SimpleNamespace(
+                    speculative_rounds=expected_tokens,
+                    speculative_drafted_tokens=0,
+                    speculative_accepted_tokens=0,
+                    speculative_committed_tokens=expected_tokens,
+                    speculative_fallback_rounds=0,
+                    speculative_error_rounds=0,
+                )
+                if index == expected_tokens - 1
+                else None
+            )
+            yield SimpleNamespace(stats=stats)
+
+    monkeypatch.setenv("EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY", "1")
+    monkeypatch.setattr(generate_module, "apply_chat_template", lambda **_kwargs: "p")
+    monkeypatch.setattr(generate_module, "mlx_generate", fake_generate)
+    monkeypatch.setattr(generate_module, "mx_barrier", lambda _group: None)
+
+    warmup_inference(
+        model=cast(Model, object()),
+        tokenizer=cast(object, object()),
+        group=None,
+        model_id=ModelId("kernelpool/Kimi-K3-2bit-UVMAX"),
+        dspark=cast(
+            LoadedMlxDSpark,
+            cast(object, SimpleNamespace(verify_width=3)),
+        ),
+    )
+
+
 def test_rank_agreed_local_stage_fail_stops_before_later_barrier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

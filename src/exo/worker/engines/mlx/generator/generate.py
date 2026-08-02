@@ -898,7 +898,7 @@ def warmup_inference(
 ) -> int:
     logger.info(f"warming up inference for instance: {model_id}")
 
-    def prepare_warmup() -> tuple[TextGenerationTaskParams, str, int, int]:
+    def prepare_warmup() -> tuple[TextGenerationTaskParams, str, int, int, bool]:
         content = InputMessageContent(
             "Prompt to warm up the inference engine. Repeat this."
         )
@@ -919,9 +919,14 @@ def warmup_inference(
         if not 1 <= warmup_tokens <= 256:
             raise ValueError("EXO_MLX_WARMUP_OUTPUT_TOKENS must be between 1 and 256")
         verify_width = 0
+        force_ordinary = False
         if dspark is not None:
             verify_width = dspark.verify_width
             warmup_tokens = max(warmup_tokens, 2 * verify_width)
+            force_ordinary = _strict_env_flag(
+                "EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY",
+                os.environ.get("EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY", "0"),
+            )
 
         task = TextGenerationTaskParams(
             model=model_id,
@@ -934,19 +939,25 @@ def warmup_inference(
             tokenizer=tokenizer,
             task_params=task,
         )
-        return task, prompt, warmup_tokens, verify_width
+        return task, prompt, warmup_tokens, verify_width, force_ordinary
 
     def warmup_contract(
-        setup: tuple[TextGenerationTaskParams, str, int, int],
+        setup: tuple[TextGenerationTaskParams, str, int, int, bool],
     ) -> str:
-        _task, prompt, warmup_tokens, verify_width = setup
+        _task, prompt, warmup_tokens, verify_width, force_ordinary = setup
         prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         return (
             f"{model_id}\0{int(dspark is not None)}\0{verify_width}\0"
-            f"{warmup_tokens}\0{prompt_digest}"
+            f"{warmup_tokens}\0{int(force_ordinary)}\0{prompt_digest}"
         )
 
-    warmup_task_params, warmup_prompt, _warmup_tokens, verify_width = (
+    (
+        warmup_task_params,
+        warmup_prompt,
+        _warmup_tokens,
+        verify_width,
+        force_ordinary,
+    ) = (
         rank_agreed_local_stage(
             "inference warmup setup",
             group,
@@ -979,28 +990,53 @@ def warmup_inference(
 
     def validate_warmup() -> tuple[int, tuple[int, ...]]:
         if dspark is not None:
-            required_drafted = 2 * (verify_width - 1)
             if tokens_generated < 2 * verify_width or final_stats is None:
                 raise RuntimeError(
                     "Kimi K3 DSpark warmup did not complete its two-round output budget"
                 )
-            if (
-                final_stats.speculative_rounds < 2
-                or final_stats.speculative_drafted_tokens < required_drafted
-                or final_stats.speculative_fallback_rounds != 0
-                or final_stats.speculative_error_rounds != 0
-            ):
-                raise RuntimeError(
-                    "Kimi K3 DSpark warmup did not complete two clean speculative rounds"
+            if force_ordinary:
+                if (
+                    final_stats.speculative_rounds != tokens_generated
+                    or final_stats.speculative_drafted_tokens != 0
+                    or final_stats.speculative_accepted_tokens != 0
+                    or final_stats.speculative_committed_tokens != tokens_generated
+                    or final_stats.speculative_fallback_rounds != 0
+                    or final_stats.speculative_error_rounds != 0
+                ):
+                    raise RuntimeError(
+                        "Kimi K3 DSpark aligned-control warmup did not remain "
+                        "strictly target-only"
+                    )
+                counters = (
+                    tokens_generated,
+                    verify_width,
+                    final_stats.speculative_rounds,
+                    final_stats.speculative_drafted_tokens,
+                    final_stats.speculative_accepted_tokens,
+                    final_stats.speculative_committed_tokens,
+                    final_stats.speculative_fallback_rounds,
+                    final_stats.speculative_error_rounds,
                 )
-            counters = (
-                tokens_generated,
-                verify_width,
-                final_stats.speculative_rounds,
-                final_stats.speculative_drafted_tokens,
-                final_stats.speculative_fallback_rounds,
-                final_stats.speculative_error_rounds,
-            )
+            else:
+                required_drafted = 2 * (verify_width - 1)
+                if (
+                    final_stats.speculative_rounds < 2
+                    or final_stats.speculative_drafted_tokens < required_drafted
+                    or final_stats.speculative_fallback_rounds != 0
+                    or final_stats.speculative_error_rounds != 0
+                ):
+                    raise RuntimeError(
+                        "Kimi K3 DSpark warmup did not complete two clean "
+                        "speculative rounds"
+                    )
+                counters = (
+                    tokens_generated,
+                    verify_width,
+                    final_stats.speculative_rounds,
+                    final_stats.speculative_drafted_tokens,
+                    final_stats.speculative_fallback_rounds,
+                    final_stats.speculative_error_rounds,
+                )
         else:
             counters = (tokens_generated, 0)
         elapsed = max(time.monotonic() - t, 0.001)
