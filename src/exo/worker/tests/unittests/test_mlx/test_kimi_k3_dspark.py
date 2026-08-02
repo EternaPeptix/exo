@@ -1643,6 +1643,29 @@ def test_decode_token_stream_uses_target_only_for_short_length_tail(
     )
 
 
+def test_decode_token_stream_can_force_aligned_target_only_control() -> None:
+    engine = _FakeRoundEngine(
+        [(11, 12, 13)],
+        verify_width=3,
+        ordinary_tokens=[91, 92, 93],
+    )
+
+    decoded = list(
+        dspark_decode_tokens(
+            engine,
+            anchor_token=10,
+            max_tokens=3,
+            eos_token_ids=(),
+            force_ordinary=True,
+        )
+    )
+
+    assert [item.token for item in decoded] == [91, 92, 93]
+    assert [item.from_draft for item in decoded] == [False, False, False]
+    assert engine.anchors == []
+    assert engine.ordinary_anchors == [10, 91, 92]
+
+
 @dataclass
 class _FakeTokenLogits:
     shape: tuple[int, int]

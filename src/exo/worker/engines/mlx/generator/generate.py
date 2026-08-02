@@ -139,6 +139,7 @@ class _DSparkRequestSetup:
     detokenizer: _DSparkDetokenizer
     empty_logprobs: mx.array
     prefill_step_size: int
+    force_ordinary: bool
     runtime: KimiK3DSparkRequestRuntime
     fingerprint: tuple[int, ...]
 
@@ -1107,6 +1108,7 @@ def _dspark_setup_fingerprint(
     is_bench: bool,
     compact_greedy: bool,
     generation_progress: bool,
+    force_ordinary: bool = False,
     eos_token_ids: tuple[int, ...],
     banned_token_ids: tuple[int, ...],
     terminal_token_ids: tuple[int, ...],
@@ -1150,6 +1152,7 @@ def _dspark_setup_fingerprint(
     add_integer(int(is_bench), name="benchmark flag")
     add_integer(int(compact_greedy), name="compact greedy flag")
     add_integer(int(generation_progress), name="generation progress flag")
+    add_integer(int(force_ordinary), name="force ordinary flag")
     add_tokens(eos_token_ids, name="EOS tokens")
     add_tokens(banned_token_ids, name="banned tokens")
     add_tokens(terminal_token_ids, name="terminal tokens")
@@ -1308,6 +1311,10 @@ def _prepare_dspark_request_setup(
             speculative=False,
         )
     )
+    force_ordinary = _strict_env_flag(
+        "EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY",
+        os.environ.get("EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY", "0"),
+    )
     prefill_step_size = _prefill_step_size(
         len(all_prompt_tokens) - 1,
         is_pipeline=False,
@@ -1337,6 +1344,7 @@ def _prepare_dspark_request_setup(
         is_bench=is_bench,
         compact_greedy=compact_greedy,
         generation_progress=generation_progress,
+        force_ordinary=force_ordinary,
         eos_token_ids=eos_token_ids,
         banned_token_ids=banned_token_ids,
         terminal_token_ids=terminal_token_ids,
@@ -1358,6 +1366,7 @@ def _prepare_dspark_request_setup(
         detokenizer=detokenizer,
         empty_logprobs=empty_logprobs,
         prefill_step_size=prefill_step_size,
+        force_ordinary=force_ordinary,
         runtime=runtime,
         fingerprint=fingerprint,
     )
@@ -1371,6 +1380,7 @@ def _dspark_mlx_responses(
     anchor_token: int,
     max_tokens: int,
     eos_token_ids: tuple[int, ...],
+    force_ordinary: bool,
     telemetry: _PromptLookupTelemetry,
 ) -> Generator[MlxGenerationResponse, None, None]:
     engine = runtime.agree_local_value(
@@ -1387,6 +1397,7 @@ def _dspark_mlx_responses(
             anchor_token=anchor_token,
             max_tokens=max_tokens,
             eos_token_ids=eos_token_ids,
+            force_ordinary=force_ordinary,
             round_observer=telemetry.observe_dspark_round,
         ),
         start=1,
@@ -1794,6 +1805,7 @@ def mlx_generate(
                 anchor_token=dspark_setup.anchor_token,
                 max_tokens=max_tokens,
                 eos_token_ids=(() if is_bench else dspark_setup.eos_token_ids),
+                force_ordinary=dspark_setup.force_ordinary,
                 telemetry=prompt_lookup_telemetry,
             )
         elif prompt_lookup_kwargs is None:

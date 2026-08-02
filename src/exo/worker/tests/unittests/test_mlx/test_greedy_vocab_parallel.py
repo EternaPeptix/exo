@@ -1014,6 +1014,16 @@ def test_dspark_setup_fingerprint_binds_generation_callback_presence() -> None:
         generation_progress=True,
     )
 
+    assert generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        force_ordinary=False,
+    ) != generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        force_ordinary=True,
+    )
+
 
 @dataclass
 class _Detokenizer:

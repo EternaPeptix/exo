@@ -3369,6 +3369,7 @@ def dspark_decode_tokens(
     anchor_token: int,
     max_tokens: int,
     eos_token_ids: Sequence[int],
+    force_ordinary: bool = False,
     round_observer: Callable[[DSparkRoundTelemetry], None] | None = None,
     token_observer: Callable[[bool], None] | None = None,
 ) -> Iterator[DSparkDecodedToken]:
@@ -3382,9 +3383,9 @@ def dspark_decode_tokens(
     while emitted < max_tokens:
         remaining = max_tokens - emitted
         result = (
-            engine.decode_round(next_anchor)
-            if remaining >= engine.verify_width
-            else engine.decode_ordinary_tail(next_anchor)
+            engine.decode_ordinary_tail(next_anchor)
+            if force_ordinary or remaining < engine.verify_width
+            else engine.decode_round(next_anchor)
         )
         if round_observer is not None:
             try:
