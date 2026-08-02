@@ -11,7 +11,9 @@ from anyio import ClosedResourceError, WouldBlock
 from exo.shared.types.chunks import TokenChunk
 from exo.shared.types.common import CommandId, ModelId
 from exo.shared.types.events import ChunkGenerated
-from exo.shared.types.tasks import TaskId, TextGeneration
+from exo.shared.types.tasks import TaskId, TaskStatus, TextGeneration
+from exo.shared.types.text_generation import InputMessage, TextGenerationTaskParams
+from exo.shared.types.worker.instances import InstanceId
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.worker.engines.mlx import utils_mlx
 from exo.worker.engines.mlx.builder import MlxBuilder
@@ -555,6 +557,40 @@ def test_dspark_task_digest_is_canonical_across_dict_order() -> None:
     )
 
     assert batch_generator._task_digest(first) == batch_generator._task_digest(second)
+
+
+def test_dspark_task_digest_ignores_rank_local_lifecycle_state() -> None:
+    pending = TextGeneration(
+        task_id=TaskId("00000000-0000-0000-0000-000000000001"),
+        task_status=TaskStatus.Pending,
+        instance_id=InstanceId("instance-1"),
+        command_id=CommandId("command-1"),
+        task_params=TextGenerationTaskParams(
+            model=ModelId("kernelpool/Kimi-K3-2bit-UVMAX"),
+            input=[InputMessage(role="user", content="hello")],
+            max_output_tokens=16,
+        ),
+    )
+    running = pending.model_copy(update={"task_status": TaskStatus.Running})
+    failed = pending.model_copy(
+        update={
+            "task_status": TaskStatus.Failed,
+            "error_type": "rank-local diagnostic",
+            "error_message": "must not alter the immutable request binding",
+        }
+    )
+    changed_request = pending.model_copy(
+        update={
+            "task_params": pending.task_params.model_copy(
+                update={"max_output_tokens": 17}
+            )
+        }
+    )
+
+    expected = batch_generator._task_digest(pending)
+    assert batch_generator._task_digest(running) == expected
+    assert batch_generator._task_digest(failed) == expected
+    assert batch_generator._task_digest(changed_request) != expected
 
 
 def _dspark_sequential(

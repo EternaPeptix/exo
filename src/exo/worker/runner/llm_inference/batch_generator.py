@@ -93,7 +93,10 @@ def _task_digest(task: TextGeneration) -> str:
     """Canonical request binding used before any DSpark-local side effects."""
 
     payload = json.dumps(
-        task.model_dump(mode="json"),
+        task.model_dump(
+            mode="json",
+            exclude={"task_status", "error_type", "error_message"},
+        ),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
