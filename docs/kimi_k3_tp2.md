@@ -68,7 +68,7 @@ checkpoint, so they remain research evidence rather than production defaults.
 | Model | [`kernelpool/Kimi-K3-2bit-UVMAX`](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) |
 | Model revision | `edb5113218df612f4a92f95145680f3f8eacd375` |
 | Darwin MLX/JACCL runtime | [`EternaPeptix/mlx`](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v6) tested code commit `57b87fe47cfce34d6dc59d0e274d8ee36bfb9308` |
-| Execution-time MLX-LM v8 affine2 candidate | v8-rooted commit `738df4ebd667d763e49a003cb0287fad12e759b3` |
+| Execution-time MLX-LM v8 affine2 plus DSpark quantized-binding fix | v8-rooted commit `f522349cd06a5d41fa61818bc5572ee297490c94` |
 | Default-off MLX v8 hybrid/affine2 candidate | v8-rooted commit `21d518384e845c1adf5c4be43d204152572fcce2` |
 | Checkpoint converter / Kimi K3 model-support base | [upstream MLX-LM #1626](https://github.com/ml-explore/mlx-lm/pull/1626) commit `7d505c285b801108a52c23353c7fb6af07204717` |
 | Converter schema | `k3-rank-local-tp/v2` |
@@ -93,15 +93,16 @@ them.
 
 The compact vocabulary-parallel greedy target path is default-off in ordinary
 runs. The maintenance canary enables it explicitly and the combined candidate
-requires MLX-LM commit `738df4ebd667d763e49a003cb0287fad12e759b3`,
+requires MLX-LM commit `f522349cd06a5d41fa61818bc5572ee297490c94`,
 whose exact verifier accepts the
 full banned-token set without materializing full-vocabulary logits on every
-rank.
+rank. This commit extends the accepted v8 runtime with logical-shape validation
+for the DSpark target's packed quantized embedding.
 Install the EXO-compatible dependency at its execution commit:
 
 ```bash
 python -m pip install \
-  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@738df4ebd667d763e49a003cb0287fad12e759b3"
+  "mlx-lm @ git+https://github.com/EternaPeptix/mlx-lm.git@f522349cd06a5d41fa61818bc5572ee297490c94"
 ```
 
 ## License and trust boundary
