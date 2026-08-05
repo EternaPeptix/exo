@@ -29,9 +29,12 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = "52d53d350799f49ef1b7fb0dbd7204c4551edf69"
+RUNTIME_MLX_LM_COMMIT = "d66b1ed5fdbf57585591226adc18816854784735"
 MLX_LM_KIMI_K3_SHA256 = (
-    "23821045a2f2745893049494115e9ab8114055f31370d3907967b7bcbbff664d"
+    "8bce862881ef6629a04ca4fc6a25239445a9e6c8be28d6d1a11b2cc7df4fe9c3"
+)
+MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE_SHA256 = (
+    "0f2d2440d89d327adeba369620aa206d1f641ff06954db6d364ae1785806e80a"
 )
 MLX_LM_KIMI_K3_DSPARK_SHA256 = (
     "6529e24f186f1f21bf048d84a0e5d2dd7f54439b1d3f477ed8a5f06e00276e3c"
@@ -349,6 +352,7 @@ def _verify_runtime_source() -> None:
         kimi_k3_fused_router,
         kimi_k3_fused_switch_glu,
         kimi_k3_packed_moe_front,
+        kimi_k3_prefill_route_combine,
         kimi_k3_tuned_gather_qmv,
         switch_layers,
     )
@@ -396,6 +400,11 @@ def _verify_runtime_source() -> None:
             kimi_k3_packed_moe_front,
             "kimi_k3_packed_moe_front.py",
             MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256,
+        ),
+        (
+            kimi_k3_prefill_route_combine,
+            "kimi_k3_prefill_route_combine.py",
+            MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE_SHA256,
         ),
     )
     for module, filename, expected in pinned_sources:
