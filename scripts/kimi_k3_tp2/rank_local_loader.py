@@ -29,9 +29,11 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = "d66b1ed5fdbf57585591226adc18816854784735"
+RUNTIME_MLX_LM_COMMIT = (
+    "d66b1ed5fdbf57585591226adc18816854784735+9521a9e655d2d9287be32755f949e02540a9b2d5"
+)
 MLX_LM_KIMI_K3_SHA256 = (
-    "8bce862881ef6629a04ca4fc6a25239445a9e6c8be28d6d1a11b2cc7df4fe9c3"
+    "42ff290b82903982fe02cec4d6b2b1de06b61cec7089274b812618dc36375bdb"
 )
 MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE_SHA256 = (
     "0f2d2440d89d327adeba369620aa206d1f641ff06954db6d364ae1785806e80a"
@@ -414,7 +416,7 @@ def _verify_runtime_source() -> None:
             raise RankLocalLoadError(
                 f"mlx_lm.models.{filename} does not match the execution runtime "
                 f"pin: expected {expected}, got {actual} at {source}. "
-                f"Install mlx-lm commit {RUNTIME_MLX_LM_COMMIT} or audit and "
+                f"Stage mlx-lm runtime {RUNTIME_MLX_LM_COMMIT} or audit and "
                 "update the execution runtime pin."
             )
 

@@ -245,6 +245,16 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
     assert result["rank_data_bytes"] == 32
 
 
+def test_execution_runtime_pin_matches_staged_aux_prefill_candidate():
+    assert loader.RUNTIME_MLX_LM_COMMIT == (
+        "d66b1ed5fdbf57585591226adc18816854784735+"
+        "9521a9e655d2d9287be32755f949e02540a9b2d5"
+    )
+    assert loader.MLX_LM_KIMI_K3_SHA256 == (
+        "42ff290b82903982fe02cec4d6b2b1de06b61cec7089274b812618dc36375bdb"
+    )
+
+
 def test_manifest_always_hashes_tokenizer_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
