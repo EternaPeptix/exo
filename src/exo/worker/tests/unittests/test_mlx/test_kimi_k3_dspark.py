@@ -12,6 +12,7 @@ import pytest
 
 from exo.worker.engines.mlx.generator import kimi_k3_dspark as dspark_module
 from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
+    DSPARK_AUX_ONLY_PREFILL_ENV,
     DSPARK_CHECKPOINT_ENV,
     DSPARK_CONSERVATIVE_VERIFY_WIDTH,
     DSPARK_ENABLE_ENV,
@@ -127,8 +128,38 @@ def test_model_native_width_eight_is_the_enabled_default(tmp_path: Path) -> None
     assert config.placement == "replicated"
     assert config.target_layer_ids == (7, 23, 51, 67, 83)
     assert config.target_hidden_state_indices == (7, 23, 51, 67, 83)
+    assert not config.aux_only_prefill
     assert validated == [tmp_path]
     assert warnings == []
+
+
+@pytest.mark.parametrize("raw", ["", "2", "true", " 1", "1 "])
+def test_aux_only_prefill_flag_is_strict_and_default_off(
+    tmp_path: Path,
+    raw: str,
+) -> None:
+    environment = _enabled_environment(tmp_path)
+    environment[DSPARK_AUX_ONLY_PREFILL_ENV] = raw
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{DSPARK_AUX_ONLY_PREFILL_ENV} must be 0 or 1",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+    environment[DSPARK_AUX_ONLY_PREFILL_ENV] = "1"
+    config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=environment,
+        checkpoint_validator=lambda _path: None,
+    )
+    assert config is not None
+    assert config.aux_only_prefill
 
 
 def test_width_three_requires_explicit_override_and_warns(tmp_path: Path) -> None:
@@ -477,12 +508,18 @@ class _FakeAgreement:
         return local_token
 
 
-def _config(tmp_path: Path, width: int) -> KimiK3DSparkConfig:
+def _config(
+    tmp_path: Path,
+    width: int,
+    *,
+    aux_only_prefill: bool = False,
+) -> KimiK3DSparkConfig:
     assert width in (3, 8)
     return KimiK3DSparkConfig(
         checkpoint_path=tmp_path,
         verify_width=width,
         round_telemetry=False,
+        aux_only_prefill=aux_only_prefill,
     )
 
 
@@ -1803,6 +1840,39 @@ class _FakeRuntimeTarget(_FakeHookTarget):
     layers: tuple[object, ...] = field(default_factory=lambda: (object(), object()))
 
 
+@dataclass
+class _FakeAuxPrefillRuntimeTarget(_FakeRuntimeTarget):
+    aux_prefill_calls: list[int] = field(default_factory=list)
+    final_hidden_size: int = 7168
+    tap_count: int = 5
+
+    def forward_aux_hidden_states_for_cache(
+        self,
+        inputs: mx.array,
+        cache: object,
+        layer_ids: tuple[int, ...],
+    ) -> object:
+        assert layer_ids == (7, 23, 51, 67, 83)
+        width = int(inputs.shape[1])
+        self.aux_prefill_calls.append(width)
+        entries = cast(list[object], cache)
+        mla_cache = cast(_FakeTargetCache, entries[0])
+        kda_cache = cast(_FakeKDATargetCache, entries[1])
+        mla_cache.offset += width
+        mla_cache.state = ("mla-keys", ["mla-values"])
+        kda_cache.cache = [("kda-conv",), {"ssm": "kda-ssm"}]
+        return SimpleNamespace(
+            final_hidden_state=_FakeHidden(
+                (1, width, self.final_hidden_size),
+                "final-hidden",
+            ),
+            aux_hidden_states=tuple(
+                _FakeHidden((1, width, 7168), f"tap-{index}")
+                for index in range(self.tap_count)
+            ),
+        )
+
+
 def _prompt_runtime(
     tmp_path: Path,
     agreement: _FakeAgreement,
@@ -1833,6 +1903,236 @@ def _prompt_runtime(
         ),
         target_cache,
     )
+
+
+def _discard_evaluation(*_values: object) -> None:
+    return None
+
+
+def _aux_prompt_runtime(
+    tmp_path: Path,
+    agreement: _FakeAgreement,
+    *,
+    target_model: _FakeRuntimeTarget | None = None,
+    evaluate: Callable[..., None] | None = None,
+) -> tuple[KimiK3DSparkRequestRuntime, list[object], _FakeRuntimeTarget]:
+    target = target_model or _FakeAuxPrefillRuntimeTarget()
+    target_evaluate: Callable[..., None] = (
+        _discard_evaluation if evaluate is None else evaluate
+    )
+    target_cache: list[object] = [_FakeTargetCache(), _FakeKDATargetCache()]
+    proposer = _FakeMlxProposer(3, [], [[11, 12]])
+    draft = MlxDSparkRequestDraft(
+        proposer=proposer,
+        context_cache=[_FakeContextCache(), _FakeContextCache()],
+        verify_width=3,
+        evaluate=lambda *_values: None,
+    )
+    runtime = KimiK3DSparkRequestRuntime(
+        loaded=LoadedMlxDSpark(
+            config=_config(tmp_path, 3, aux_only_prefill=True),
+            target_model=target,
+            drafter=object(),
+            proposer=proposer,
+            evaluate=target_evaluate,
+        ),
+        target_model=target,
+        target_cache=target_cache,
+        draft=draft,
+        collective=agreement,
+        evaluate=target_evaluate,
+    )
+    return runtime, target_cache, target
+
+
+def test_aux_only_prefill_missing_api_fails_before_graph_or_progress(
+    tmp_path: Path,
+) -> None:
+    runtime, target_cache, _target = _aux_prompt_runtime(
+        tmp_path,
+        _FakeAgreement([]),
+        target_model=_FakeRuntimeTarget(),
+    )
+    progress: list[tuple[int, int]] = []
+
+    with pytest.raises(
+        DSparkDistributedStateError,
+        match="target auxiliary prompt prefill API preflight failed on every rank",
+    ):
+        runtime.seed_prompt(
+            cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
+            prefill_step_size=2,
+            max_tokens=16,
+            stop_sequences=(),
+            progress_callback=lambda done, total: progress.append((done, total)),
+            distributed_progress_callback=None,
+        )
+
+    assert cast(_FakeTargetCache, target_cache[0]).offset == 0
+    assert cast(_FakeKDATargetCache, target_cache[1]).cache == [None, None]
+    assert progress == []
+
+
+def test_aux_only_prefill_skips_logits_and_materializes_every_root_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace: list[str] = []
+    materializations: list[tuple[object, ...]] = []
+
+    def evaluate(*values: object) -> None:
+        trace.append("target_materialization")
+        materializations.append(values)
+
+    target = _FakeAuxPrefillRuntimeTarget()
+    runtime, target_cache, _target = _aux_prompt_runtime(
+        tmp_path,
+        _FakeAgreement([]),
+        target_model=target,
+        evaluate=evaluate,
+    )
+    proposer = cast(_FakeMlxProposer, runtime.draft.proposer)
+    append_target_context = proposer.append_target_context
+    full_logit_graph_builds: list[int] = []
+
+    def unexpected_full_logit_graph(*_args: object, **_kwargs: object) -> object:
+        full_logit_graph_builds.append(1)
+        raise AssertionError("opt-in prompt path must not build target logits")
+
+    def track_draft_projection(
+        aux_hidden_states: Sequence[object],
+        context_offset: int,
+        context_cache: object,
+    ) -> None:
+        trace.append("draft_projection")
+        append_target_context(aux_hidden_states, context_offset, context_cache)
+
+    monkeypatch.setattr(proposer, "append_target_context", track_draft_projection)
+    monkeypatch.setattr(
+        runtime,
+        "_build_forward_with_taps",
+        unexpected_full_logit_graph,
+    )
+    monkeypatch.setattr(dspark_module.mx, "clear_cache", lambda: None, raising=False)
+
+    prompt_tps, prompt_tokens = runtime.seed_prompt(
+        cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
+        prefill_step_size=2,
+        max_tokens=16,
+        stop_sequences=(),
+        progress_callback=lambda done, _total: trace.append(f"progress:{done}"),
+        distributed_progress_callback=None,
+    )
+
+    assert prompt_tps > 0
+    assert prompt_tokens == 2
+    assert target.aux_prefill_calls == [2]
+    assert full_logit_graph_builds == []
+    assert len(materializations) == 1
+    final_hidden_state, *other_roots = materializations[0]
+    assert cast(_FakeHidden, final_hidden_state).name == "final-hidden"
+    assert [cast(_FakeHidden, value).name for value in other_roots[:5]] == [
+        "tap-0",
+        "tap-1",
+        "tap-2",
+        "tap-3",
+        "tap-4",
+    ]
+    assert tuple(other_roots[5:]) == (
+        "mla-keys",
+        "mla-values",
+        "kda-conv",
+        "kda-ssm",
+    )
+    assert trace == [
+        "progress:0",
+        "target_materialization",
+        "draft_projection",
+        "progress:2",
+    ]
+    assert cast(_FakeTargetCache, target_cache[0]).offset == 2
+    assert [
+        entry.length
+        for entry in cast(Sequence[_FakeContextCache], runtime.draft.context_cache)
+    ] == [2, 2]
+
+
+@pytest.mark.parametrize(
+    ("final_hidden_size", "tap_count"),
+    [
+        pytest.param(1024, 5, id="final-hidden-shape"),
+        pytest.param(7168, 4, id="tap-count"),
+    ],
+)
+def test_aux_only_prefill_rejects_malformed_result_before_evaluation(
+    tmp_path: Path,
+    final_hidden_size: int,
+    tap_count: int,
+) -> None:
+    evaluations: list[tuple[object, ...]] = []
+    target = _FakeAuxPrefillRuntimeTarget(
+        final_hidden_size=final_hidden_size,
+        tap_count=tap_count,
+    )
+    runtime, _target_cache, _target = _aux_prompt_runtime(
+        tmp_path,
+        _FakeAgreement([]),
+        target_model=target,
+        evaluate=lambda *values: evaluations.append(values),
+    )
+
+    with pytest.raises(
+        DSparkDistributedStateError,
+        match="target auxiliary prompt prefill graph build failed on every rank",
+    ):
+        runtime.seed_prompt(
+            cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
+            prefill_step_size=2,
+            max_tokens=16,
+            stop_sequences=(),
+            progress_callback=lambda _done, _total: None,
+            distributed_progress_callback=None,
+        )
+
+    assert target.aux_prefill_calls == [2]
+    assert evaluations == []
+
+
+def test_aux_only_prefill_rank_asymmetry_fails_before_target_graph(
+    tmp_path: Path,
+) -> None:
+    target = _FakeAuxPrefillRuntimeTarget()
+    agreement = _FakeAgreement([], stage_outcomes=[True, None])
+    evaluations: list[tuple[object, ...]] = []
+    runtime, target_cache, _target = _aux_prompt_runtime(
+        tmp_path,
+        agreement,
+        target_model=target,
+        evaluate=lambda *values: evaluations.append(values),
+    )
+    progress: list[tuple[int, int]] = []
+
+    with pytest.raises(
+        DSparkDistributedStateError,
+        match=(
+            "target auxiliary prompt prefill API preflight outcomes disagreed "
+            "across ranks"
+        ),
+    ):
+        runtime.seed_prompt(
+            cast(mx.array, cast(object, _FakePromptArray((1, 2)))),
+            prefill_step_size=2,
+            max_tokens=16,
+            stop_sequences=(),
+            progress_callback=lambda done, total: progress.append((done, total)),
+            distributed_progress_callback=None,
+        )
+
+    assert target.aux_prefill_calls == []
+    assert evaluations == []
+    assert cast(_FakeTargetCache, target_cache[0]).offset == 0
+    assert cast(_FakeKDATargetCache, target_cache[1]).cache == [None, None]
+    assert progress == []
 
 
 def test_prompt_prefix_is_chunk_seeded_into_fresh_target_and_draft_context(
@@ -1889,6 +2189,11 @@ def test_prompt_prefix_is_chunk_seeded_into_fresh_target_and_draft_context(
         )
 
     monkeypatch.setattr(runtime, "_build_forward_with_taps", forward)
+
+    def unexpected_aux_prefill() -> None:
+        raise AssertionError("default-off prompt path must not preflight auxiliary API")
+
+    monkeypatch.setattr(runtime, "_target_aux_prefill_forward", unexpected_aux_prefill)
     monkeypatch.setattr(dspark_module.mx, "clear_cache", lambda: None, raising=False)
     progress: list[tuple[int, int]] = []
     distributed_progress: list[None] = []
@@ -1986,6 +2291,35 @@ def test_request_control_fingerprint_binds_graph_and_termination_controls() -> N
         stop_sequences=("STOP", "END"),
         distributed_progress=True,
     )
+
+
+def test_aux_only_prefill_flag_is_bound_into_rank_prompt_contract(
+    tmp_path: Path,
+) -> None:
+    control_runtime, _control_cache = _prompt_runtime(tmp_path, _FakeAgreement([]))
+    candidate_runtime, _candidate_cache, _target = _aux_prompt_runtime(
+        tmp_path,
+        _FakeAgreement([]),
+    )
+    prompt = cast(mx.array, cast(object, _FakePromptArray((1, 2))))
+
+    control_tokens, control_fingerprint = control_runtime._prompt_contract(
+        prompt,
+        max_tokens=16,
+        prefill_step_size=2,
+        stop_sequences=(),
+        distributed_progress=False,
+    )
+    candidate_tokens, candidate_fingerprint = candidate_runtime._prompt_contract(
+        prompt,
+        max_tokens=16,
+        prefill_step_size=2,
+        stop_sequences=(),
+        distributed_progress=False,
+    )
+
+    assert control_tokens == candidate_tokens == (1, 2)
+    assert control_fingerprint != candidate_fingerprint
 
 
 @pytest.mark.parametrize(

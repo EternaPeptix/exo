@@ -33,6 +33,7 @@ DSPARK_ENABLE_ENV = "EXO_MLX_KIMI_K3_DSPARK_SPECULATIVE"
 DSPARK_CHECKPOINT_ENV = "EXO_MLX_KIMI_K3_DSPARK_CHECKPOINT"
 DSPARK_VERIFY_WIDTH_ENV = "EXO_MLX_KIMI_K3_DSPARK_VERIFY_WIDTH"
 DSPARK_TELEMETRY_ENV = "EXO_MLX_KIMI_K3_DSPARK_ROUND_TELEMETRY"
+DSPARK_AUX_ONLY_PREFILL_ENV = "EXO_MLX_KIMI_K3_DSPARK_AUX_ONLY_PREFILL"
 
 MLX_DSPARK_PROPOSER_ENV = "MLX_LM_KIMI_K3_DSPARK_PROPOSER"
 MLX_REPLAYSSM_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
@@ -71,6 +72,7 @@ _EXO_COMPANION_ENVS = (
     DSPARK_CHECKPOINT_ENV,
     DSPARK_VERIFY_WIDTH_ENV,
     DSPARK_TELEMETRY_ENV,
+    DSPARK_AUX_ONLY_PREFILL_ENV,
 )
 
 
@@ -104,6 +106,7 @@ class KimiK3DSparkConfig:
     model_bytes: int = RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES
     model_sha256: str = RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256
     target_layer_ids: tuple[int, ...] = RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS
+    aux_only_prefill: bool = False
 
     @property
     def gamma(self) -> int:
@@ -315,10 +318,15 @@ def kimi_k3_dspark_config(
         DSPARK_TELEMETRY_ENV,
         values.get(DSPARK_TELEMETRY_ENV, "0"),
     )
+    aux_only_prefill = _strict_flag(
+        DSPARK_AUX_ONLY_PREFILL_ENV,
+        values.get(DSPARK_AUX_ONLY_PREFILL_ENV, "0"),
+    )
     return KimiK3DSparkConfig(
         checkpoint_path=checkpoint_path,
         verify_width=verify_width,
         round_telemetry=round_telemetry,
+        aux_only_prefill=aux_only_prefill,
     )
 
 
@@ -2300,6 +2308,11 @@ class _TargetForwardResult(Protocol):
     aux_hidden_states: Sequence[object]
 
 
+class _AuxPrefillResult(Protocol):
+    final_hidden_state: object
+    aux_hidden_states: Sequence[object]
+
+
 class _CompactTargetForwardResult(Protocol):
     tokens: object
     aux_hidden_states: Sequence[object]
@@ -2437,6 +2450,49 @@ def _target_cache_states(target_cache: object) -> tuple[object, ...]:
         cast(_TargetCacheEntry, entry).state
         for entry in cast(Sequence[object], target_cache)
     )
+
+
+def _target_cache_materialization_roots(target_cache: object) -> tuple[object, ...]:
+    """Flatten every nested cache state before any rank can enter evaluation."""
+
+    roots: list[object] = []
+
+    def append_state(value: object) -> None:
+        if value is None:
+            raise ValueError("Kimi K3 target cache contains an empty state root")
+        if isinstance(value, Mapping):
+            if not value:
+                raise ValueError("Kimi K3 target cache contains an empty state root")
+            for nested in cast(Mapping[object, object], value).values():
+                append_state(nested)
+            return
+        if isinstance(value, (list, tuple)):
+            if not value:
+                raise ValueError("Kimi K3 target cache contains an empty state root")
+            for nested in cast(Sequence[object], value):
+                append_state(nested)
+            return
+        roots.append(value)
+
+    for state in _target_cache_states(target_cache):
+        append_state(state)
+    if not roots:
+        raise ValueError("Kimi K3 target cache has no materialization roots")
+    return tuple(roots)
+
+
+def _validate_target_final_hidden_state(
+    final_hidden_state: object,
+    *,
+    expected_width: int,
+) -> None:
+    shape = _shape_tuple(getattr(final_hidden_state, "shape", None))
+    expected = (1, expected_width, KIMI_K3_TARGET_HIDDEN_SIZE)
+    if shape != expected:
+        raise ValueError(
+            "Kimi K3 target final hidden state must have shape "
+            f"[1, {expected_width}, {KIMI_K3_TARGET_HIDDEN_SIZE}]"
+        )
 
 
 def _validate_target_logits(logits: object, *, expected_width: int) -> None:
@@ -2593,6 +2649,49 @@ class _BuiltKimiK3TargetForward:
         )
         self._materialized = True
         return self.forward
+
+
+@final
+class _BuiltKimiK3AuxPrefill:
+    """Shape-checked prompt graph with no vocabulary-logit evaluation root."""
+
+    def __init__(
+        self,
+        *,
+        final_hidden_state: object,
+        validated_aux_hidden_states: tuple[object, ...],
+        target_cache: object,
+        cache_roots: tuple[object, ...],
+        initial_offset: int,
+        width: int,
+        evaluate: Callable[..., None],
+    ):
+        self.final_hidden_state = final_hidden_state
+        self.validated_aux_hidden_states = validated_aux_hidden_states
+        self._target_cache = target_cache
+        self._cache_roots = cache_roots
+        self._initial_offset = initial_offset
+        self._width = width
+        self._evaluate = evaluate
+        self._materialized = False
+
+    def materialize(self) -> tuple[object, ...]:
+        if self._materialized:
+            raise RuntimeError(
+                "Kimi K3 auxiliary prefill graph was already materialized"
+            )
+        self._evaluate(
+            self.final_hidden_state,
+            *self.validated_aux_hidden_states,
+            *self._cache_roots,
+        )
+        _validate_target_cache(
+            self._target_cache,
+            expected_offset=self._initial_offset + self._width,
+            require_kda_state=True,
+        )
+        self._materialized = True
+        return self.validated_aux_hidden_states
 
 
 @final
@@ -2914,6 +3013,21 @@ class KimiK3DSparkRequestRuntime:
                 ) from None
         return result
 
+    def _target_aux_prefill_forward(
+        self,
+    ) -> Callable[[mx.array, object, tuple[int, ...]], object]:
+        forward = getattr(
+            self.target_model,
+            "forward_aux_hidden_states_for_cache",
+            None,
+        )
+        if not callable(forward):
+            raise DSparkFeatureUnavailableError(
+                "Kimi K3 auxiliary prompt prefill was requested but the target "
+                "rank does not expose forward_aux_hidden_states_for_cache"
+            )
+        return cast(Callable[[mx.array, object, tuple[int, ...]], object], forward)
+
     def _validate_forward_readiness(
         self,
         inputs: mx.array,
@@ -2982,6 +3096,51 @@ class KimiK3DSparkRequestRuntime:
             evaluate=self.evaluate,
         )
 
+    def _build_aux_prefill_with_taps(
+        self,
+        inputs: mx.array,
+        *,
+        initial_offset: int,
+        forward: Callable[[mx.array, object, tuple[int, ...]], object],
+    ) -> _BuiltKimiK3AuxPrefill:
+        if inputs.ndim != 2 or inputs.shape[0] != 1 or inputs.shape[1] <= 0:
+            raise ValueError("Kimi K3 DSpark target input must be non-empty batch one")
+        width = int(inputs.shape[1])
+        if _target_cache_offset(self.target_cache) != initial_offset:
+            raise ValueError("Kimi K3 target cache moved after its readiness gate")
+        result = cast(
+            _AuxPrefillResult,
+            forward(
+                inputs,
+                self.target_cache,
+                self.loaded.config.target_hidden_state_indices,
+            ),
+        )
+        final_hidden_state = getattr(result, "final_hidden_state", None)
+        aux_hidden_states = getattr(result, "aux_hidden_states", None)
+        if not isinstance(aux_hidden_states, Sequence) or isinstance(
+            aux_hidden_states, (str, bytes)
+        ):
+            raise TypeError("Kimi K3 target did not return auxiliary hidden states")
+        _validate_target_final_hidden_state(
+            final_hidden_state,
+            expected_width=width,
+        )
+        validated = _validated_aux_hidden_states(
+            cast(Sequence[object], aux_hidden_states),
+            expected_width=width,
+        )
+        cache_roots = _target_cache_materialization_roots(self.target_cache)
+        return _BuiltKimiK3AuxPrefill(
+            final_hidden_state=final_hidden_state,
+            validated_aux_hidden_states=validated,
+            target_cache=self.target_cache,
+            cache_roots=cache_roots,
+            initial_offset=initial_offset,
+            width=width,
+            evaluate=self.evaluate,
+        )
+
     def _prompt_contract(
         self,
         prompt_prefix: mx.array,
@@ -3010,7 +3169,10 @@ class KimiK3DSparkRequestRuntime:
             tokens,
             self.banned_token_ids,
             self.terminal_token_ids,
-            (int(self.compact_greedy),),
+            (
+                int(self.compact_greedy),
+                int(self.loaded.config.aux_only_prefill),
+            ),
         )
         request_fingerprint = _request_control_fingerprint(
             max_tokens=max_tokens,
@@ -3053,6 +3215,17 @@ class KimiK3DSparkRequestRuntime:
                     "Kimi K3 DSpark prompt/request contract disagreed across ranks; "
                     "no target TP graph was built"
                 ) from None
+        aux_prefill_forward: (
+            Callable[[mx.array, object, tuple[int, ...]], object] | None
+        ) = None
+        if self.loaded.config.aux_only_prefill:
+            # The opt-in bit is already bound into the agreed prompt digest, so
+            # every rank enters this preflight or none do. Feature asymmetry is
+            # agreed before a target graph capable of TP collective entry exists.
+            aux_prefill_forward = self._agreed_operation(
+                "target auxiliary prompt prefill API preflight",
+                self._target_aux_prefill_forward,
+            )
         processed = 0
         started = self.clock()
         self.agree_local_side_effect(
@@ -3090,24 +3263,47 @@ class KimiK3DSparkRequestRuntime:
                     "Kimi K3 DSpark target prompt offsets disagreed across ranks; "
                     "no target TP graph was built"
                 ) from None
-            pending_forward = self._agreed_operation(
-                "target prompt graph build",
-                lambda chunk=chunk,
-                initial_offset=initial_offset: self._build_forward_with_taps(
-                    chunk,
+            prompt_aux_hidden_states: Sequence[object]
+            if aux_prefill_forward is None:
+                pending_forward = self._agreed_operation(
+                    "target prompt graph build",
+                    lambda chunk=chunk, initial_offset=initial_offset: (
+                        self._build_forward_with_taps(
+                            chunk,
+                            initial_offset=initial_offset,
+                        )
+                    ),
+                )
+                forward_result = self._agreed_operation(
+                    "target prompt materialization",
+                    pending_forward.materialize,
+                )
+                prompt_aux_hidden_states = forward_result.aux_hidden_states
+            else:
+                pending_aux_prefill = self._agreed_operation(
+                    "target auxiliary prompt prefill graph build",
+                    lambda chunk=chunk,
                     initial_offset=initial_offset,
-                ),
-            )
-            forward = self._agreed_operation(
-                "target prompt materialization",
-                pending_forward.materialize,
-            )
+                    aux_prefill_forward=aux_prefill_forward: (
+                        self._build_aux_prefill_with_taps(
+                            chunk,
+                            initial_offset=initial_offset,
+                            forward=aux_prefill_forward,
+                        )
+                    ),
+                )
+                prompt_aux_hidden_states = self._agreed_operation(
+                    "target auxiliary prompt prefill materialization",
+                    pending_aux_prefill.materialize,
+                )
             self._agreed_operation(
                 "draft prompt projection",
-                lambda forward=forward,
-                chunk_size=chunk_size: self.draft.seed_target_context(
-                    forward.aux_hidden_states,
-                    expected_width=chunk_size,
+                lambda prompt_aux_hidden_states=prompt_aux_hidden_states,
+                chunk_size=chunk_size: (
+                    self.draft.seed_target_context(
+                        prompt_aux_hidden_states,
+                        expected_width=chunk_size,
+                    )
                 ),
             )
             processed = next_processed
