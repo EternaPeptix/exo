@@ -29,7 +29,7 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = "da0f01d70d60fe6a28d26b0c61c85c1d5260afd0"
+RUNTIME_MLX_LM_COMMIT = "e2050582995426c0e1f3f4619b80fc8a456f3d36"
 MLX_LM_KIMI_K3_SHA256 = (
     "0c14403903d862aadc30b071a5931ef0db29642111e3bd7ed4ab4a38558ce8d4"
 )
@@ -53,6 +53,9 @@ MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256 = (
 )
 MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256 = (
     "2401fa7c58ad095e0b48bd617387df8fd30403b4e11416c56620879b0044c7b7"
+)
+MLX_LM_KIMI_K3_FUSED_ROUTER_SHA256 = (
+    "17bfde08b4d72deb74f9f0e0337822495e1b305166ee966eaab65896f1ed1fc4"
 )
 MLX_LM_KIMI_K3_TUNED_GATHER_QMV_SHA256 = (
     "ec702446d3b3fe72cd95b0ee24497de54bcfde1ea2de9f78bad96e2f98ac4de2"
@@ -343,6 +346,7 @@ def _verify_runtime_source() -> None:
         kimi_k3_dspark,
         kimi_k3_fused_down_reduce,
         kimi_k3_fused_expert,
+        kimi_k3_fused_router,
         kimi_k3_fused_switch_glu,
         kimi_k3_packed_moe_front,
         kimi_k3_tuned_gather_qmv,
@@ -377,6 +381,11 @@ def _verify_runtime_source() -> None:
             kimi_k3_fused_down_reduce,
             "kimi_k3_fused_down_reduce.py",
             MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256,
+        ),
+        (
+            kimi_k3_fused_router,
+            "kimi_k3_fused_router.py",
+            MLX_LM_KIMI_K3_FUSED_ROUTER_SHA256,
         ),
         (
             kimi_k3_tuned_gather_qmv,

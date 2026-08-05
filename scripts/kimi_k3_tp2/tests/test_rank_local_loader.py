@@ -373,6 +373,7 @@ def test_runtime_source_verification_uses_execution_pin(
         "kimi_k3_dspark": "MLX_LM_KIMI_K3_DSPARK_SHA256",
         "kimi_k3_fused_down_reduce": "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256",
         "kimi_k3_fused_expert": "MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256",
+        "kimi_k3_fused_router": "MLX_LM_KIMI_K3_FUSED_ROUTER_SHA256",
         "kimi_k3_fused_switch_glu": "MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256",
         "kimi_k3_packed_moe_front": "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256",
         "kimi_k3_tuned_gather_qmv": "MLX_LM_KIMI_K3_TUNED_GATHER_QMV_SHA256",
