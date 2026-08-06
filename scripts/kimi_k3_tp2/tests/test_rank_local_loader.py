@@ -245,10 +245,10 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
     assert result["rank_data_bytes"] == 32
 
 
-def test_execution_runtime_pin_matches_top8_kcut_candidate():
-    assert loader.RUNTIME_MLX_LM_COMMIT == ("bda4ae8b0fa67124bdf7f84bcd0715e7e284b558")
+def test_execution_runtime_pin_matches_top8_sequential_q3_candidate():
+    assert loader.RUNTIME_MLX_LM_COMMIT == ("2fcf8e1e94941b755f3eb27c4f99731f747ba84c")
     assert loader.MLX_LM_KIMI_K3_SHA256 == (
-        "6d41a3743cb62af9c024997172034472c046a4f72ae154882fcd2b1cee72c4de"
+        "26414ea04f082474d882da36bf823557a9f93af0f736cccd532b881ea2913ab9"
     )
     assert loader.MLX_LM_KIMI_K3_FUSED_ROUTER_SHA256 == (
         "14a7cb54eb3585c992504c109db8bed45eb6ec521ae37e680eb601c419ed8ed1"
