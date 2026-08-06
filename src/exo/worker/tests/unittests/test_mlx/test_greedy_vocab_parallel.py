@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,8 +18,13 @@ from exo.shared.types.text_generation import InputMessage, TextGenerationTaskPar
 from exo.shared.types.worker.instances import InstanceId
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.worker.engines.mlx import utils_mlx
-from exo.worker.engines.mlx.builder import MlxBuilder
+from exo.worker.engines.mlx.builder import (
+    MlxBuilder,
+    dspark_config_contract,
+    loaded_dspark_contract,
+)
 from exo.worker.engines.mlx.generator import generate as generate_module
+from exo.worker.engines.mlx.generator import kimi_k3_dspark as dspark_module
 from exo.worker.engines.mlx.generator.generate import (
     greedy_vocab_parallel_stream_kwargs,
     warmup_inference,
@@ -28,7 +34,11 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSparkDistributedStateError,
     DSparkRoundResult,
     DSparkRoundTelemetry,
+    KimiK3DSparkConfig,
+    KimiK3DSparkDualConfig,
+    KimiK3DSparkProposerSelection,
     LoadedMlxDSpark,
+    LoadedMlxDSparkDual,
 )
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import rank_agreed_local_stage
@@ -547,6 +557,80 @@ def test_builder_threads_dspark_into_real_sequential_warmup(
     assert engine.check_for_cancel_every == 17
 
 
+def _dual_loaded_for_test(tmp_path: Path) -> LoadedMlxDSparkDual:
+    old_config = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path / "old",
+        verify_width=8,
+        round_telemetry=False,
+    )
+    yarn_config = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path / "yarn",
+        verify_width=8,
+        round_telemetry=False,
+        revision=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_REVISION,
+        config_sha256=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256,
+        model_sha256=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256,
+    )
+    config = KimiK3DSparkDualConfig(old=old_config, yarn=yarn_config)
+    target_model = object()
+    return LoadedMlxDSparkDual(
+        config=config,
+        old=LoadedMlxDSpark(
+            config=old_config,
+            target_model=target_model,
+            drafter=SimpleNamespace(name="old-drafter"),
+            proposer=SimpleNamespace(name="old-proposer"),
+        ),
+        yarn=LoadedMlxDSpark(
+            config=yarn_config,
+            target_model=target_model,
+            drafter=SimpleNamespace(name="yarn-drafter"),
+            proposer=SimpleNamespace(name="yarn-proposer"),
+        ),
+    )
+
+
+def test_dual_rank_contracts_bind_both_identities_and_fixed_threshold(
+    tmp_path: Path,
+) -> None:
+    loaded = _dual_loaded_for_test(tmp_path)
+    config_payload = json.loads(dspark_config_contract(loaded.config))
+    load_payload = json.loads(
+        loaded_dspark_contract(loaded, vision_processor_present=False)
+    )
+
+    assert config_payload["mode"] == "dual"
+    assert config_payload["threshold_tokens"] == 8_192
+    assert config_payload["aux_only_prefill"] is False
+    assert config_payload["old"]["revision"] == loaded.config.old.revision
+    assert config_payload["yarn"]["revision"] == loaded.config.yarn.revision
+    assert (
+        config_payload["old"]["model_sha256"] != config_payload["yarn"]["model_sha256"]
+    )
+    assert load_payload["mode"] == "dual"
+    assert load_payload["threshold_tokens"] == 8_192
+    assert load_payload["aux_only_prefill"] is False
+    assert load_payload["old"]["checkpoint"] == str(loaded.config.old.checkpoint_path)
+    assert load_payload["yarn"]["checkpoint"] == str(loaded.config.yarn.checkpoint_path)
+
+    other = _dual_loaded_for_test(tmp_path / "other-rank")
+    assert dspark_config_contract(other.config) != dspark_config_contract(loaded.config)
+    assert loaded_dspark_contract(
+        other,
+        vision_processor_present=False,
+    ) != loaded_dspark_contract(loaded, vision_processor_present=False)
+
+    assert loaded.old is not None
+    single_config_payload = json.loads(dspark_config_contract(loaded.config.old))
+    single_load_payload = json.loads(
+        loaded_dspark_contract(loaded.old, vision_processor_present=False)
+    )
+    assert "mode" not in single_config_payload
+    assert "aux_only_prefill" not in single_config_payload
+    assert "mode" not in single_load_payload
+    assert "revision" not in single_load_payload
+
+
 def _sequential_for_callback_test(cancel_receiver: object) -> SequentialGenerator:
     return SequentialGenerator(
         model=cast(Model, object()),
@@ -559,6 +643,53 @@ def _sequential_for_callback_test(cancel_receiver: object) -> SequentialGenerato
         cancel_receiver=cast(object, cancel_receiver),
         event_sender=cast(object, object()),
     )
+
+
+def test_sequential_generator_shutdown_closes_both_dual_proposers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanups: list[str] = []
+    monkeypatch.setattr(
+        dspark_module,
+        "_release_mlx_memory",
+        lambda: cleanups.append("released"),
+    )
+    loaded = _dual_loaded_for_test(tmp_path)
+    generator = _sequential_for_callback_test(object())
+    generator.dspark = loaded
+
+    generator.close()
+
+    assert loaded.old is None
+    assert loaded.yarn is None
+    assert cleanups == ["released"]
+
+
+def test_builder_shutdown_closes_dual_before_dropping_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, bool]] = []
+    loaded = _dual_loaded_for_test(tmp_path)
+    builder = MlxBuilder(
+        model_id=ModelId("kernelpool/Kimi-K3-2bit-UVMAX"),
+        event_sender=cast(object, object()),
+        cancel_receiver=cast(object, object()),
+        inference_model=cast(Model, loaded.target_model),
+        dspark=loaded,
+    )
+
+    def release() -> None:
+        events.append(("released", hasattr(builder, "inference_model")))
+
+    monkeypatch.setattr(dspark_module, "_release_mlx_memory", release)
+
+    builder.close()
+
+    assert loaded.old is None
+    assert loaded.yarn is None
+    assert events == [("released", True)]
 
 
 def _fake_dspark_task(*, bench: bool = True) -> TextGeneration:
@@ -1085,6 +1216,59 @@ def test_dspark_setup_fingerprint_binds_generation_callback_presence(
     )
 
 
+def test_dspark_setup_fingerprint_binds_dual_selection_without_changing_default() -> None:
+    common = {
+        "prompt_tokens": cast(object, _PromptTokens((1, 2, 3))),
+        "max_tokens": 16,
+        "prefill_step_size": 4,
+        "capacity_hint": 18,
+        "verify_width": 8,
+        "seed": 42,
+        "is_bench": False,
+        "compact_greedy": False,
+        "generation_progress": False,
+        "eos_token_ids": (2,),
+        "banned_token_ids": (),
+        "terminal_token_ids": (2,),
+        "stop_sequences": (),
+    }
+    old = KimiK3DSparkProposerSelection(
+        role="old",
+        initial_prompt_tokens=8_191,
+        threshold_tokens=8_192,
+        revision="old-revision",
+        config_sha256="1" * 64,
+        model_sha256="2" * 64,
+    )
+    yarn = KimiK3DSparkProposerSelection(
+        role="yarn",
+        initial_prompt_tokens=8_192,
+        threshold_tokens=8_192,
+        revision="yarn-revision",
+        config_sha256="3" * 64,
+        model_sha256="4" * 64,
+    )
+
+    legacy = generate_module._dspark_setup_fingerprint(**common)  # type: ignore[arg-type]
+    explicit_default = generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        proposer_selection=None,
+    )
+    old_fingerprint = generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        proposer_selection=old,
+    )
+    yarn_fingerprint = generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        proposer_selection=yarn,
+    )
+
+    assert legacy == explicit_default
+    assert old.identity_sha256 != yarn.identity_sha256
+    assert old_fingerprint != legacy
+    assert old_fingerprint != yarn_fingerprint
+
+
 @dataclass
 class _Detokenizer:
     pieces: dict[int, str]
@@ -1195,6 +1379,8 @@ def _run_mlx_generate_dspark_scenario(
     )
 
     def create_runtime(*_args: object, **_kwargs: object) -> object:
+        if lifecycle_events is not None:
+            lifecycle_events.append("runtime_create")
         if runtime_create_error is not None:
             raise runtime_create_error
         return runtime
@@ -1235,14 +1421,37 @@ def _run_mlx_generate_dspark_scenario(
     monkeypatch.setattr(
         generate_module, "_validate_dspark_request", lambda *_args, **_kwargs: None
     )
-    monkeypatch.setattr(
-        generate_module, "encode_prompt", lambda *_args: _PromptTokens((1, 2, 10))
-    )
-    monkeypatch.setattr(
-        generate_module, "fix_unmatched_think_end_tokens", lambda tokens, _tok: tokens
-    )
+
+    def encode(*_args: object) -> _PromptTokens:
+        if lifecycle_events is not None:
+            lifecycle_events.append("encode")
+        return _PromptTokens((1, 2, 10))
+
+    def fix(tokens: object, _tokenizer: object) -> object:
+        if lifecycle_events is not None:
+            lifecycle_events.append("fix")
+        return tokens
+
+    select_loaded = generate_module.select_loaded_mlx_dspark
+
+    def select(loaded: object, *, initial_prompt_tokens: int) -> object:
+        if lifecycle_events is not None:
+            lifecycle_events.append("select")
+        return select_loaded(  # type: ignore[arg-type]
+            loaded,
+            initial_prompt_tokens=initial_prompt_tokens,
+        )
+
+    def make_target_cache(**_kwargs: object) -> list[object]:
+        if lifecycle_events is not None:
+            lifecycle_events.append("target_cache")
+        return []
+
+    monkeypatch.setattr(generate_module, "encode_prompt", encode)
+    monkeypatch.setattr(generate_module, "fix_unmatched_think_end_tokens", fix)
+    monkeypatch.setattr(generate_module, "select_loaded_mlx_dspark", select)
     monkeypatch.setattr(generate_module, "system_prompt_token_count", lambda *_args: 0)
-    monkeypatch.setattr(generate_module, "make_kv_cache", lambda **_kwargs: [])
+    monkeypatch.setattr(generate_module, "make_kv_cache", make_target_cache)
     monkeypatch.setattr(generate_module, "make_logits_processors", lambda **_kwargs: [])
     monkeypatch.setattr(generate_module, "make_sampler", lambda **_kwargs: object())
 
@@ -1294,6 +1503,30 @@ def _run_mlx_generate_dspark_scenario(
                 on_generation_token=generation_callback,
             )
         )
+
+
+def test_dspark_selects_after_final_tokenization_before_any_request_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle: list[str] = []
+
+    _run_mlx_generate_dspark_scenario(
+        monkeypatch,
+        engine=_ScenarioRoundEngine(
+            [],
+            ordinary=[_round((11,), proposed=0, accepted=0)],
+        ),
+        pieces={11: "done"},
+        eos_ids=(),
+        stop=None,
+        max_tokens=1,
+        lifecycle_events=lifecycle,
+    )
+
+    assert lifecycle.index("encode") < lifecycle.index("fix")
+    assert lifecycle.index("fix") < lifecycle.index("select")
+    assert lifecycle.index("select") < lifecycle.index("target_cache")
+    assert lifecycle.index("target_cache") < lifecycle.index("runtime_create")
 
 
 @pytest.mark.parametrize(

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import gc
 import hashlib
 import importlib
 import inspect
@@ -41,6 +42,18 @@ DSPARK_TELEMETRY_ENV = "EXO_MLX_KIMI_K3_DSPARK_ROUND_TELEMETRY"
 DSPARK_AUX_ONLY_PREFILL_ENV = "EXO_MLX_KIMI_K3_DSPARK_AUX_ONLY_PREFILL"
 DSPARK_CONFIDENCE_JSONL_ENV = "EXO_MLX_KIMI_K3_DSPARK_CONFIDENCE_JSONL"
 DSPARK_CONFIDENCE_SESSION_ENV = "EXO_MLX_KIMI_K3_DSPARK_CONFIDENCE_SESSION"
+DSPARK_DUAL_PROPOSER_ENV = "EXO_MLX_KIMI_K3_DSPARK_DUAL_PROPOSER"
+DSPARK_YARN_CHECKPOINT_ENV = "EXO_MLX_KIMI_K3_DSPARK_YARN_CHECKPOINT"
+
+# These controls live on separate experimental branches.  The first dual
+# proposer deliberately rejects them instead of silently composing untested
+# request-state machines when those branches are integrated.
+DSPARK_PREFIX_CACHE_ENV = "EXO_MLX_KIMI_K3_DSPARK_PREFIX_CACHE"
+DSPARK_ADAPTIVE_GATE_ENV = "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_W3_GATE"
+DSPARK_ADAPTIVE_GATE_POLICY_ENV = "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_W3_GATE_POLICY"
+DSPARK_ADAPTIVE_GATE_POLICY_SHA256_ENV = (
+    "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_W3_GATE_POLICY_SHA256"
+)
 
 MLX_DSPARK_PROPOSER_ENV = "MLX_LM_KIMI_K3_DSPARK_PROPOSER"
 MLX_REPLAYSSM_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
@@ -70,6 +83,7 @@ RADIXARK_KIMI_K3_DSPARK_BLOCK_SIZE = 7
 KIMI_K3_TARGET_HIDDEN_SIZE = 7168
 KIMI_K3_TARGET_TAP_COUNT = len(RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS)
 KIMI_K3_MAX_CONTEXT_LENGTH = 1_048_576
+DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS = 8_192
 
 # SGLang's published K3 deployment maps checkpoint block_size directly to
 # gamma, so seven proposals plus the current anchor are verified at once.
@@ -91,6 +105,8 @@ _EXO_COMPANION_ENVS = (
     DSPARK_AUX_ONLY_PREFILL_ENV,
     DSPARK_CONFIDENCE_JSONL_ENV,
     DSPARK_CONFIDENCE_SESSION_ENV,
+    DSPARK_DUAL_PROPOSER_ENV,
+    DSPARK_YARN_CHECKPOINT_ENV,
 )
 
 
@@ -170,6 +186,69 @@ class KimiK3DSparkConfig:
         """Direct MLX-LM layer ids for post-layer target taps."""
 
         return self.target_layer_ids
+
+
+@dataclass(frozen=True)
+class KimiK3DSparkDualConfig:
+    """Two exact proposer identities selected once from initial prompt length."""
+
+    old: KimiK3DSparkConfig
+    yarn: KimiK3DSparkConfig
+    threshold_tokens: int = DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS
+
+    def __post_init__(self) -> None:
+        if self.threshold_tokens != DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS:
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark threshold must be exactly 8192 tokens"
+            )
+        if (
+            self.old.revision != RADIXARK_KIMI_K3_DSPARK_REVISION
+            or self.old.config_sha256 != RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256
+            or self.old.model_sha256 != RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256
+        ):
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark old checkpoint identity does not match"
+            )
+        if (
+            self.yarn.revision != RADIXARK_KIMI_K3_DSPARK_YARN_REVISION
+            or self.yarn.config_sha256 != RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256
+            or self.yarn.model_sha256 != RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256
+        ):
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark YaRN checkpoint identity does not match"
+            )
+        if self.old.checkpoint_path.resolve() == self.yarn.checkpoint_path.resolve():
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark checkpoints must be distinct directories"
+            )
+        shared_contract = (
+            "verify_width",
+            "round_telemetry",
+            "placement",
+            "model_id",
+            "model_bytes",
+            "target_layer_ids",
+            "aux_only_prefill",
+            "confidence_capture",
+        )
+        if any(
+            getattr(self.old, name) != getattr(self.yarn, name)
+            for name in shared_contract
+        ):
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark checkpoint runtime contracts disagree"
+            )
+        if self.old.confidence_capture is not None:
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark cannot be combined with confidence capture"
+            )
+
+    @property
+    def verify_width(self) -> Literal[3, 8]:
+        return self.old.verify_width
+
+
+KimiK3DSparkDeploymentConfig = KimiK3DSparkConfig | KimiK3DSparkDualConfig
 
 
 def _strict_flag(name: str, raw: str) -> bool:
@@ -396,10 +475,8 @@ def kimi_k3_dspark_config(
     is_batch: bool,
     environ: Mapping[str, str] | None = None,
     warning: Callable[[str], None] = logger.warning,
-    checkpoint_validator: Callable[
-        [Path], KimiK3DSparkCheckpointContract | None
-    ] = validate_local_dspark_checkpoint,
-) -> KimiK3DSparkConfig | None:
+    checkpoint_validator: Callable[[Path], object] = validate_local_dspark_checkpoint,
+) -> KimiK3DSparkDeploymentConfig | None:
     """Parse the fail-closed EXO and MLX-LM DSpark opt-ins.
 
     Configuration mistakes raise instead of silently selecting ordinary decode.
@@ -435,19 +512,56 @@ def kimi_k3_dspark_config(
             "Kimi K3 DSpark speculation does not support batch generation"
         )
 
+    dual_enabled = _strict_flag(
+        DSPARK_DUAL_PROPOSER_ENV,
+        values.get(DSPARK_DUAL_PROPOSER_ENV, "0"),
+    )
+    yarn_checkpoint_raw = values.get(DSPARK_YARN_CHECKPOINT_ENV)
+    if not dual_enabled and yarn_checkpoint_raw is not None:
+        raise DSparkConfigurationError(
+            f"{DSPARK_YARN_CHECKPOINT_ENV} requires {DSPARK_DUAL_PROPOSER_ENV}=1"
+        )
+    if dual_enabled:
+        incompatible_enabled: list[str] = []
+        for name in (DSPARK_PREFIX_CACHE_ENV, DSPARK_ADAPTIVE_GATE_ENV):
+            raw = values.get(name)
+            if raw is not None and _strict_flag(name, raw):
+                incompatible_enabled.append(name)
+        incompatible_configured = [
+            name
+            for name in (
+                DSPARK_ADAPTIVE_GATE_POLICY_ENV,
+                DSPARK_ADAPTIVE_GATE_POLICY_SHA256_ENV,
+                DSPARK_CONFIDENCE_JSONL_ENV,
+                DSPARK_CONFIDENCE_SESSION_ENV,
+            )
+            if name in values
+        ]
+        incompatible = incompatible_enabled + incompatible_configured
+        if incompatible:
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark cannot be combined with " + ", ".join(incompatible)
+            )
+        if yarn_checkpoint_raw is None or yarn_checkpoint_raw == "":
+            raise DSparkConfigurationError(
+                f"{DSPARK_YARN_CHECKPOINT_ENV} is required when "
+                f"{DSPARK_DUAL_PROPOSER_ENV}=1"
+            )
+
     checkpoint_raw = values.get(DSPARK_CHECKPOINT_ENV)
     if checkpoint_raw is None or checkpoint_raw == "":
         raise DSparkConfigurationError(
             f"{DSPARK_CHECKPOINT_ENV} is required when {DSPARK_ENABLE_ENV}=1"
         )
     checkpoint_path = Path(checkpoint_raw)
-    checkpoint_contract = checkpoint_validator(checkpoint_path)
-    if checkpoint_contract is not None and not isinstance(
-        checkpoint_contract, KimiK3DSparkCheckpointContract
+    raw_checkpoint_contract: object = checkpoint_validator(checkpoint_path)
+    if raw_checkpoint_contract is not None and not isinstance(
+        raw_checkpoint_contract, KimiK3DSparkCheckpointContract
     ):
         raise DSparkConfigurationError(
             "Kimi K3 DSpark checkpoint validator returned an invalid contract"
         )
+    checkpoint_contract = raw_checkpoint_contract
 
     verify_width = _strict_verify_width(
         values.get(
@@ -482,7 +596,7 @@ def kimi_k3_dspark_config(
         config_sha256 = checkpoint_contract.config_sha256
         model_bytes = checkpoint_contract.model_bytes
         model_sha256 = checkpoint_contract.model_sha256
-    return KimiK3DSparkConfig(
+    primary_config = KimiK3DSparkConfig(
         checkpoint_path=checkpoint_path,
         verify_width=verify_width,
         round_telemetry=round_telemetry,
@@ -493,6 +607,39 @@ def kimi_k3_dspark_config(
         aux_only_prefill=aux_only_prefill,
         confidence_capture=confidence_capture,
     )
+    if not dual_enabled:
+        return primary_config
+
+    if checkpoint_contract is None or (
+        checkpoint_contract.revision != RADIXARK_KIMI_K3_DSPARK_REVISION
+        or checkpoint_contract.config_sha256 != RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256
+        or checkpoint_contract.model_sha256 != RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256
+    ):
+        raise DSparkConfigurationError(
+            "Kimi K3 dual DSpark primary checkpoint must be the pinned old revision"
+        )
+    assert yarn_checkpoint_raw is not None
+    yarn_checkpoint_path = Path(yarn_checkpoint_raw)
+    yarn_contract = checkpoint_validator(yarn_checkpoint_path)
+    if not isinstance(yarn_contract, KimiK3DSparkCheckpointContract) or (
+        yarn_contract.revision != RADIXARK_KIMI_K3_DSPARK_YARN_REVISION
+        or yarn_contract.config_sha256 != RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256
+        or yarn_contract.model_sha256 != RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256
+    ):
+        raise DSparkConfigurationError(
+            "Kimi K3 dual DSpark YaRN checkpoint must be the pinned 9c4 revision"
+        )
+    yarn_config = KimiK3DSparkConfig(
+        checkpoint_path=yarn_checkpoint_path,
+        verify_width=verify_width,
+        round_telemetry=round_telemetry,
+        revision=yarn_contract.revision,
+        config_sha256=yarn_contract.config_sha256,
+        model_bytes=yarn_contract.model_bytes,
+        model_sha256=yarn_contract.model_sha256,
+        aux_only_prefill=aux_only_prefill,
+    )
+    return KimiK3DSparkDualConfig(old=primary_config, yarn=yarn_config)
 
 
 @dataclass(frozen=True)
@@ -2922,6 +3069,140 @@ class LoadedMlxDSpark:
         )
 
 
+DSparkProposerRole = Literal["old", "yarn"]
+
+
+@dataclass(frozen=True)
+class KimiK3DSparkProposerSelection:
+    """Immutable request-scoped identity chosen from initial encoded tokens."""
+
+    role: DSparkProposerRole
+    initial_prompt_tokens: int
+    threshold_tokens: int
+    revision: str
+    config_sha256: str
+    model_sha256: str
+
+    @property
+    def identity_sha256(self) -> str:
+        payload = json.dumps(
+            {
+                "role": self.role,
+                "initial_prompt_tokens": self.initial_prompt_tokens,
+                "threshold_tokens": self.threshold_tokens,
+                "revision": self.revision,
+                "config_sha256": self.config_sha256,
+                "model_sha256": self.model_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = hashlib.sha256(b"exo-kimi-k3-dspark-selection/v1\0")
+        digest.update(payload)
+        return digest.hexdigest()
+
+
+@dataclass
+class LoadedMlxDSparkDual:
+    """Two fully loaded proposers with no shared request-context cache."""
+
+    config: KimiK3DSparkDualConfig
+    old: LoadedMlxDSpark | None
+    yarn: LoadedMlxDSpark | None
+    placement: Literal["replicated"] = "replicated"
+    _closed: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        if self.old is None or self.yarn is None:
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark requires both loaded proposers"
+            )
+        if self.old.config != self.config.old or self.yarn.config != self.config.yarn:
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark loaded proposer identities do not match config"
+            )
+        if self.old.target_model is not self.yarn.target_model:
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark proposers must share one target model"
+            )
+        if self.old.verify_width != self.yarn.verify_width:
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark loaded proposer widths disagree"
+            )
+
+    @property
+    def verify_width(self) -> int:
+        return self.config.verify_width
+
+    @property
+    def target_model(self) -> object:
+        old = self._require_loaded(self.old)
+        return old.target_model
+
+    @staticmethod
+    def _require_loaded(loaded: LoadedMlxDSpark | None) -> LoadedMlxDSpark:
+        if loaded is None:
+            raise DSparkConfigurationError("Kimi K3 dual DSpark is closed")
+        return loaded
+
+    def select(
+        self,
+        initial_prompt_tokens: int,
+    ) -> tuple[LoadedMlxDSpark, KimiK3DSparkProposerSelection]:
+        if type(initial_prompt_tokens) is not int or initial_prompt_tokens < 2:
+            raise ValueError(
+                "Kimi K3 dual DSpark initial prompt must contain at least two tokens"
+            )
+        if initial_prompt_tokens < self.config.threshold_tokens:
+            role: DSparkProposerRole = "old"
+            loaded = self._require_loaded(self.old)
+        else:
+            role = "yarn"
+            loaded = self._require_loaded(self.yarn)
+        selected_config = loaded.config
+        return loaded, KimiK3DSparkProposerSelection(
+            role=role,
+            initial_prompt_tokens=initial_prompt_tokens,
+            threshold_tokens=self.config.threshold_tokens,
+            revision=selected_config.revision,
+            config_sha256=selected_config.config_sha256,
+            model_sha256=selected_config.model_sha256,
+        )
+
+    def close(self) -> None:
+        """Drop both rank-local weight graphs and release cached MLX allocations."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self.old = None
+        self.yarn = None
+        _release_mlx_memory()
+
+
+LoadedKimiK3DSpark = LoadedMlxDSpark | LoadedMlxDSparkDual
+
+
+def select_loaded_mlx_dspark(
+    loaded: LoadedKimiK3DSpark,
+    *,
+    initial_prompt_tokens: int,
+) -> tuple[LoadedMlxDSpark, KimiK3DSparkProposerSelection | None]:
+    """Select once; the returned ordinary loaded object owns the only request cache."""
+
+    if isinstance(loaded, LoadedMlxDSparkDual):
+        return loaded.select(initial_prompt_tokens)
+    return loaded, None
+
+
+def _release_mlx_memory() -> None:
+    with contextlib.suppress(Exception):
+        mx.synchronize()
+    gc.collect()
+    with contextlib.suppress(Exception):
+        mx.clear_cache()
+
+
 def load_replicated_mlx_dspark(
     config: KimiK3DSparkConfig,
     target_model: object,
@@ -2980,6 +3261,45 @@ def load_replicated_mlx_dspark(
         target_route_top_k=target_route_top_k,
         evaluate=evaluate,
     )
+
+
+def load_replicated_mlx_dspark_dual(
+    config: KimiK3DSparkDualConfig,
+    target_model: object,
+    *,
+    features: MlxDSparkFeatures | None = None,
+    evaluate: Callable[..., None] = mx.eval,
+    loader: Callable[[KimiK3DSparkConfig, object], LoadedMlxDSpark] | None = None,
+) -> LoadedMlxDSparkDual:
+    """Load and fully attest both pinned checkpoints exactly once on this rank."""
+
+    def load_one(
+        checkpoint_config: KimiK3DSparkConfig,
+        model: object,
+    ) -> LoadedMlxDSpark:
+        if loader is not None:
+            return loader(checkpoint_config, model)
+        return load_replicated_mlx_dspark(
+            checkpoint_config,
+            model,
+            features=features,
+            evaluate=evaluate,
+        )
+
+    old = load_one(config.old, target_model)
+    try:
+        yarn = load_one(config.yarn, target_model)
+    except BaseException:
+        old = None
+        _release_mlx_memory()
+        raise
+    try:
+        return LoadedMlxDSparkDual(config=config, old=old, yarn=yarn)
+    except BaseException:
+        old = None
+        yarn = None
+        _release_mlx_memory()
+        raise
 
 
 class _TargetForwardResult(Protocol):

@@ -71,12 +71,14 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSparkDecodedToken,
     DSparkDistributedStateError,
     DSparkRoundTelemetry,
+    KimiK3DSparkProposerSelection,
     KimiK3DSparkRequestRuntime,
-    LoadedMlxDSpark,
+    LoadedKimiK3DSpark,
     MlxRankAgreement,
     dspark_confidence_capture_request,
     dspark_context_capacity_hint,
     dspark_decode_tokens,
+    select_loaded_mlx_dspark,
     validate_dspark_greedy_sampling,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
@@ -143,6 +145,7 @@ class _DSparkRequestSetup:
     prefill_step_size: int
     force_ordinary: bool
     runtime: KimiK3DSparkRequestRuntime
+    proposer_selection: KimiK3DSparkProposerSelection | None
     fingerprint: tuple[int, ...]
 
 
@@ -896,7 +899,7 @@ def warmup_inference(
     tokenizer: TokenizerWrapper,
     group: mx.distributed.Group | None,
     model_id: ModelId,
-    dspark: LoadedMlxDSpark | None = None,
+    dspark: LoadedKimiK3DSpark | None = None,
 ) -> int:
     logger.info(f"warming up inference for instance: {model_id}")
 
@@ -1091,7 +1094,7 @@ def eos_ids_from_tokenizer(tokenizer: TokenizerWrapper) -> list[int]:
 
 
 def _validate_dspark_request(
-    dspark: LoadedMlxDSpark,
+    dspark: LoadedKimiK3DSpark,
     *,
     model: Model,
     task: TextGenerationTaskParams,
@@ -1153,6 +1156,7 @@ def _dspark_setup_fingerprint(
     stop_sequences: tuple[str, ...],
     confidence_capture: DSparkConfidenceCaptureConfig | None = None,
     target_route_top_k: int | None = None,
+    proposer_selection: KimiK3DSparkProposerSelection | None = None,
 ) -> tuple[int, ...]:
     """Bind every local choice that can alter DSpark graph or loop ordering."""
 
@@ -1218,6 +1222,30 @@ def _dspark_setup_fingerprint(
         encoded = stop.encode("utf-8")
         add_integer(len(encoded), name="stop sequence byte length")
         digest.update(encoded)
+    if proposer_selection is not None:
+        digest.update(b"exo-kimi-k3-dspark-dual-selection/v1\0")
+        add_text(proposer_selection.role, name="dual proposer role")
+        add_integer(
+            proposer_selection.initial_prompt_tokens,
+            name="dual proposer initial prompt tokens",
+        )
+        add_integer(
+            proposer_selection.threshold_tokens,
+            name="dual proposer threshold tokens",
+        )
+        add_text(proposer_selection.revision, name="dual proposer revision")
+        add_text(
+            proposer_selection.config_sha256,
+            name="dual proposer config SHA-256",
+        )
+        add_text(
+            proposer_selection.model_sha256,
+            name="dual proposer model SHA-256",
+        )
+        add_text(
+            proposer_selection.identity_sha256,
+            name="dual proposer identity SHA-256",
+        )
 
     raw = digest.digest()
     return tuple(
@@ -1274,7 +1302,7 @@ def _rank_agreed_dspark_setup(
 
 def _prepare_dspark_request_setup(
     *,
-    dspark: LoadedMlxDSpark,
+    dspark: LoadedKimiK3DSpark,
     model: Model,
     tokenizer: TokenizerWrapper,
     task: TextGenerationTaskParams,
@@ -1312,6 +1340,10 @@ def _prepare_dspark_request_setup(
     )
     if len(all_prompt_tokens) < 2:
         raise ValueError("Kimi K3 DSpark requires at least two prompt tokens")
+    request_dspark, proposer_selection = select_loaded_mlx_dspark(
+        dspark,
+        initial_prompt_tokens=len(all_prompt_tokens),
+    )
     anchor_token = int(all_prompt_tokens[-1].item())
     if not 0 <= anchor_token <= 0x7FFFFFFF:
         raise ValueError("Kimi K3 DSpark anchor token must fit non-negative int32")
@@ -1379,10 +1411,10 @@ def _prepare_dspark_request_setup(
     capacity_hint = dspark_context_capacity_hint(
         prompt_tokens=len(all_prompt_tokens),
         max_tokens=max_tokens,
-        verify_width=dspark.verify_width,
+        verify_width=request_dspark.verify_width,
     )
     confidence_request = None
-    if dspark.config.confidence_capture is not None:
+    if request_dspark.config.confidence_capture is not None:
         raw_prompt_tokens = all_prompt_tokens.tolist()
         if not isinstance(raw_prompt_tokens, list):
             raise ValueError("Kimi K3 DSpark prompt tokens must be one-dimensional")
@@ -1390,7 +1422,7 @@ def _prepare_dspark_request_setup(
             cast(list[int], raw_prompt_tokens)
         )
     runtime = KimiK3DSparkRequestRuntime.create(
-        dspark,
+        request_dspark,
         model,
         caches,
         agreement,
@@ -1405,7 +1437,7 @@ def _prepare_dspark_request_setup(
         max_tokens=max_tokens,
         prefill_step_size=prefill_step_size,
         capacity_hint=capacity_hint,
-        verify_width=dspark.verify_width,
+        verify_width=request_dspark.verify_width,
         seed=seed,
         is_bench=is_bench,
         compact_greedy=compact_greedy,
@@ -1415,8 +1447,9 @@ def _prepare_dspark_request_setup(
         banned_token_ids=banned_token_ids,
         terminal_token_ids=terminal_token_ids,
         stop_sequences=stop_sequences,
-        confidence_capture=dspark.config.confidence_capture,
-        target_route_top_k=dspark.target_route_top_k,
+        confidence_capture=request_dspark.config.confidence_capture,
+        target_route_top_k=request_dspark.target_route_top_k,
+        proposer_selection=proposer_selection,
     )
     return _DSparkRequestSetup(
         is_pipeline=is_pipeline,
@@ -1436,6 +1469,7 @@ def _prepare_dspark_request_setup(
         prefill_step_size=prefill_step_size,
         force_ordinary=force_ordinary,
         runtime=runtime,
+        proposer_selection=proposer_selection,
         fingerprint=fingerprint,
     )
 
@@ -1569,7 +1603,7 @@ def mlx_generate(
     distributed_prompt_progress_callback: Callable[[], None] | None = None,
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
-    dspark: LoadedMlxDSpark | None = None,
+    dspark: LoadedKimiK3DSpark | None = None,
 ) -> Generator[GenerationResponse]:
     dspark_setup: _DSparkRequestSetup | None = None
     if dspark is not None:
@@ -1593,6 +1627,18 @@ def mlx_generate(
                 generation_progress=on_generation_token is not None,
             ),
         )
+        selection = dspark_setup.proposer_selection
+        if selection is not None:
+            logger.info(
+                "Kimi K3 dual DSpark request selection: "
+                f"role={selection.role}, "
+                f"initial_prompt_tokens={selection.initial_prompt_tokens}, "
+                f"threshold_tokens={selection.threshold_tokens}, "
+                f"revision={selection.revision}, "
+                f"config_sha256={selection.config_sha256}, "
+                f"model_sha256={selection.model_sha256}, "
+                f"identity_sha256={selection.identity_sha256}"
+            )
         is_pipeline = dspark_setup.is_pipeline
         prompt_lookup_configuration = dspark_setup.prompt_lookup_configuration
         all_prompt_tokens = dspark_setup.all_prompt_tokens

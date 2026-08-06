@@ -6,7 +6,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import FrozenInstanceError, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
@@ -16,15 +16,22 @@ import pytest
 
 from exo.worker.engines.mlx.generator import kimi_k3_dspark as dspark_module
 from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
+    DSPARK_ADAPTIVE_GATE_ENV,
+    DSPARK_ADAPTIVE_GATE_POLICY_ENV,
+    DSPARK_ADAPTIVE_GATE_POLICY_SHA256_ENV,
     DSPARK_AUX_ONLY_PREFILL_ENV,
     DSPARK_CHECKPOINT_ENV,
     DSPARK_CONFIDENCE_JSONL_ENV,
     DSPARK_CONFIDENCE_SESSION_ENV,
     DSPARK_CONSERVATIVE_VERIFY_WIDTH,
+    DSPARK_DUAL_PROPOSER_ENV,
+    DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS,
     DSPARK_ENABLE_ENV,
     DSPARK_MODEL_NATIVE_VERIFY_WIDTH,
+    DSPARK_PREFIX_CACHE_ENV,
     DSPARK_TELEMETRY_ENV,
     DSPARK_VERIFY_WIDTH_ENV,
+    DSPARK_YARN_CHECKPOINT_ENV,
     MLX_DSPARK_PROPOSER_ENV,
     MLX_DSPARK_SEGMENTED_SDPA_ENV,
     MLX_REPLAYSSM_ENV,
@@ -38,10 +45,13 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSparkFeatureUnavailableError,
     DSparkRoundResult,
     DSparkRoundTelemetry,
+    KimiK3DSparkCheckpointContract,
     KimiK3DSparkConfig,
+    KimiK3DSparkDualConfig,
     KimiK3DSparkRequestRuntime,
     KimiK3DSparkRoundEngine,
     LoadedMlxDSpark,
+    LoadedMlxDSparkDual,
     MlxDSparkFeatures,
     MlxDSparkRequestDraft,
     OrdinaryDecodePlan,
@@ -58,6 +68,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     has_replayssm_target_hooks,
     kimi_k3_dspark_config,
     load_replicated_mlx_dspark,
+    load_replicated_mlx_dspark_dual,
     preflight_mlx_dspark_segmented_sdpa,
     validate_dspark_greedy_sampling,
     validate_local_dspark_checkpoint,
@@ -76,6 +87,61 @@ def _enabled_environment(
     if width is not None:
         environment[DSPARK_VERIFY_WIDTH_ENV] = width
     return environment
+
+
+def _checkpoint_contract(*, yarn: bool) -> KimiK3DSparkCheckpointContract:
+    return KimiK3DSparkCheckpointContract(
+        revision=(
+            dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_REVISION
+            if yarn
+            else dspark_module.RADIXARK_KIMI_K3_DSPARK_REVISION
+        ),
+        config_sha256=(
+            dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256
+            if yarn
+            else dspark_module.RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256
+        ),
+        model_bytes=dspark_module.RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES,
+        model_sha256=(
+            dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256
+            if yarn
+            else dspark_module.RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256
+        ),
+    )
+
+
+def _dual_environment(old: Path, yarn: Path) -> dict[str, str]:
+    environment = _enabled_environment(old)
+    environment.update(
+        {
+            DSPARK_DUAL_PROPOSER_ENV: "1",
+            DSPARK_YARN_CHECKPOINT_ENV: str(yarn),
+        }
+    )
+    return environment
+
+
+def _dual_config(
+    tmp_path: Path,
+    *,
+    width: Literal[3, 8] = 8,
+) -> KimiK3DSparkDualConfig:
+    old_path = tmp_path / "old"
+    yarn_path = tmp_path / "yarn"
+    old = KimiK3DSparkConfig(
+        checkpoint_path=old_path,
+        verify_width=width,
+        round_telemetry=False,
+    )
+    yarn = KimiK3DSparkConfig(
+        checkpoint_path=yarn_path,
+        verify_width=width,
+        round_telemetry=False,
+        revision=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_REVISION,
+        config_sha256=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256,
+        model_sha256=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256,
+    )
+    return KimiK3DSparkDualConfig(old=old, yarn=yarn)
 
 
 def test_dspark_is_inert_by_default_and_rejects_orphan_companions(
@@ -98,6 +164,168 @@ def test_dspark_is_inert_by_default_and_rejects_orphan_companions(
             is_pipeline=False,
             is_batch=False,
             environ={DSPARK_CHECKPOINT_ENV: str(tmp_path)},
+        )
+
+
+def test_dual_proposer_is_default_off_and_preserves_single_config(
+    tmp_path: Path,
+) -> None:
+    old_path = tmp_path / "old"
+    calls: list[Path] = []
+
+    def validate(path: Path) -> KimiK3DSparkCheckpointContract:
+        calls.append(path)
+        return _checkpoint_contract(yarn=False)
+
+    config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=_enabled_environment(old_path),
+        checkpoint_validator=validate,
+    )
+
+    assert type(config) is KimiK3DSparkConfig
+    assert config.checkpoint_path == old_path
+    assert config.revision == dspark_module.RADIXARK_KIMI_K3_DSPARK_REVISION
+    assert calls == [old_path]
+
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{DSPARK_YARN_CHECKPOINT_ENV} requires {DSPARK_DUAL_PROPOSER_ENV}=1",
+    ):
+        environment = _enabled_environment(old_path)
+        environment[DSPARK_YARN_CHECKPOINT_ENV] = str(tmp_path / "yarn")
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=validate,
+        )
+
+
+def test_dual_proposer_requires_exact_old_and_yarn_checkpoint_pair(
+    tmp_path: Path,
+) -> None:
+    old_path = tmp_path / "old"
+    yarn_path = tmp_path / "yarn"
+    missing_yarn = _enabled_environment(old_path)
+    missing_yarn[DSPARK_DUAL_PROPOSER_ENV] = "1"
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{DSPARK_YARN_CHECKPOINT_ENV} is required",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=missing_yarn,
+            checkpoint_validator=lambda _path: _checkpoint_contract(yarn=False),
+        )
+
+    contracts = {
+        old_path: _checkpoint_contract(yarn=False),
+        yarn_path: _checkpoint_contract(yarn=True),
+    }
+    config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=_dual_environment(old_path, yarn_path),
+        checkpoint_validator=contracts.__getitem__,
+    )
+
+    assert isinstance(config, KimiK3DSparkDualConfig)
+    assert config.old.checkpoint_path == old_path
+    assert config.yarn.checkpoint_path == yarn_path
+    assert config.threshold_tokens == DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS
+
+    swapped = {
+        old_path: _checkpoint_contract(yarn=True),
+        yarn_path: _checkpoint_contract(yarn=False),
+    }
+    with pytest.raises(DSparkConfigurationError, match="pinned old revision"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=_dual_environment(old_path, yarn_path),
+            checkpoint_validator=swapped.__getitem__,
+        )
+
+    hybrid_old = KimiK3DSparkCheckpointContract(
+        revision=dspark_module.RADIXARK_KIMI_K3_DSPARK_REVISION,
+        config_sha256=dspark_module.RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256,
+        model_bytes=dspark_module.RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES,
+        model_sha256=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256,
+    )
+    with pytest.raises(DSparkConfigurationError, match="pinned old revision"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=_dual_environment(old_path, yarn_path),
+            checkpoint_validator=lambda path: (
+                hybrid_old if path == old_path else _checkpoint_contract(yarn=True)
+            ),
+        )
+
+    with pytest.raises(DSparkConfigurationError, match="pinned old revision"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=_dual_environment(old_path, yarn_path),
+            checkpoint_validator=lambda _path: None,
+        )
+
+    with pytest.raises(DSparkConfigurationError, match="distinct directories"):
+        same_path_contracts = iter(
+            (_checkpoint_contract(yarn=False), _checkpoint_contract(yarn=True))
+        )
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=_dual_environment(old_path, old_path),
+            checkpoint_validator=lambda _path: next(same_path_contracts),
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        (DSPARK_PREFIX_CACHE_ENV, "1"),
+        (DSPARK_ADAPTIVE_GATE_ENV, "1"),
+        (DSPARK_ADAPTIVE_GATE_POLICY_ENV, "/tmp/policy.json"),
+        (DSPARK_ADAPTIVE_GATE_POLICY_SHA256_ENV, "0" * 64),
+        (DSPARK_CONFIDENCE_JSONL_ENV, "/tmp/capture.jsonl"),
+    ],
+)
+def test_dual_proposer_rejects_unvalidated_feature_combinations(
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    old_path = tmp_path / "old"
+    yarn_path = tmp_path / "yarn"
+    environment = _dual_environment(old_path, yarn_path)
+    environment[name] = value
+
+    with pytest.raises(DSparkConfigurationError, match="cannot be combined"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda path: _checkpoint_contract(
+                yarn=path == yarn_path
+            ),
+        )
+
+
+def test_dual_proposer_threshold_is_fixed_not_operator_tunable(
+    tmp_path: Path,
+) -> None:
+    config = _dual_config(tmp_path)
+
+    with pytest.raises(DSparkConfigurationError, match="exactly 8192"):
+        KimiK3DSparkDualConfig(
+            old=config.old,
+            yarn=config.yarn,
+            threshold_tokens=DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS + 1,
         )
 
 
@@ -1931,10 +2159,13 @@ def test_confidence_capture_rejects_native_top16_target_before_loading(
 
 
 def test_target_route_top_k_attestation_rejects_mixed_sparse_layers() -> None:
-    assert attest_kimi_k3_target_route_top_k(
-        _fake_sparse_target(8, 8),
-        expected=8,
-    ) == 8
+    assert (
+        attest_kimi_k3_target_route_top_k(
+            _fake_sparse_target(8, 8),
+            expected=8,
+        )
+        == 8
+    )
     with pytest.raises(DSparkConfigurationError, match="layers disagree"):
         attest_kimi_k3_target_route_top_k(_fake_sparse_target(8, 16))
 
@@ -1977,6 +2208,164 @@ def test_replicated_loader_uses_exact_mlx_signatures_and_proposer_context(
     ]
     with pytest.raises(DSparkConfigurationError, match="requires capture config"):
         loaded.new_request(capacity_hint=300, capture_confidence=True)
+
+
+def test_dual_loader_attests_each_checkpoint_once_and_selects_exact_boundary(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    target_model = object()
+    config = _dual_config(tmp_path)
+
+    loaded = load_replicated_mlx_dspark_dual(
+        config,
+        target_model,
+        features=_mock_mlx_features(calls, [[11, 12, 13, 14, 15, 16, 17]]),
+        evaluate=lambda *_values: None,
+    )
+
+    assert calls[:4] == [
+        ("load", config.old.checkpoint_path, target_model, True),
+        ("proposer", "draft", 8, False),
+        ("load", config.yarn.checkpoint_path, target_model, True),
+        ("proposer", "draft", 8, False),
+    ]
+    old, old_selection = loaded.select(DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS - 1)
+    yarn, yarn_selection = loaded.select(DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS)
+    minimum, minimum_selection = loaded.select(2)
+    maximum, maximum_selection = loaded.select(1_048_576)
+    assert old is loaded.old
+    assert old_selection.role == "old"
+    assert old_selection.revision == config.old.revision
+    assert yarn is loaded.yarn
+    assert yarn_selection.role == "yarn"
+    assert yarn_selection.revision == config.yarn.revision
+    assert minimum is loaded.old
+    assert minimum_selection.role == "old"
+    assert maximum is loaded.yarn
+    assert maximum_selection.role == "yarn"
+
+    with pytest.raises(FrozenInstanceError):
+        old_selection.role = "yarn"
+
+
+def test_dual_selection_allocates_only_the_selected_request_cache(
+    tmp_path: Path,
+) -> None:
+    target_model = object()
+    config = _dual_config(tmp_path)
+    old_calls: list[tuple[object, ...]] = []
+    yarn_calls: list[tuple[object, ...]] = []
+    old_proposer = _FakeMlxProposer(8, old_calls, [[11, 12, 13, 14, 15, 16, 17]])
+    yarn_proposer = _FakeMlxProposer(
+        8,
+        yarn_calls,
+        [[21, 22, 23, 24, 25, 26, 27]],
+    )
+    loaded = LoadedMlxDSparkDual(
+        config=config,
+        old=LoadedMlxDSpark(
+            config=config.old,
+            target_model=target_model,
+            drafter=object(),
+            proposer=old_proposer,
+            evaluate=lambda *_values: None,
+        ),
+        yarn=LoadedMlxDSpark(
+            config=config.yarn,
+            target_model=target_model,
+            drafter=object(),
+            proposer=yarn_proposer,
+            evaluate=lambda *_values: None,
+        ),
+    )
+
+    selected_old, _ = loaded.select(8_191)
+    old_request = selected_old.new_request(capacity_hint=8_200)
+    assert old_calls == [("make_context_cache", 8_200)]
+    assert yarn_calls == []
+
+    selected_yarn, _ = loaded.select(8_192)
+    yarn_request = selected_yarn.new_request(capacity_hint=8_300)
+    assert old_calls == [("make_context_cache", 8_200)]
+    assert yarn_calls == [("make_context_cache", 8_300)]
+    assert old_request.context_cache is not yarn_request.context_cache
+
+
+def test_dual_loader_cleans_partial_first_load_when_yarn_load_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _dual_config(tmp_path)
+    target_model = object()
+    calls: list[Path] = []
+    cleanups: list[str] = []
+    monkeypatch.setattr(
+        dspark_module,
+        "_release_mlx_memory",
+        lambda: cleanups.append("released"),
+    )
+
+    def load(
+        checkpoint_config: KimiK3DSparkConfig,
+        model: object,
+    ) -> LoadedMlxDSpark:
+        calls.append(checkpoint_config.checkpoint_path)
+        if checkpoint_config is config.yarn:
+            raise RuntimeError("injected YaRN load failure")
+        return LoadedMlxDSpark(
+            config=checkpoint_config,
+            target_model=model,
+            drafter=object(),
+            proposer=_FakeMlxProposer(8, [], [[11, 12, 13, 14, 15, 16, 17]]),
+            evaluate=lambda *_values: None,
+        )
+
+    with pytest.raises(RuntimeError, match="injected YaRN load failure"):
+        load_replicated_mlx_dspark_dual(
+            config,
+            target_model,
+            loader=load,
+        )
+
+    assert calls == [config.old.checkpoint_path, config.yarn.checkpoint_path]
+    assert cleanups == ["released"]
+
+
+def test_dual_loaded_cleanup_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _dual_config(tmp_path)
+    target_model = object()
+    cleanups: list[str] = []
+    monkeypatch.setattr(
+        dspark_module,
+        "_release_mlx_memory",
+        lambda: cleanups.append("released"),
+    )
+    loaded = LoadedMlxDSparkDual(
+        config=config,
+        old=LoadedMlxDSpark(
+            config.old,
+            target_model,
+            object(),
+            _FakeMlxProposer(8, [], [[11, 12, 13, 14, 15, 16, 17]]),
+        ),
+        yarn=LoadedMlxDSpark(
+            config.yarn,
+            target_model,
+            object(),
+            _FakeMlxProposer(8, [], [[21, 22, 23, 24, 25, 26, 27]]),
+        ),
+    )
+
+    loaded.close()
+    loaded.close()
+
+    assert loaded.old is None
+    assert loaded.yarn is None
+    assert cleanups == ["released"]
 
 
 def test_replicated_draft_flattens_proposals_and_appends_only_committed_context(
@@ -2194,6 +2583,7 @@ def test_replicated_draft_rejects_malformed_mlx_proposals(
     ("name", "value"),
     [
         (DSPARK_ENABLE_ENV, "true"),
+        (DSPARK_DUAL_PROPOSER_ENV, "true"),
         (DSPARK_TELEMETRY_ENV, "true"),
         (DSPARK_TELEMETRY_ENV, "2"),
     ],

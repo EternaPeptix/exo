@@ -39,7 +39,10 @@ from exo.worker.engines.mlx.generator.generate import (
     mlx_generate,
     warmup_inference,
 )
-from exo.worker.engines.mlx.generator.kimi_k3_dspark import LoadedMlxDSpark
+from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
+    LoadedKimiK3DSpark,
+    LoadedMlxDSparkDual,
+)
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -133,7 +136,7 @@ class SequentialGenerator(Engine):
     cancel_receiver: MpReceiver[TaskId]
     event_sender: MpSender[Event]
     vision_processor: VisionProcessor | None = None
-    dspark: LoadedMlxDSpark | None = None
+    dspark: LoadedKimiK3DSpark | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -435,6 +438,8 @@ class SequentialGenerator(Engine):
         )
 
     def close(self) -> None:
+        if isinstance(self.dspark, LoadedMlxDSparkDual):
+            self.dspark.close()
         del self.model, self.tokenizer, self.group, self.dspark
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
