@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import stat
+import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +18,8 @@ from exo.worker.engines.mlx.generator import kimi_k3_dspark as dspark_module
 from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSPARK_AUX_ONLY_PREFILL_ENV,
     DSPARK_CHECKPOINT_ENV,
+    DSPARK_CONFIDENCE_JSONL_ENV,
+    DSPARK_CONFIDENCE_SESSION_ENV,
     DSPARK_CONSERVATIVE_VERIFY_WIDTH,
     DSPARK_ENABLE_ENV,
     DSPARK_MODEL_NATIVE_VERIFY_WIDTH,
@@ -23,6 +29,10 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     MLX_DSPARK_SEGMENTED_SDPA_ENV,
     MLX_REPLAYSSM_ENV,
     DSparkCancellationError,
+    DSparkConfidenceCaptureConfig,
+    DSparkConfidenceCaptureRequest,
+    DSparkConfidenceJSONLRecorder,
+    DSparkConfidenceObservation,
     DSparkConfigurationError,
     DSparkDistributedStateError,
     DSparkFeatureUnavailableError,
@@ -39,9 +49,12 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     TargetPosterior,
     TargetVerificationPlan,
     accepted_draft_prefix,
+    attest_kimi_k3_target_route_top_k,
     detect_mlx_dspark_features,
+    dspark_context_bucket,
     dspark_context_capacity_hint,
     dspark_decode_tokens,
+    dspark_prompt_identity,
     has_replayssm_target_hooks,
     kimi_k3_dspark_config,
     load_replicated_mlx_dspark,
@@ -131,6 +144,84 @@ def test_model_native_width_eight_is_the_enabled_default(tmp_path: Path) -> None
     assert not config.aux_only_prefill
     assert validated == [tmp_path]
     assert warnings == []
+
+
+def test_conservative_confidence_capture_requires_complete_strict_metadata(
+    tmp_path: Path,
+) -> None:
+    environment = _enabled_environment(tmp_path, width="3")
+    environment.update(
+        {
+            DSPARK_AUX_ONLY_PREFILL_ENV: "1",
+            DSPARK_CONFIDENCE_JSONL_ENV: str(tmp_path / "rounds.jsonl"),
+            DSPARK_CONFIDENCE_SESSION_ENV: "top8-canary-20260806",
+        }
+    )
+
+    config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=environment,
+        checkpoint_validator=lambda _path: None,
+    )
+
+    assert config is not None
+    assert config.verify_width == 3
+    assert config.aux_only_prefill is True
+    assert config.confidence_capture == DSparkConfidenceCaptureConfig(
+        jsonl_path=tmp_path / "rounds.jsonl",
+        session_id="top8-canary-20260806",
+    )
+
+    del environment[DSPARK_CONFIDENCE_SESSION_ENV]
+    with pytest.raises(DSparkConfigurationError, match="is required"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+
+def test_confidence_capture_rejects_width_eight_and_unsafe_paths(
+    tmp_path: Path,
+) -> None:
+    environment = _enabled_environment(tmp_path, width="8")
+    environment.update(
+        {
+            DSPARK_CONFIDENCE_JSONL_ENV: str(tmp_path / "rounds.jsonl"),
+            DSPARK_CONFIDENCE_SESSION_ENV: "capture-1",
+        }
+    )
+    with pytest.raises(DSparkConfigurationError, match="conservative verify width 3"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+    environment[DSPARK_VERIFY_WIDTH_ENV] = "3"
+    environment[DSPARK_CONFIDENCE_JSONL_ENV] = "relative.jsonl"
+    with pytest.raises(DSparkConfigurationError, match="absolute path"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+    capture_path = tmp_path / "world-readable.jsonl"
+    capture_path.write_text("", encoding="utf-8")
+    capture_path.chmod(0o644)
+    environment[DSPARK_CONFIDENCE_JSONL_ENV] = str(capture_path)
+    with pytest.raises(DSparkConfigurationError, match="group or other access"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
 
 
 @pytest.mark.parametrize("raw", ["", "2", "true", " 1", "1 "])
@@ -244,6 +335,7 @@ def test_local_checkpoint_validation_is_hash_pinned(tmp_path: Path) -> None:
 class _FakeDraftRound:
     proposal_tokens: Sequence[int]
     events: list[str]
+    confidence_logits: Sequence[float] | None = None
     commits: list[tuple[int, int, tuple[int, ...]]] = field(default_factory=list)
     cancelled: bool = False
     fail_commit: bool = False
@@ -278,6 +370,7 @@ class _FakeDraft:
     proposal_tokens: Sequence[int]
     verify_width: int
     events: list[str]
+    confidence_logits: Sequence[float] | None = None
     placement: str = "replicated"
     rounds: list[_FakeDraftRound] = field(default_factory=list)
     fail_commit: bool = False
@@ -321,6 +414,7 @@ class _FakePreparedDraft:
         round_state = _FakeDraftRound(
             self.owner.proposal_tokens,
             self.owner.events,
+            confidence_logits=self.owner.confidence_logits,
             fail_commit=self.owner.fail_commit,
             fail_cancel=self.owner.fail_cancel,
         )
@@ -609,6 +703,426 @@ def test_width_three_override_commits_anchor_plus_accepted_prefix(
     assert result.telemetry.emitted == 2
     assert target.rounds[0].commits == [2]
     assert draft.rounds[0].commits == [(1, 99, (21, 99, 100))]
+
+
+@dataclass
+class _FakeConfidenceRecorder:
+    records: list[
+        tuple[DSparkRoundTelemetry, DSparkConfidenceObservation | None, float]
+    ] = field(default_factory=list)
+    events: list[str] | None = None
+
+    def record(
+        self,
+        telemetry: DSparkRoundTelemetry,
+        observation: DSparkConfidenceObservation | None,
+        *,
+        total_step_ms: float,
+    ) -> None:
+        if self.events is not None:
+            self.events.append("confidence_record")
+        self.records.append((telemetry, observation, total_step_ms))
+
+    def finalize(self, *, complete: bool) -> None:
+        del complete
+
+
+def test_rank_zero_capture_labels_conservative_agreed_prefix_after_commits(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    confidence = (-1.5, 0.75)
+    draft = _FakeDraft(
+        (21, 22),
+        3,
+        events,
+        confidence_logits=confidence,
+    )
+    target = _FakeTarget((21, 99, 100), events)
+    recorder = _FakeConfidenceRecorder(events=events)
+    config = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path,
+        verify_width=3,
+        round_telemetry=False,
+        aux_only_prefill=True,
+        confidence_capture=DSparkConfidenceCaptureConfig(
+            tmp_path / "rounds.jsonl",
+            "capture-1",
+        ),
+    )
+    engine = KimiK3DSparkRoundEngine(
+        config=config,
+        draft=draft,
+        target=target,
+        collective=_FakeAgreement(events),
+        confidence_recorder=recorder,
+    )
+
+    result = engine.decode_round(20)
+
+    assert result.emitted_tokens == (21, 99)
+    assert result.telemetry.accepted == 1
+    telemetry, observation, total_step_ms = recorder.records[0]
+    assert telemetry is result.telemetry
+    assert observation is not None
+    assert observation.confidence_logits == confidence
+    assert len(observation.proposal_sha256) == 64
+    assert total_step_ms >= 0.0
+    assert events[-3:] == ["draft_commit", "agree_stage_1", "confidence_record"]
+
+
+def test_confidence_capture_absence_never_changes_conservative_tokens(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    draft = _FakeDraft((21, 22), 3, events)
+    target = _FakeTarget((21, 22, 23), events)
+    recorder = _FakeConfidenceRecorder()
+    engine = KimiK3DSparkRoundEngine(
+        config=KimiK3DSparkConfig(
+            checkpoint_path=tmp_path,
+            verify_width=3,
+            round_telemetry=False,
+            confidence_capture=DSparkConfidenceCaptureConfig(
+                tmp_path / "rounds.jsonl",
+                "capture-1",
+            ),
+        ),
+        draft=draft,
+        target=target,
+        collective=_FakeAgreement(events),
+        confidence_recorder=recorder,
+    )
+
+    result = engine.decode_round(20)
+
+    assert result.emitted_tokens == (21, 22, 23)
+    assert result.telemetry.fallback is False
+    assert recorder.records[0][1] is None
+
+
+def test_confidence_recorder_is_rejected_on_nonzero_rank(tmp_path: Path) -> None:
+    events: list[str] = []
+    with pytest.raises(DSparkConfigurationError, match="must be rank zero"):
+        KimiK3DSparkRoundEngine(
+            config=KimiK3DSparkConfig(
+                checkpoint_path=tmp_path,
+                verify_width=3,
+                round_telemetry=False,
+                confidence_capture=DSparkConfidenceCaptureConfig(
+                    tmp_path / "rounds.jsonl",
+                    "capture-1",
+                ),
+            ),
+            draft=_FakeDraft((21, 22), 3, events),
+            target=_FakeTarget((21, 22, 23), events),
+            collective=_FakeAgreement(events, rank=1),
+            confidence_recorder=_FakeConfidenceRecorder(),
+        )
+
+
+def test_confidence_jsonl_has_labels_timings_prompt_identity_and_end_marker(
+    tmp_path: Path,
+) -> None:
+    capture_path = tmp_path / "rounds.jsonl"
+    request = DSparkConfidenceCaptureRequest(
+        prompt_id=dspark_prompt_identity((1, 2, 3)),
+        context_tokens=3,
+        context_bucket=dspark_context_bucket(3),
+    )
+    recorder = DSparkConfidenceJSONLRecorder(
+        DSparkConfidenceCaptureConfig(capture_path, "capture-1"),
+        request,
+        verify_width=3,
+        target_route_top_k=8,
+    )
+    telemetry = DSparkRoundTelemetry(
+        round_index=4,
+        rank=0,
+        draft_ms=1.0,
+        target_verify_ms=2.0,
+        target_commit_ms=3.0,
+        draft_commit_ms=4.0,
+        collective_ms=5.0,
+        proposed=2,
+        accepted=1,
+        emitted=2,
+        fallback=False,
+        error=None,
+    )
+    observation = DSparkConfidenceObservation(
+        confidence_logits=(-1.0, 2.0),
+        proposal_sha256="a" * 64,
+    )
+
+    recorder.record(telemetry, observation, total_step_ms=16.0)
+    recorder.finalize(complete=True)
+
+    lines = capture_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    payload = json.loads(lines[0])
+    assert payload["schema"] == "k3-dspark-confidence-capture-v3"
+    assert payload["prompt_id"] == request.prompt_id
+    assert payload["context_tokens"] == 3
+    assert payload["context_bucket"] == "le_512"
+    assert payload["verify_width"] == 3
+    assert payload["target_route_top_k"] == 8
+    assert payload["confidence_logits"] == [-1.0, 2.0]
+    assert payload["accepted_prefix"] == 1
+    assert payload["total_step_ms"] == 16.0
+    assert "prompt_tokens" not in payload
+    assert "prompt_text" not in payload
+    end = json.loads(lines[1])
+    assert end["schema"] == "k3-dspark-confidence-request-end-v3"
+    assert end["complete"] is True
+    assert end["captured_rounds"] == 1
+    assert end["target_route_top_k"] == 8
+    assert end["request_buffered_locked_append"] is True
+    assert end["round_timing_excludes_request_flush"] is True
+    assert stat.S_IMODE(capture_path.stat().st_mode) == 0o600
+
+
+def test_confidence_recorder_retries_short_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture_path = tmp_path / "rounds.jsonl"
+    recorder = DSparkConfidenceJSONLRecorder(
+        DSparkConfidenceCaptureConfig(capture_path, "capture-1"),
+        DSparkConfidenceCaptureRequest("a" * 64, 3, "le_512"),
+        verify_width=3,
+        target_route_top_k=8,
+    )
+    telemetry = DSparkRoundTelemetry(
+        round_index=0,
+        rank=0,
+        draft_ms=1.0,
+        target_verify_ms=2.0,
+        target_commit_ms=3.0,
+        draft_commit_ms=4.0,
+        collective_ms=5.0,
+        proposed=2,
+        accepted=1,
+        emitted=2,
+        fallback=False,
+        error=None,
+    )
+    observation = DSparkConfidenceObservation(
+        confidence_logits=(-1.0, 2.0),
+        proposal_sha256="b" * 64,
+    )
+    real_write = dspark_module.os.write
+    write_sizes: list[int] = []
+
+    def short_write(descriptor: int, payload: bytes | memoryview) -> int:
+        chunk = payload[:17]
+        write_sizes.append(len(chunk))
+        return real_write(descriptor, chunk)
+
+    monkeypatch.setattr(dspark_module.os, "write", short_write)
+    recorder.record(telemetry, observation, total_step_ms=16.0)
+    recorder.finalize(complete=True)
+
+    lines = capture_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["schema"] == "k3-dspark-confidence-capture-v3"
+    assert json.loads(lines[1])["schema"] == "k3-dspark-confidence-request-end-v3"
+    assert len(write_sizes) > 2
+
+
+def test_confidence_recorder_serializes_concurrent_short_write_transactions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture_path = tmp_path / "rounds.jsonl"
+    telemetry = DSparkRoundTelemetry(
+        round_index=0,
+        rank=0,
+        draft_ms=1.0,
+        target_verify_ms=2.0,
+        target_commit_ms=3.0,
+        draft_commit_ms=4.0,
+        collective_ms=5.0,
+        proposed=2,
+        accepted=1,
+        emitted=2,
+        fallback=False,
+        error=None,
+    )
+    recorders = [
+        DSparkConfidenceJSONLRecorder(
+            DSparkConfidenceCaptureConfig(capture_path, "capture-1"),
+            DSparkConfidenceCaptureRequest(character * 64, 3, "le_512"),
+            verify_width=3,
+            target_route_top_k=8,
+        )
+        for character in ("a", "b")
+    ]
+    for index, recorder in enumerate(recorders):
+        recorder.record(
+            telemetry,
+            DSparkConfidenceObservation(
+                confidence_logits=(-1.0, 2.0),
+                proposal_sha256=("c" if index == 0 else "d") * 64,
+            ),
+            total_step_ms=16.0,
+        )
+
+    real_write = dspark_module.os.write
+
+    def slow_short_write(descriptor: int, payload: bytes | memoryview) -> int:
+        chunk = payload[:11]
+        written = real_write(descriptor, chunk)
+        time.sleep(0.0001)
+        return written
+
+    monkeypatch.setattr(dspark_module.os, "write", slow_short_write)
+    threads = [
+        threading.Thread(target=recorder.finalize, kwargs={"complete": True})
+        for recorder in recorders
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    payloads = [
+        json.loads(line)
+        for line in capture_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [payload["schema"] for payload in payloads] == [
+        "k3-dspark-confidence-capture-v3",
+        "k3-dspark-confidence-request-end-v3",
+        "k3-dspark-confidence-capture-v3",
+        "k3-dspark-confidence-request-end-v3",
+    ]
+    assert payloads[0]["prompt_id"] == payloads[1]["prompt_id"]
+    assert payloads[2]["prompt_id"] == payloads[3]["prompt_id"]
+    assert payloads[0]["prompt_id"] != payloads[2]["prompt_id"]
+
+
+def test_confidence_recorder_rolls_back_partial_failed_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture_path = tmp_path / "rounds.jsonl"
+    capture_path.write_bytes(b'{"existing":"valid"}\n')
+    capture_path.chmod(0o600)
+    before = capture_path.read_bytes()
+    recorder = DSparkConfidenceJSONLRecorder(
+        DSparkConfidenceCaptureConfig(capture_path, "capture-1"),
+        DSparkConfidenceCaptureRequest("a" * 64, 3, "le_512"),
+        verify_width=3,
+        target_route_top_k=8,
+    )
+    telemetry = DSparkRoundTelemetry(
+        round_index=0,
+        rank=0,
+        draft_ms=1.0,
+        target_verify_ms=2.0,
+        target_commit_ms=3.0,
+        draft_commit_ms=4.0,
+        collective_ms=5.0,
+        proposed=2,
+        accepted=1,
+        emitted=2,
+        fallback=False,
+        error=None,
+    )
+    recorder.record(
+        telemetry,
+        DSparkConfidenceObservation(
+            confidence_logits=(-1.0, 2.0),
+            proposal_sha256="b" * 64,
+        ),
+        total_step_ms=16.0,
+    )
+    real_write = dspark_module.os.write
+    calls = 0
+
+    def fail_after_partial_write(
+        descriptor: int,
+        payload: bytes | memoryview,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            chunk = payload[:19]
+            return real_write(descriptor, chunk)
+        raise OSError("injected partial append failure")
+
+    monkeypatch.setattr(dspark_module.os, "write", fail_after_partial_write)
+    recorder.finalize(complete=True)
+
+    assert calls == 2
+    assert capture_path.read_bytes() == before
+
+
+def test_confidence_recorder_closes_descriptor_when_unlock_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture_path = tmp_path / "rounds.jsonl"
+    recorders = [
+        DSparkConfidenceJSONLRecorder(
+            DSparkConfidenceCaptureConfig(capture_path, "capture-1"),
+            DSparkConfidenceCaptureRequest(character * 64, 3, "le_512"),
+            verify_width=3,
+            target_route_top_k=8,
+        )
+        for character in ("a", "b")
+    ]
+    real_flock = dspark_module.fcntl.flock
+    real_close = dspark_module.os.close
+    unlock_failed = False
+    closed: list[int] = []
+
+    def fail_first_unlock(descriptor: int, operation: int) -> None:
+        nonlocal unlock_failed
+        if operation == dspark_module.fcntl.LOCK_UN and not unlock_failed:
+            unlock_failed = True
+            raise OSError("injected unlock failure")
+        real_flock(descriptor, operation)
+
+    def track_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(dspark_module.fcntl, "flock", fail_first_unlock)
+    monkeypatch.setattr(dspark_module.os, "close", track_close)
+    recorders[0].finalize(complete=False)
+
+    assert unlock_failed is True
+    assert len(closed) == 1
+
+    recorders[1].finalize(complete=False)
+
+    assert len(closed) == 2
+    assert len(capture_path.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_confidence_recorder_flush_failure_is_nonthrowing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = DSparkConfidenceJSONLRecorder(
+        DSparkConfidenceCaptureConfig(tmp_path / "rounds.jsonl", "capture-1"),
+        DSparkConfidenceCaptureRequest("a" * 64, 3, "le_512"),
+        verify_width=3,
+        target_route_top_k=8,
+    )
+    attempts: list[bytes] = []
+
+    def reject(payload: bytes) -> None:
+        attempts.append(payload)
+        raise OSError("injected recorder failure")
+
+    monkeypatch.setattr(recorder, "_append", reject)
+    recorder.finalize(complete=False)
+    recorder.finalize(complete=False)
+
+    assert len(attempts) == 1
 
 
 def test_terminal_proposal_is_reclassified_as_bonus_before_commit(
@@ -1163,6 +1677,18 @@ class _FakeTokenArray:
 
 
 @dataclass(frozen=True)
+class _FakeConfidenceArray:
+    rows: list[list[float]]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (len(self.rows), len(self.rows[0]) if self.rows else 0)
+
+    def tolist(self) -> object:
+        return self.rows
+
+
+@dataclass(frozen=True)
 class _FakeHidden:
     shape: tuple[int, int, int]
     name: str
@@ -1190,6 +1716,7 @@ class _FakeMlxProposer:
     verify_width: int
     calls: list[tuple[object, ...]]
     proposal_rows: list[list[int]]
+    confidence_rows: list[list[float]] | None = None
 
     def make_context_cache(self, *, capacity_hint: int = 0) -> object:
         self.calls.append(("make_context_cache", capacity_hint))
@@ -1197,10 +1724,15 @@ class _FakeMlxProposer:
 
     def propose(self, anchor_token: int, context_cache: object) -> object:
         self.calls.append(("propose", anchor_token, context_cache))
-        return SimpleNamespace(
+        proposal = SimpleNamespace(
             tokens=_FakeTokenArray(self.proposal_rows),
             verify_width=self.verify_width,
         )
+        if self.confidence_rows is not None:
+            proposal.confidence_logits = _FakeConfidenceArray(  # type: ignore[attr-defined]
+                self.confidence_rows
+            )
+        return proposal
 
     def append_target_context(
         self,
@@ -1228,6 +1760,7 @@ class _FakeMlxProposer:
 def _mock_mlx_features(
     calls: list[tuple[object, ...]],
     proposal_rows: list[list[int]],
+    confidence_rows: list[list[float]] | None = None,
 ) -> MlxDSparkFeatures:
     def load(
         checkpoint_path: Path,
@@ -1245,7 +1778,12 @@ def _mock_mlx_features(
         screening_override: bool,
     ) -> object:
         calls.append(("proposer", drafter, verify_width, screening_override))
-        return _FakeMlxProposer(verify_width, calls, proposal_rows)
+        return _FakeMlxProposer(
+            verify_width,
+            calls,
+            proposal_rows,
+            confidence_rows,
+        )
 
     return MlxDSparkFeatures(
         load_kimi_k3_dspark=load,
@@ -1280,6 +1818,57 @@ def test_feature_detection_matches_actual_module_level_surface(
     assert features is not None
     assert features.load_kimi_k3_dspark is load
     assert features.proposer_type is Proposer
+
+
+def _fake_sparse_target(*route_top_ks: int) -> object:
+    return SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                mlp=SimpleNamespace(
+                    switch_mlp=object(),
+                    expert_top_k=route_top_k,
+                )
+            )
+            for route_top_k in route_top_ks
+        ]
+    )
+
+
+def test_confidence_capture_rejects_native_top16_target_before_loading(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    config = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path,
+        verify_width=3,
+        round_telemetry=False,
+        confidence_capture=DSparkConfidenceCaptureConfig(
+            tmp_path / "rounds.jsonl",
+            "capture-1",
+        ),
+    )
+
+    with pytest.raises(
+        DSparkConfigurationError,
+        match="target route top-k is 16, expected 8",
+    ):
+        load_replicated_mlx_dspark(
+            config,
+            _fake_sparse_target(16, 16),
+            features=_mock_mlx_features(calls, [[11, 12]]),
+            evaluate=lambda *_values: None,
+        )
+
+    assert calls == []
+
+
+def test_target_route_top_k_attestation_rejects_mixed_sparse_layers() -> None:
+    assert attest_kimi_k3_target_route_top_k(
+        _fake_sparse_target(8, 8),
+        expected=8,
+    ) == 8
+    with pytest.raises(DSparkConfigurationError, match="layers disagree"):
+        attest_kimi_k3_target_route_top_k(_fake_sparse_target(8, 16))
 
 
 @pytest.mark.parametrize(
@@ -1318,6 +1907,8 @@ def test_replicated_loader_uses_exact_mlx_signatures_and_proposer_context(
         ("make_context_cache", 100),
         ("make_context_cache", 200),
     ]
+    with pytest.raises(DSparkConfigurationError, match="requires capture config"):
+        loaded.new_request(capacity_hint=300, capture_confidence=True)
 
 
 def test_replicated_draft_flattens_proposals_and_appends_only_committed_context(
@@ -1375,6 +1966,107 @@ def test_replicated_draft_flattens_proposals_and_appends_only_committed_context(
     ]
     with pytest.raises(RuntimeError, match="no longer active"):
         round_state.commit(1, 99, TargetPosterior((11, 99, 100)))
+
+
+def test_conservative_capture_materializes_two_rank_zero_confidences_only(
+    tmp_path: Path,
+) -> None:
+    evaluated: list[tuple[object, ...]] = []
+    config = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path,
+        verify_width=3,
+        round_telemetry=False,
+        confidence_capture=DSparkConfidenceCaptureConfig(
+            tmp_path / "rounds.jsonl",
+            "capture-1",
+        ),
+    )
+    loaded = load_replicated_mlx_dspark(
+        config,
+        _fake_sparse_target(8, 8),
+        features=_mock_mlx_features(
+            [],
+            [[11, 12]],
+            [[-1.0, 2.0]],
+        ),
+        evaluate=lambda *values: evaluated.append(values),
+    )
+
+    rank_zero_round = (
+        loaded.new_request(capacity_hint=100, capture_confidence=True)
+        .prepare_round(10, 2)
+        .materialize()
+    )
+    peer_round = (
+        loaded.new_request(capacity_hint=100, capture_confidence=False)
+        .prepare_round(10, 2)
+        .materialize()
+    )
+
+    assert tuple(rank_zero_round.proposal_tokens) == (11, 12)
+    assert tuple(rank_zero_round.confidence_logits or ()) == (-1.0, 2.0)
+    assert tuple(peer_round.proposal_tokens) == (11, 12)
+    assert peer_round.confidence_logits is None
+    assert len(evaluated) == 1
+
+
+def test_missing_confidence_graph_preserves_exact_conservative_proposals(
+    tmp_path: Path,
+) -> None:
+    loaded = load_replicated_mlx_dspark(
+        KimiK3DSparkConfig(
+            checkpoint_path=tmp_path,
+            verify_width=3,
+            round_telemetry=False,
+            confidence_capture=DSparkConfidenceCaptureConfig(
+                tmp_path / "rounds.jsonl",
+                "capture-1",
+            ),
+        ),
+        _fake_sparse_target(8, 8),
+        features=_mock_mlx_features([], [[11, 12]]),
+        evaluate=lambda *_values: None,
+    )
+
+    round_state = (
+        loaded.new_request(capacity_hint=100, capture_confidence=True)
+        .prepare_round(10, 2)
+        .materialize()
+    )
+
+    assert tuple(round_state.proposal_tokens) == (11, 12)
+    assert round_state.confidence_logits is None
+
+
+def test_confidence_evaluation_failure_preserves_exact_conservative_proposals(
+    tmp_path: Path,
+) -> None:
+    def reject_confidence(*_values: object) -> None:
+        raise RuntimeError("injected confidence evaluation failure")
+
+    loaded = load_replicated_mlx_dspark(
+        KimiK3DSparkConfig(
+            checkpoint_path=tmp_path,
+            verify_width=3,
+            round_telemetry=False,
+            confidence_capture=DSparkConfidenceCaptureConfig(
+                tmp_path / "rounds.jsonl",
+                "capture-1",
+            ),
+        ),
+        _fake_sparse_target(8, 8),
+        features=_mock_mlx_features([], [[11, 12]], [[-1.0, 2.0]]),
+        evaluate=reject_confidence,
+    )
+
+    round_state = (
+        loaded.new_request(capacity_hint=100, capture_confidence=True)
+        .prepare_round(10, 2)
+        .materialize()
+    )
+
+    assert tuple(round_state.proposal_tokens) == (11, 12)
+    assert round_state.confidence_logits is None
 
 
 @pytest.mark.parametrize(

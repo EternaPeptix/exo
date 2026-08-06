@@ -67,12 +67,14 @@ from exo.worker.engines.mlx.constants import (
     MAX_TOKENS,
 )
 from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
+    DSparkConfidenceCaptureConfig,
     DSparkDecodedToken,
     DSparkDistributedStateError,
     DSparkRoundTelemetry,
     KimiK3DSparkRequestRuntime,
     LoadedMlxDSpark,
     MlxRankAgreement,
+    dspark_confidence_capture_request,
     dspark_context_capacity_hint,
     dspark_decode_tokens,
     validate_dspark_greedy_sampling,
@@ -1149,6 +1151,8 @@ def _dspark_setup_fingerprint(
     banned_token_ids: tuple[int, ...],
     terminal_token_ids: tuple[int, ...],
     stop_sequences: tuple[str, ...],
+    confidence_capture: DSparkConfidenceCaptureConfig | None = None,
+    target_route_top_k: int | None = None,
 ) -> tuple[int, ...]:
     """Bind every local choice that can alter DSpark graph or loop ordering."""
 
@@ -1179,6 +1183,11 @@ def _dspark_setup_fingerprint(
                 )
             digest.update(token.to_bytes(4, "big"))
 
+    def add_text(value: str, *, name: str) -> None:
+        encoded = value.encode("utf-8")
+        add_integer(len(encoded), name=f"{name} byte length")
+        digest.update(encoded)
+
     add_tokens(logical_prompt_tokens, name="prompt")
     add_integer(max_tokens, name="max tokens")
     add_integer(prefill_step_size, name="prefill step size")
@@ -1192,6 +1201,18 @@ def _dspark_setup_fingerprint(
     add_tokens(eos_token_ids, name="EOS tokens")
     add_tokens(banned_token_ids, name="banned tokens")
     add_tokens(terminal_token_ids, name="terminal tokens")
+    add_integer(int(confidence_capture is not None), name="confidence capture flag")
+    if confidence_capture is not None:
+        if target_route_top_k != 8:
+            raise ValueError(
+                "Kimi K3 DSpark confidence capture requires target route top-k 8"
+            )
+        add_integer(target_route_top_k, name="target route top-k")
+        add_text(
+            str(confidence_capture.jsonl_path),
+            name="confidence capture path",
+        )
+        add_text(confidence_capture.session_id, name="confidence capture session")
     add_integer(len(stop_sequences), name="stop sequence count")
     for stop in stop_sequences:
         encoded = stop.encode("utf-8")
@@ -1360,6 +1381,14 @@ def _prepare_dspark_request_setup(
         max_tokens=max_tokens,
         verify_width=dspark.verify_width,
     )
+    confidence_request = None
+    if dspark.config.confidence_capture is not None:
+        raw_prompt_tokens = all_prompt_tokens.tolist()
+        if not isinstance(raw_prompt_tokens, list):
+            raise ValueError("Kimi K3 DSpark prompt tokens must be one-dimensional")
+        confidence_request = dspark_confidence_capture_request(
+            cast(list[int], raw_prompt_tokens)
+        )
     runtime = KimiK3DSparkRequestRuntime.create(
         dspark,
         model,
@@ -1369,6 +1398,7 @@ def _prepare_dspark_request_setup(
         banned_token_ids=banned_token_ids,
         terminal_token_ids=terminal_token_ids,
         compact_greedy=compact_greedy,
+        confidence_request=confidence_request,
     )
     fingerprint = _dspark_setup_fingerprint(
         prompt_tokens=all_prompt_tokens,
@@ -1385,6 +1415,8 @@ def _prepare_dspark_request_setup(
         banned_token_ids=banned_token_ids,
         terminal_token_ids=terminal_token_ids,
         stop_sequences=stop_sequences,
+        confidence_capture=dspark.config.confidence_capture,
+        target_route_top_k=dspark.target_route_top_k,
     )
     return _DSparkRequestSetup(
         is_pipeline=is_pipeline,
@@ -2081,6 +2113,19 @@ def mlx_generate(
                 # Complete the distributed terminal boundary before yielding;
                 # a downstream parser may not resume this generator.
                 mx_barrier(group)
+
+            if (
+                is_done
+                and dspark_runtime is not None
+                and dspark_runtime.confidence_capture_enabled
+            ):
+                # A capture is complete only after every terminal side effect and
+                # rank boundary succeeds.  The public response has not been yielded
+                # yet, so a downstream parser cannot abandon this generator first.
+                dspark_runtime.agree_local_side_effect(
+                    "confidence capture finalization",
+                    lambda: dspark_runtime.finalize_confidence_capture(complete=True),
+                )
 
             yield response
 

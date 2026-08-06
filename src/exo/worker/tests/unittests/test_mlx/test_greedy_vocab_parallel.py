@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, cast
 from unittest.mock import patch
@@ -23,6 +24,7 @@ from exo.worker.engines.mlx.generator.generate import (
     warmup_inference,
 )
 from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
+    DSparkConfidenceCaptureConfig,
     DSparkDistributedStateError,
     DSparkRoundResult,
     DSparkRoundTelemetry,
@@ -1028,7 +1030,9 @@ class _LocalAgreement:
         return local_token if self.use_local_token else self.token_outcome
 
 
-def test_dspark_setup_fingerprint_binds_generation_callback_presence() -> None:
+def test_dspark_setup_fingerprint_binds_generation_callback_presence(
+    tmp_path: Path,
+) -> None:
     common = {
         "prompt_tokens": cast(object, _PromptTokens((1, 2, 3))),
         "max_tokens": 16,
@@ -1060,6 +1064,24 @@ def test_dspark_setup_fingerprint_binds_generation_callback_presence() -> None:
         **common,
         generation_progress=False,
         force_ordinary=True,
+    )
+
+    assert generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        confidence_capture=DSparkConfidenceCaptureConfig(
+            tmp_path / "rounds.jsonl",
+            "session-a",
+        ),
+        target_route_top_k=8,
+    ) != generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        confidence_capture=DSparkConfidenceCaptureConfig(
+            tmp_path / "rounds.jsonl",
+            "session-b",
+        ),
+        target_route_top_k=8,
     )
 
 
@@ -1128,9 +1150,11 @@ def _run_mlx_generate_dspark_scenario(
     setup_agreement: _LocalAgreement | None = None,
     environment: dict[str, str] | None = None,
     barrier_calls: list[object] | None = None,
+    barrier_error: Exception | None = None,
     runtime_create_error: Exception | None = None,
     generation_callback: Callable[[], None] | None = None,
     lifecycle_events: list[str] | None = None,
+    capture_finalizations: list[bool] | None = None,
 ) -> list[object]:
     model = object()
     tokenizer = SimpleNamespace(detokenizer=_Detokenizer(pieces))
@@ -1162,6 +1186,12 @@ def _run_mlx_generate_dspark_scenario(
         agree_local_side_effect=agree_local_side_effect,
         agree_text=lambda _name, operation: operation(),
         agree_response_control=lambda operation: operation(),
+        confidence_capture_enabled=capture_finalizations is not None,
+        finalize_confidence_capture=lambda *, complete: (
+            capture_finalizations.append(complete)
+            if capture_finalizations is not None
+            else None
+        ),
     )
 
     def create_runtime(*_args: object, **_kwargs: object) -> object:
@@ -1172,6 +1202,8 @@ def _run_mlx_generate_dspark_scenario(
     dspark = SimpleNamespace(
         verify_width=engine.verify_width,
         target_model=model,
+        target_route_top_k=None,
+        config=SimpleNamespace(confidence_capture=None),
     )
     group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
     task = SimpleNamespace(
@@ -1219,6 +1251,8 @@ def _run_mlx_generate_dspark_scenario(
             barrier_calls.append(called_group)
         if lifecycle_events is not None:
             lifecycle_events.append("barrier")
+        if barrier_error is not None:
+            raise barrier_error
 
     monkeypatch.setattr(generate_module, "mx_barrier", observe_barrier)
     monkeypatch.setattr(
@@ -1475,3 +1509,73 @@ def test_mlx_generate_dspark_completes_terminal_barrier_before_yield_boundary(
         "callback",
         "barrier",
     ]
+
+
+def test_mlx_generate_flushes_confidence_buffer_once_at_request_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finalized: list[bool] = []
+
+    _run_mlx_generate_dspark_scenario(
+        monkeypatch,
+        engine=_ScenarioRoundEngine(
+            [],
+            ordinary=[_round((11,), proposed=0, accepted=0)],
+        ),
+        pieces={11: "done"},
+        eos_ids=(),
+        stop=None,
+        max_tokens=1,
+        capture_finalizations=finalized,
+    )
+
+    assert finalized == [True]
+
+
+def test_mlx_generate_does_not_complete_confidence_capture_after_callback_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finalized: list[bool] = []
+
+    def reject_terminal_callback() -> None:
+        raise RuntimeError("injected callback failure")
+
+    with pytest.raises(RuntimeError, match="injected callback failure"):
+        _run_mlx_generate_dspark_scenario(
+            monkeypatch,
+            engine=_ScenarioRoundEngine(
+                [],
+                ordinary=[_round((11,), proposed=0, accepted=0)],
+            ),
+            pieces={11: "done"},
+            eos_ids=(),
+            stop=None,
+            max_tokens=1,
+            generation_callback=reject_terminal_callback,
+            capture_finalizations=finalized,
+        )
+
+    assert finalized == []
+
+
+def test_mlx_generate_does_not_complete_confidence_capture_after_barrier_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finalized: list[bool] = []
+
+    with pytest.raises(RuntimeError, match="injected barrier failure"):
+        _run_mlx_generate_dspark_scenario(
+            monkeypatch,
+            engine=_ScenarioRoundEngine(
+                [],
+                ordinary=[_round((11,), proposed=0, accepted=0)],
+            ),
+            pieces={11: "done"},
+            eos_ids=(),
+            stop=None,
+            max_tokens=1,
+            barrier_error=RuntimeError("injected barrier failure"),
+            capture_finalizations=finalized,
+        )
+
+    assert finalized == []

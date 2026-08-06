@@ -15,11 +15,16 @@ RadixArk artifact.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import importlib
 import inspect
+import json
+import math
 import os
+import stat
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +39,8 @@ DSPARK_CHECKPOINT_ENV = "EXO_MLX_KIMI_K3_DSPARK_CHECKPOINT"
 DSPARK_VERIFY_WIDTH_ENV = "EXO_MLX_KIMI_K3_DSPARK_VERIFY_WIDTH"
 DSPARK_TELEMETRY_ENV = "EXO_MLX_KIMI_K3_DSPARK_ROUND_TELEMETRY"
 DSPARK_AUX_ONLY_PREFILL_ENV = "EXO_MLX_KIMI_K3_DSPARK_AUX_ONLY_PREFILL"
+DSPARK_CONFIDENCE_JSONL_ENV = "EXO_MLX_KIMI_K3_DSPARK_CONFIDENCE_JSONL"
+DSPARK_CONFIDENCE_SESSION_ENV = "EXO_MLX_KIMI_K3_DSPARK_CONFIDENCE_SESSION"
 
 MLX_DSPARK_PROPOSER_ENV = "MLX_LM_KIMI_K3_DSPARK_PROPOSER"
 MLX_REPLAYSSM_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
@@ -73,6 +80,8 @@ _EXO_COMPANION_ENVS = (
     DSPARK_VERIFY_WIDTH_ENV,
     DSPARK_TELEMETRY_ENV,
     DSPARK_AUX_ONLY_PREFILL_ENV,
+    DSPARK_CONFIDENCE_JSONL_ENV,
+    DSPARK_CONFIDENCE_SESSION_ENV,
 )
 
 
@@ -93,6 +102,14 @@ class DSparkCancellationError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class DSparkConfidenceCaptureConfig:
+    """Strict operator metadata for one conservative-width confidence capture."""
+
+    jsonl_path: Path
+    session_id: str
+
+
+@dataclass(frozen=True)
 class KimiK3DSparkConfig:
     """Validated local checkpoint and replicated placement contract."""
 
@@ -107,6 +124,7 @@ class KimiK3DSparkConfig:
     model_sha256: str = RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256
     target_layer_ids: tuple[int, ...] = RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS
     aux_only_prefill: bool = False
+    confidence_capture: DSparkConfidenceCaptureConfig | None = None
 
     @property
     def gamma(self) -> int:
@@ -132,6 +150,84 @@ def _strict_verify_width(raw: str) -> Literal[3, 8]:
     if parsed not in DSPARK_ALLOWED_VERIFY_WIDTHS:
         raise DSparkConfigurationError(f"{DSPARK_VERIFY_WIDTH_ENV} must be 3 or 8")
     return parsed
+
+
+def _strict_capture_label(name: str, raw: str) -> str:
+    if not 1 <= len(raw) <= 128 or any(
+        not (character.isascii() and (character.isalnum() or character in "._-"))
+        for character in raw
+    ):
+        raise DSparkConfigurationError(
+            f"{name} must be 1-128 ASCII letters, digits, dots, underscores, or dashes"
+        )
+    return raw
+
+
+def _validate_confidence_jsonl_path(raw: str) -> Path:
+    path = Path(raw)
+    if not path.is_absolute():
+        raise DSparkConfigurationError(
+            f"{DSPARK_CONFIDENCE_JSONL_ENV} must be an absolute path"
+        )
+    if not path.parent.is_dir():
+        raise DSparkConfigurationError(
+            f"{DSPARK_CONFIDENCE_JSONL_ENV} parent must be an existing directory"
+        )
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return path
+    except OSError as error:
+        raise DSparkConfigurationError(
+            f"{DSPARK_CONFIDENCE_JSONL_ENV} cannot be inspected: {error}"
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise DSparkConfigurationError(
+            f"{DSPARK_CONFIDENCE_JSONL_ENV} must be a regular file"
+        )
+    if metadata.st_nlink != 1:
+        raise DSparkConfigurationError(
+            f"{DSPARK_CONFIDENCE_JSONL_ENV} must not be hard-linked"
+        )
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise DSparkConfigurationError(
+            f"{DSPARK_CONFIDENCE_JSONL_ENV} must not grant group or other access"
+        )
+    return path
+
+
+def _confidence_capture_config(
+    values: Mapping[str, str],
+    *,
+    verify_width: int,
+) -> DSparkConfidenceCaptureConfig | None:
+    configured = tuple(
+        name
+        for name in (DSPARK_CONFIDENCE_JSONL_ENV, DSPARK_CONFIDENCE_SESSION_ENV)
+        if name in values
+    )
+    if not configured:
+        return None
+    if len(configured) != 2:
+        missing = (
+            DSPARK_CONFIDENCE_SESSION_ENV
+            if DSPARK_CONFIDENCE_JSONL_ENV in configured
+            else DSPARK_CONFIDENCE_JSONL_ENV
+        )
+        raise DSparkConfigurationError(
+            f"{missing} is required for DSpark confidence capture"
+        )
+    if verify_width != DSPARK_CONSERVATIVE_VERIFY_WIDTH:
+        raise DSparkConfigurationError(
+            "DSpark confidence capture requires conservative verify width 3"
+        )
+    return DSparkConfidenceCaptureConfig(
+        jsonl_path=_validate_confidence_jsonl_path(values[DSPARK_CONFIDENCE_JSONL_ENV]),
+        session_id=_strict_capture_label(
+            DSPARK_CONFIDENCE_SESSION_ENV,
+            values[DSPARK_CONFIDENCE_SESSION_ENV],
+        ),
+    )
 
 
 def validate_dspark_greedy_sampling(
@@ -322,11 +418,16 @@ def kimi_k3_dspark_config(
         DSPARK_AUX_ONLY_PREFILL_ENV,
         values.get(DSPARK_AUX_ONLY_PREFILL_ENV, "0"),
     )
+    confidence_capture = _confidence_capture_config(
+        values,
+        verify_width=verify_width,
+    )
     return KimiK3DSparkConfig(
         checkpoint_path=checkpoint_path,
         verify_width=verify_width,
         round_telemetry=round_telemetry,
         aux_only_prefill=aux_only_prefill,
+        confidence_capture=confidence_capture,
     )
 
 
@@ -343,6 +444,9 @@ class DraftRound(Protocol):
 
     @property
     def proposal_tokens(self) -> Sequence[int]: ...
+
+    @property
+    def confidence_logits(self) -> Sequence[float] | None: ...
 
     def commit(
         self,
@@ -595,6 +699,280 @@ class DSparkRoundTelemetry:
 
 
 @dataclass(frozen=True)
+class DSparkConfidenceCaptureRequest:
+    """Prompt-safe request identity shared by the rank-zero recorder."""
+
+    prompt_id: str
+    context_tokens: int
+    context_bucket: str
+
+
+@dataclass(frozen=True)
+class DSparkConfidenceObservation:
+    """Rank-zero copy of one fully materialized and agreed proposal."""
+
+    confidence_logits: tuple[float, ...]
+    proposal_sha256: str
+
+
+class DSparkConfidenceRecorder(Protocol):
+    def record(
+        self,
+        telemetry: DSparkRoundTelemetry,
+        observation: DSparkConfidenceObservation | None,
+        *,
+        total_step_ms: float,
+    ) -> None: ...
+
+    def finalize(self, *, complete: bool) -> None: ...
+
+
+def _token_sequence_sha256(tokens: Sequence[int], *, domain: bytes) -> str:
+    digest = hashlib.sha256(domain)
+    digest.update(len(tokens).to_bytes(8, "big"))
+    for token in tokens:
+        if type(token) is not int or not 0 <= token <= 0x7FFFFFFF:
+            raise ValueError(
+                "Kimi K3 DSpark identity tokens must fit non-negative int32"
+            )
+        digest.update(token.to_bytes(4, "big"))
+    return digest.hexdigest()
+
+
+def dspark_prompt_identity(tokens: Sequence[int]) -> str:
+    """Match the K3 TP2 uint32-little-endian token digest contract."""
+
+    if not tokens:
+        raise ValueError("Kimi K3 DSpark prompt identity requires at least one token")
+    digest = hashlib.sha256()
+    for token in tokens:
+        value = int(token)
+        if not 0 <= value < 2**32:
+            raise ValueError("Kimi K3 DSpark prompt token id is outside uint32")
+        digest.update(value.to_bytes(4, byteorder="little", signed=False))
+    return digest.hexdigest()
+
+
+def dspark_context_bucket(context_tokens: int) -> str:
+    """Return a deterministic power-of-two context bucket through 1M."""
+
+    if (
+        type(context_tokens) is not int
+        or not 1 <= context_tokens <= KIMI_K3_MAX_CONTEXT_LENGTH
+    ):
+        raise ValueError("Kimi K3 DSpark context token count is out of range")
+    ceiling = 512
+    while ceiling < context_tokens and ceiling < KIMI_K3_MAX_CONTEXT_LENGTH:
+        ceiling *= 2
+    return f"le_{ceiling}"
+
+
+def dspark_confidence_capture_request(
+    tokens: Sequence[int],
+) -> DSparkConfidenceCaptureRequest:
+    logical_tokens = tuple(tokens)
+    return DSparkConfidenceCaptureRequest(
+        prompt_id=dspark_prompt_identity(logical_tokens),
+        context_tokens=len(logical_tokens),
+        context_bucket=dspark_context_bucket(len(logical_tokens)),
+    )
+
+
+@final
+class DSparkConfidenceJSONLRecorder:
+    """Buffer labeled rank-zero evidence and append once at request end."""
+
+    def __init__(
+        self,
+        config: DSparkConfidenceCaptureConfig,
+        request: DSparkConfidenceCaptureRequest,
+        *,
+        verify_width: int,
+        target_route_top_k: int,
+    ):
+        if verify_width != DSPARK_CONSERVATIVE_VERIFY_WIDTH:
+            raise DSparkConfigurationError(
+                "DSpark confidence recorder requires conservative verify width 3"
+            )
+        if target_route_top_k != 8:
+            raise DSparkConfigurationError(
+                "DSpark confidence recorder requires an attested target route top-k of 8"
+            )
+        self._config = config
+        self._request = request
+        self._verify_width = verify_width
+        self._target_route_top_k = target_route_top_k
+        self._run_id = uuid.uuid4().hex
+        self._disabled = False
+        self._finalized = False
+        self._rounds_seen = 0
+        self._ignored_tail_rounds = 0
+        self._dropped_rounds = 0
+        self._records: list[
+            tuple[DSparkRoundTelemetry, DSparkConfidenceObservation, float]
+        ] = []
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    def _append(self, payload: bytes) -> None:
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self._config.jsonl_path, flags, 0o600)
+        locked = False
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            locked = True
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError("confidence capture target is not a regular file")
+            if metadata.st_nlink != 1:
+                raise OSError("confidence capture target is hard-linked")
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise OSError("confidence capture target grants group or other access")
+            initial_size = metadata.st_size
+            try:
+                view = memoryview(payload)
+                offset = 0
+                while offset < len(view):
+                    written = os.write(descriptor, view[offset:])
+                    if written <= 0:
+                        raise OSError("confidence capture append made no progress")
+                    offset += written
+            except BaseException:
+                try:
+                    os.ftruncate(descriptor, initial_size)
+                except OSError as rollback_error:
+                    raise OSError(
+                        "confidence capture append failed and could not be rolled back"
+                    ) from rollback_error
+                raise
+        finally:
+            try:
+                if locked:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    def record(
+        self,
+        telemetry: DSparkRoundTelemetry,
+        observation: DSparkConfidenceObservation | None,
+        *,
+        total_step_ms: float,
+    ) -> None:
+        if self._disabled or self._finalized:
+            return
+        self._rounds_seen += 1
+        if telemetry.rank != 0:
+            self._dropped_rounds += 1
+            return
+        if (
+            telemetry.proposed == 0
+            and not telemetry.fallback
+            and telemetry.error is None
+        ):
+            self._ignored_tail_rounds += 1
+            return
+        gamma = self._verify_width - 1
+        if (
+            observation is None
+            or telemetry.proposed != gamma
+            or telemetry.fallback
+            or telemetry.error is not None
+        ):
+            self._dropped_rounds += 1
+            return
+        try:
+            _confidence_tuple(observation.confidence_logits, expected=gamma)
+            if not math.isfinite(total_step_ms) or total_step_ms < 0.0:
+                raise ValueError("confidence capture total step time is invalid")
+            self._records.append((telemetry, observation, total_step_ms))
+        except Exception:
+            self._dropped_rounds += 1
+            _log_nonfatal_warning(
+                "Kimi K3 DSpark confidence row was dropped; inference continues"
+            )
+
+    def _round_payload(
+        self,
+        telemetry: DSparkRoundTelemetry,
+        observation: DSparkConfidenceObservation,
+        total_step_ms: float,
+    ) -> dict[str, object]:
+        return {
+            "schema": "k3-dspark-confidence-capture-v3",
+            "session_id": self._config.session_id,
+            "run_id": self._run_id,
+            "prompt_id": self._request.prompt_id,
+            "context_bucket": self._request.context_bucket,
+            "context_tokens": self._request.context_tokens,
+            "round_index": telemetry.round_index,
+            "verify_width": self._verify_width,
+            "target_route_top_k": self._target_route_top_k,
+            "confidence_logits": list(observation.confidence_logits),
+            "proposal_sha256": observation.proposal_sha256,
+            "proposed": telemetry.proposed,
+            "accepted_prefix": telemetry.accepted,
+            "emitted": telemetry.emitted,
+            "draft_ms": telemetry.draft_ms,
+            "target_verify_ms": telemetry.target_verify_ms,
+            "target_commit_ms": telemetry.target_commit_ms,
+            "draft_commit_ms": telemetry.draft_commit_ms,
+            "collective_ms": telemetry.collective_ms,
+            "total_step_ms": total_step_ms,
+            "fallback": False,
+            "error": None,
+        }
+
+    def finalize(self, *, complete: bool) -> None:
+        if self._disabled or self._finalized:
+            return
+        self._finalized = True
+        end: dict[str, object] = {
+            "schema": "k3-dspark-confidence-request-end-v3",
+            "session_id": self._config.session_id,
+            "run_id": self._run_id,
+            "prompt_id": self._request.prompt_id,
+            "context_bucket": self._request.context_bucket,
+            "context_tokens": self._request.context_tokens,
+            "verify_width": self._verify_width,
+            "target_route_top_k": self._target_route_top_k,
+            "complete": bool(complete),
+            "rounds_seen": self._rounds_seen,
+            "captured_rounds": len(self._records),
+            "ignored_tail_rounds": self._ignored_tail_rounds,
+            "dropped_rounds": self._dropped_rounds,
+            "request_buffered_locked_append": True,
+            "round_timing_excludes_request_flush": True,
+        }
+        payloads = [
+            self._round_payload(telemetry, observation, total_step_ms)
+            for telemetry, observation, total_step_ms in self._records
+        ]
+        payloads.append(end)
+        try:
+            encoded = b"".join(
+                json.dumps(
+                    payload,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                + b"\n"
+                for payload in payloads
+            )
+            self._append(encoded)
+        except Exception:
+            self._disabled = True
+            _log_nonfatal_warning(
+                "Kimi K3 DSpark confidence request flush failed and was disabled"
+            )
+
+
+@dataclass(frozen=True)
 class DSparkRoundResult:
     emitted_tokens: tuple[int, ...]
     telemetry: DSparkRoundTelemetry
@@ -645,6 +1023,29 @@ def _token_tuple(tokens: Sequence[int], *, expected: int, name: str) -> tuple[in
     if any(type(token) is not int or token < 0 for token in values):
         raise ValueError(f"{name} must contain non-negative integer token ids")
     return values
+
+
+def _confidence_tuple(
+    logits: Sequence[object] | None,
+    *,
+    expected: int,
+) -> tuple[float, ...]:
+    if logits is None:
+        raise ValueError("MLX-LM DSpark confidence logits are unavailable")
+    values = tuple(logits)
+    if len(values) != expected:
+        raise ValueError(
+            f"DSpark confidence logits must contain exactly {expected} values"
+        )
+    validated: list[float] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("DSpark confidence logits must be finite numbers")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError("DSpark confidence logits must be finite numbers")
+        validated.append(numeric)
+    return tuple(validated)
 
 
 def _shape_tuple(value: object) -> tuple[object, ...] | None:
@@ -745,9 +1146,15 @@ class KimiK3DSparkRoundEngine:
     collective: RankAgreement
     terminal_token_ids: tuple[int, ...] = ()
     telemetry_sink: Callable[[DSparkRoundTelemetry], None] | None = None
+    confidence_recorder: DSparkConfidenceRecorder | None = None
     clock: Callable[[], float] = time.perf_counter
     _round_index: int = field(default=0, init=False)
     _disabled_reason: str | None = field(default=None, init=False)
+    _confidence_observation: DSparkConfidenceObservation | None = field(
+        default=None,
+        init=False,
+    )
+    _capture_round_started: float | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.clock = _nonthrowing_telemetry_clock(self.clock)
@@ -758,6 +1165,12 @@ class KimiK3DSparkRoundEngine:
         if self.draft.verify_width != self.config.verify_width:
             raise DSparkConfigurationError(
                 "Kimi K3 DSpark proposer and EXO verify widths do not match"
+            )
+        if self.confidence_recorder is not None and (
+            self.config.confidence_capture is None or self.collective.rank != 0
+        ):
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark confidence recorder must be rank zero and configured"
             )
         if any(
             type(token_id) is not int or token_id < 0
@@ -782,6 +1195,28 @@ class KimiK3DSparkRoundEngine:
                 self.telemetry_sink(telemetry)
             except Exception:
                 _log_nonfatal_warning("Kimi K3 DSpark telemetry callback failed")
+        if self.confidence_recorder is not None:
+            started = self._capture_round_started
+            total_step_ms = (
+                0.0 if started is None else max(0.0, (self.clock() - started) * 1000.0)
+            )
+            try:
+                self.confidence_recorder.record(
+                    telemetry,
+                    self._confidence_observation,
+                    total_step_ms=total_step_ms,
+                )
+            except Exception:
+                _log_nonfatal_warning("Kimi K3 DSpark confidence recorder failed")
+            finally:
+                self._confidence_observation = None
+                self._capture_round_started = None
+
+    def _begin_capture_round(self) -> None:
+        self._confidence_observation = None
+        self._capture_round_started = (
+            None if self.confidence_recorder is None else self.clock()
+        )
 
     def _agree_stage(
         self,
@@ -1065,6 +1500,7 @@ class KimiK3DSparkRoundEngine:
 
         if type(anchor_token) is not int or anchor_token < 0:
             raise ValueError("anchor_token must be a non-negative integer")
+        self._begin_capture_round()
         return self._ordinary_fallback(
             anchor_token,
             draft_ms=0.0,
@@ -1082,6 +1518,7 @@ class KimiK3DSparkRoundEngine:
 
         if type(anchor_token) is not int or anchor_token < 0:
             raise ValueError("anchor_token must be a non-negative integer")
+        self._begin_capture_round()
         if self._disabled_reason is not None:
             return self._ordinary_fallback(
                 anchor_token,
@@ -1177,6 +1614,7 @@ class KimiK3DSparkRoundEngine:
 
         draft_round: DraftRound | None = None
         local_block: tuple[int, ...] | None = None
+        local_confidence: tuple[float, ...] | None = None
         local_error = None
         try:
             # This is the first operation allowed to materialize the borrowed
@@ -1190,6 +1628,21 @@ class KimiK3DSparkRoundEngine:
             local_block = (anchor_token, *proposals)
         except Exception as error:
             local_error = f"draft failed: {type(error).__name__}: {error}"
+        if local_block is not None and self.confidence_recorder is not None:
+            raw_confidence = (
+                None if draft_round is None else draft_round.confidence_logits
+            )
+            if raw_confidence is not None:
+                try:
+                    local_confidence = _confidence_tuple(
+                        raw_confidence,
+                        expected=gamma,
+                    )
+                except Exception:
+                    _log_nonfatal_warning(
+                        "Kimi K3 DSpark confidence conversion failed; "
+                        "inference continues"
+                    )
         draft_ms = (self.clock() - draft_start) * 1000.0
 
         proposal_agreement_started = self.clock()
@@ -1375,6 +1828,14 @@ class KimiK3DSparkRoundEngine:
         accepted, next_anchor_token = agreed_acceptance
         assert target_round is not None
         assert posterior is not None
+        if local_confidence is not None:
+            self._confidence_observation = DSparkConfidenceObservation(
+                confidence_logits=local_confidence,
+                proposal_sha256=_token_sequence_sha256(
+                    agreed_block[1:],
+                    domain=b"exo-k3-dspark-proposal/v1\0",
+                ),
+            )
         emitted_tokens = (
             *agreed_block[1 : accepted + 1],
             next_anchor_token,
@@ -1870,6 +2331,13 @@ class _ProposalTokenArray(Protocol):
     def tolist(self) -> object: ...
 
 
+class _ConfidenceLogitArray(Protocol):
+    @property
+    def shape(self) -> Sequence[int]: ...
+
+    def tolist(self) -> object: ...
+
+
 class _AuxHiddenState(Protocol):
     @property
     def shape(self) -> Sequence[int]: ...
@@ -1913,6 +2381,35 @@ def _validate_mlx_proposal_graph(
     return cast(_ProposalTokenArray, raw_tokens)
 
 
+def _validate_mlx_confidence_graph(
+    proposal: object,
+    *,
+    expected: int,
+) -> _ConfidenceLogitArray:
+    candidate = getattr(proposal, "confidence_logits", None)
+    confidence_shape = getattr(candidate, "shape", None)
+    if _shape_tuple(confidence_shape) != (1, expected):
+        raise ValueError(
+            f"MLX-LM DSpark confidence graph must have shape [1, {expected}]"
+        )
+    confidence_tolist = getattr(candidate, "tolist", None)
+    if not callable(confidence_tolist):
+        raise TypeError("MLX-LM DSpark confidence logits must be an MLX array")
+    return cast(_ConfidenceLogitArray, candidate)
+
+
+@dataclass
+class _ConfidenceCaptureState:
+    enabled: bool = True
+
+    def disable(self) -> None:
+        if self.enabled:
+            self.enabled = False
+            _log_nonfatal_warning(
+                "Kimi K3 DSpark confidence tensor capture failed and was disabled"
+            )
+
+
 def _materialize_mlx_proposal_tokens(
     raw_tokens: _ProposalTokenArray,
     *,
@@ -1932,6 +2429,27 @@ def _materialize_mlx_proposal_tokens(
         cast(Sequence[int], row_values[0]),
         expected=expected,
         name="MLX-LM DSpark proposal",
+    )
+
+
+def _materialize_mlx_confidence_logits(
+    raw_logits: _ConfidenceLogitArray,
+    *,
+    expected: int,
+) -> tuple[float, ...]:
+    rows = raw_logits.tolist()
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        raise ValueError("MLX-LM DSpark confidence logits must have batch size one")
+    row_values = cast(Sequence[object], rows)
+    if (
+        len(row_values) != 1
+        or not isinstance(row_values[0], Sequence)
+        or isinstance(row_values[0], (str, bytes))
+    ):
+        raise ValueError("MLX-LM DSpark confidence logits must have batch size one")
+    return _confidence_tuple(
+        cast(Sequence[object], row_values[0]),
+        expected=expected,
     )
 
 
@@ -2031,12 +2549,14 @@ class _MlxDSparkDraftRound:
         proposer: _MlxDSparkProposer,
         context_cache: object,
         proposal_tokens: tuple[int, ...],
+        confidence_logits: tuple[float, ...] | None,
         verify_width: int,
         evaluate: Callable[..., None],
     ):
         self._proposer = proposer
         self._context_cache = context_cache
         self._proposal_tokens = proposal_tokens
+        self._confidence_logits = confidence_logits
         self._verify_width = verify_width
         self._evaluate = evaluate
         self._active = True
@@ -2044,6 +2564,10 @@ class _MlxDSparkDraftRound:
     @property
     def proposal_tokens(self) -> tuple[int, ...]:
         return self._proposal_tokens
+
+    @property
+    def confidence_logits(self) -> tuple[float, ...] | None:
+        return self._confidence_logits
 
     def commit(
         self,
@@ -2105,6 +2629,8 @@ class _PreparedMlxDSparkRound:
         proposer: _MlxDSparkProposer,
         context_cache: object,
         proposal_tokens: _ProposalTokenArray,
+        confidence_logits: _ConfidenceLogitArray | None,
+        confidence_state: _ConfidenceCaptureState | None,
         proposal_count: int,
         verify_width: int,
         evaluate: Callable[..., None],
@@ -2112,6 +2638,8 @@ class _PreparedMlxDSparkRound:
         self._proposer = proposer
         self._context_cache = context_cache
         self._proposal_tokens = proposal_tokens
+        self._confidence_logits = confidence_logits
+        self._confidence_state = confidence_state
         self._proposal_count = proposal_count
         self._verify_width = verify_width
         self._evaluate = evaluate
@@ -2121,16 +2649,31 @@ class _PreparedMlxDSparkRound:
         if not self._active:
             raise RuntimeError("MLX-LM DSpark proposal graph is no longer active")
         try:
+            # Preserve the exact token-only inference path as authoritative.
             proposal_tokens = _materialize_mlx_proposal_tokens(
                 self._proposal_tokens,
                 expected=self._proposal_count,
             )
+            confidence_logits: tuple[float, ...] | None = None
+            if self._confidence_logits is not None:
+                try:
+                    # Proposal tokens are already materialized and usable. The
+                    # rank-zero diagnostic tensor cannot affect their value.
+                    self._evaluate(self._confidence_logits)
+                    confidence_logits = _materialize_mlx_confidence_logits(
+                        self._confidence_logits,
+                        expected=self._proposal_count,
+                    )
+                except Exception:
+                    if self._confidence_state is not None:
+                        self._confidence_state.disable()
         finally:
             self._active = False
         return _MlxDSparkDraftRound(
             self._proposer,
             self._context_cache,
             proposal_tokens,
+            confidence_logits,
             self._verify_width,
             self._evaluate,
         )
@@ -2147,6 +2690,7 @@ class MlxDSparkRequestDraft:
     proposer: object
     context_cache: object
     verify_width: int
+    confidence_state: _ConfidenceCaptureState | None = None
     evaluate: Callable[..., None] = mx.eval
     placement: Literal["replicated"] = "replicated"
 
@@ -2204,14 +2748,65 @@ class MlxDSparkRequestDraft:
             expected=num_proposals,
             verify_width=self.verify_width,
         )
+        confidence_logits: _ConfidenceLogitArray | None = None
+        if self.confidence_state is not None and self.confidence_state.enabled:
+            try:
+                confidence_logits = _validate_mlx_confidence_graph(
+                    proposal,
+                    expected=num_proposals,
+                )
+            except Exception:
+                self.confidence_state.disable()
         return _PreparedMlxDSparkRound(
             proposer,
             self.context_cache,
             proposal_tokens,
+            confidence_logits,
+            self.confidence_state,
             num_proposals,
             self.verify_width,
             self.evaluate,
         )
+
+
+def attest_kimi_k3_target_route_top_k(
+    target_model: object,
+    *,
+    expected: int | None = None,
+) -> int:
+    """Attest one routing width across every sparse target layer."""
+
+    layers: object = getattr(target_model, "layers", None)
+    if not isinstance(layers, Sequence) or isinstance(layers, (str, bytes)):
+        raise DSparkConfigurationError("Kimi K3 target layers are unavailable")
+    route_top_ks: list[int] = []
+    for index, layer in enumerate(cast(Sequence[object], layers)):
+        mlp = getattr(layer, "mlp", None)
+        is_sparse = any(
+            hasattr(mlp, marker)
+            for marker in ("switch_mlp", "e_score_correction_bias", "expert_top_k")
+        )
+        if not is_sparse:
+            continue
+        route_top_k = getattr(mlp, "expert_top_k", None)
+        if type(route_top_k) is not int or route_top_k <= 0:
+            raise DSparkConfigurationError(
+                f"Kimi K3 sparse target layer {index} has no valid route top-k"
+            )
+        route_top_ks.append(route_top_k)
+    if not route_top_ks:
+        raise DSparkConfigurationError("Kimi K3 target has no attested sparse layers")
+    unique = set(route_top_ks)
+    if len(unique) != 1:
+        raise DSparkConfigurationError(
+            "Kimi K3 sparse target layers disagree on route top-k"
+        )
+    route_top_k = next(iter(unique))
+    if expected is not None and route_top_k != expected:
+        raise DSparkConfigurationError(
+            f"Kimi K3 target route top-k is {route_top_k}, expected {expected}"
+        )
+    return route_top_k
 
 
 @dataclass(frozen=True)
@@ -2222,6 +2817,7 @@ class LoadedMlxDSpark:
     target_model: object
     drafter: object
     proposer: object
+    target_route_top_k: int | None = None
     evaluate: Callable[..., None] = mx.eval
     placement: Literal["replicated"] = "replicated"
 
@@ -2229,9 +2825,18 @@ class LoadedMlxDSpark:
     def verify_width(self) -> int:
         return self.config.verify_width
 
-    def new_request(self, *, capacity_hint: int) -> MlxDSparkRequestDraft:
+    def new_request(
+        self,
+        *,
+        capacity_hint: int,
+        capture_confidence: bool = False,
+    ) -> MlxDSparkRequestDraft:
         if type(capacity_hint) is not int or capacity_hint <= 0:
             raise ValueError("Kimi K3 DSpark context capacity hint must be positive")
+        if capture_confidence and self.config.confidence_capture is None:
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark confidence materialization requires capture config"
+            )
         proposer = cast(_MlxDSparkProposer, self.proposer)
         make_context_cache = proposer.make_context_cache
         parameters = inspect.signature(make_context_cache).parameters
@@ -2246,6 +2851,9 @@ class LoadedMlxDSpark:
             proposer=self.proposer,
             context_cache=context_cache,
             verify_width=self.verify_width,
+            confidence_state=(
+                _ConfidenceCaptureState() if capture_confidence else None
+            ),
             evaluate=self.evaluate,
         )
 
@@ -2264,6 +2872,12 @@ def load_replicated_mlx_dspark(
     a remote checkpoint download.
     """
 
+    target_route_top_k = None
+    if config.confidence_capture is not None:
+        target_route_top_k = attest_kimi_k3_target_route_top_k(
+            target_model,
+            expected=8,
+        )
     preflight_mlx_dspark_segmented_sdpa()
     detected = detect_mlx_dspark_features() if features is None else features
     if detected is None:
@@ -2299,6 +2913,7 @@ def load_replicated_mlx_dspark(
         target_model=target_model,
         drafter=drafter,
         proposer=proposer,
+        target_route_top_k=target_route_top_k,
         evaluate=evaluate,
     )
 
@@ -2825,8 +3440,13 @@ class KimiK3DSparkRequestRuntime:
     banned_token_ids: tuple[int, ...] = ()
     terminal_token_ids: tuple[int, ...] = ()
     compact_greedy: bool = False
+    confidence_request: DSparkConfidenceCaptureRequest | None = None
     evaluate: Callable[..., None] = mx.eval
     clock: Callable[[], float] = time.perf_counter
+    _confidence_recorder: DSparkConfidenceRecorder | None = field(
+        default=None,
+        init=False,
+    )
 
     def __post_init__(self) -> None:
         self.clock = _nonthrowing_telemetry_clock(self.clock)
@@ -2841,6 +3461,19 @@ class KimiK3DSparkRequestRuntime:
         if self.draft.verify_width != self.loaded.verify_width:
             raise DSparkConfigurationError(
                 "Kimi K3 DSpark request and loaded proposer widths do not match"
+            )
+        if (self.loaded.config.confidence_capture is None) != (
+            self.confidence_request is None
+        ):
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark confidence request metadata does not match config"
+            )
+        if (
+            self.loaded.config.confidence_capture is not None
+            and self.loaded.target_route_top_k != 8
+        ):
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark confidence capture target route top-k is not 8"
             )
         if not has_replayssm_target_hooks(self.target_model):
             raise DSparkFeatureUnavailableError(
@@ -2885,9 +3518,15 @@ class KimiK3DSparkRequestRuntime:
         banned_token_ids: Sequence[int] = (),
         terminal_token_ids: Sequence[int] = (),
         compact_greedy: bool = False,
+        confidence_request: DSparkConfidenceCaptureRequest | None = None,
         evaluate: Callable[..., None] = mx.eval,
     ) -> "KimiK3DSparkRequestRuntime":
-        draft = loaded.new_request(capacity_hint=capacity_hint)
+        draft = loaded.new_request(
+            capacity_hint=capacity_hint,
+            capture_confidence=(
+                loaded.config.confidence_capture is not None and collective.rank == 0
+            ),
+        )
         return cls(
             loaded=loaded,
             target_model=target_model,
@@ -2897,6 +3536,7 @@ class KimiK3DSparkRequestRuntime:
             banned_token_ids=tuple(banned_token_ids),
             terminal_token_ids=tuple(terminal_token_ids),
             compact_greedy=compact_greedy,
+            confidence_request=confidence_request,
             evaluate=evaluate,
         )
 
@@ -3532,6 +4172,18 @@ class KimiK3DSparkRequestRuntime:
                 speculative_width=width,
             ),
         )
+        recorder: DSparkConfidenceRecorder | None = None
+        capture_config = self.loaded.config.confidence_capture
+        if capture_config is not None and self.collective.rank == 0:
+            assert self.confidence_request is not None
+            if self._confidence_recorder is None:
+                self._confidence_recorder = DSparkConfidenceJSONLRecorder(
+                    capture_config,
+                    self.confidence_request,
+                    verify_width=self.loaded.verify_width,
+                    target_route_top_k=cast(int, self.loaded.target_route_top_k),
+                )
+            recorder = self._confidence_recorder
         return KimiK3DSparkRoundEngine(
             config=self.loaded.config,
             draft=self.draft,
@@ -3539,8 +4191,17 @@ class KimiK3DSparkRequestRuntime:
             collective=self.collective,
             terminal_token_ids=self.terminal_token_ids,
             telemetry_sink=telemetry_sink,
+            confidence_recorder=recorder,
             clock=self.clock,
         )
+
+    @property
+    def confidence_capture_enabled(self) -> bool:
+        return self.loaded.config.confidence_capture is not None
+
+    def finalize_confidence_capture(self, *, complete: bool) -> None:
+        if self._confidence_recorder is not None:
+            self._confidence_recorder.finalize(complete=complete)
 
 
 @dataclass(frozen=True)
