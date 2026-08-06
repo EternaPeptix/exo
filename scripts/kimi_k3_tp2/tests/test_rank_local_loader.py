@@ -245,18 +245,28 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
     assert result["rank_data_bytes"] == 32
 
 
-def test_execution_runtime_pin_matches_projected_kv_cache_candidate():
+def test_execution_runtime_pin_matches_top8_kcut_candidate():
     assert loader.RUNTIME_MLX_LM_COMMIT == (
-        "290e6aabdfc0b85961c2e1b21a1e8f43549ffacb"
+        "bda4ae8b0fa67124bdf7f84bcd0715e7e284b558"
     )
     assert loader.MLX_LM_KIMI_K3_SHA256 == (
-        "c4e4604bdfe520c69fa2a27458ab861099ba4838342ccf72a6e44413bbec9fd5"
+        "6d41a3743cb62af9c024997172034472c046a4f72ae154882fcd2b1cee72c4de"
+    )
+    assert loader.MLX_LM_KIMI_K3_FUSED_ROUTER_SHA256 == (
+        "14a7cb54eb3585c992504c109db8bed45eb6ec521ae37e680eb601c419ed8ed1"
+    )
+    assert loader.MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE_SHA256 == (
+        "beaadba191fb762d70c2fe2d9d41f53f06984b857db02b8b7fefcd93ee15a925"
     )
     assert loader.MLX_LM_CACHE_SHA256 == (
         "2011e972be37f5d22450cf5e0b3af0620337d1805d243d4de981430676ac68ca"
     )
     assert loader.MLX_LM_GENERATE_SHA256 == (
         "096f24553953a90f8e331cb7c7415a75636db4eec8a5bd159b6ad3e93cc4e369"
+    )
+    assert loader.MLX_LM_COMMIT == "7d505c285b801108a52c23353c7fb6af07204717"
+    assert loader.CHECKPOINT_MLX_LM_KIMI_K3_SHA256 == (
+        "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
     )
 
 
@@ -424,6 +434,26 @@ def test_runtime_source_verification_uses_execution_pin(
     loader._verify_runtime_source()
     for module_name, constant_name in pins.items():
         monkeypatch.setattr(loader, constant_name, "0" * 64)
+        with pytest.raises(loader.RankLocalLoadError, match=f"{module_name}.py"):
+            loader._verify_runtime_source()
+        monkeypatch.setattr(loader, constant_name, expected[constant_name])
+
+    projected_kv_runtime_pins = {
+        "kimi_k3": (
+            "MLX_LM_KIMI_K3_SHA256",
+            "c4e4604bdfe520c69fa2a27458ab861099ba4838342ccf72a6e44413bbec9fd5",
+        ),
+        "kimi_k3_fused_router": (
+            "MLX_LM_KIMI_K3_FUSED_ROUTER_SHA256",
+            "17bfde08b4d72deb74f9f0e0337822495e1b305166ee966eaab65896f1ed1fc4",
+        ),
+        "kimi_k3_prefill_route_combine": (
+            "MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE_SHA256",
+            "0f2d2440d89d327adeba369620aa206d1f641ff06954db6d364ae1785806e80a",
+        ),
+    }
+    for module_name, (constant_name, old_digest) in projected_kv_runtime_pins.items():
+        monkeypatch.setattr(loader, constant_name, old_digest)
         with pytest.raises(loader.RankLocalLoadError, match=f"{module_name}.py"):
             loader._verify_runtime_source()
         monkeypatch.setattr(loader, constant_name, expected[constant_name])
