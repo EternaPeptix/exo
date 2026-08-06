@@ -56,6 +56,15 @@ RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES = 4_498_585_858
 RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256 = (
     "29df0e8eafb81909f785df55cb352b90d6a1500c609b1d60526c1a62b4d42495"
 )
+RADIXARK_KIMI_K3_DSPARK_YARN_REVISION = (
+    "9c4b2577dacb572ce88e8aad4357dffb4f6c9796"
+)
+RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256 = (
+    "410dd228c75ff91b57af8a1581d44d2ea096d5604f0d37fbd400470e90d961d3"
+)
+RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256 = (
+    "ecd746459b4a603ce0d2c64f73935efead29bd651b14439b99e57ee8b41b77ca"
+)
 RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS = (7, 23, 51, 67, 83)
 RADIXARK_KIMI_K3_DSPARK_BLOCK_SIZE = 7
 KIMI_K3_TARGET_HIDDEN_SIZE = 7168
@@ -99,6 +108,32 @@ class DSparkDistributedStateError(RuntimeError):
 
 class DSparkCancellationError(RuntimeError):
     """A speculative transaction could not be cancelled safely."""
+
+
+@dataclass(frozen=True)
+class KimiK3DSparkCheckpointContract:
+    """One exact, audited DSpark config/weight identity pair."""
+
+    revision: str
+    config_sha256: str
+    model_bytes: int
+    model_sha256: str
+
+
+_DSPARK_CHECKPOINT_CONTRACTS_BY_CONFIG_SHA256 = {
+    RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256: KimiK3DSparkCheckpointContract(
+        revision=RADIXARK_KIMI_K3_DSPARK_REVISION,
+        config_sha256=RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256,
+        model_bytes=RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES,
+        model_sha256=RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256,
+    ),
+    RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256: KimiK3DSparkCheckpointContract(
+        revision=RADIXARK_KIMI_K3_DSPARK_YARN_REVISION,
+        config_sha256=RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256,
+        model_bytes=RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES,
+        model_sha256=RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -312,10 +347,10 @@ def _sha256(path: Path) -> str:
 def validate_local_dspark_checkpoint(
     checkpoint_path: Path,
     *,
-    expected_config_sha256: str = RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256,
+    expected_config_sha256: str | None = None,
     expected_model_bytes: int = RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES,
     sha256: Callable[[Path], str] = _sha256,
-) -> None:
+) -> KimiK3DSparkCheckpointContract | None:
     """Validate the pinned config before any code can allocate draft weights."""
 
     if not checkpoint_path.is_absolute():
@@ -332,9 +367,16 @@ def validate_local_dspark_checkpoint(
             f"{DSPARK_CHECKPOINT_ENV} is missing config.json"
         )
     actual_hash = sha256(config_path)
-    if actual_hash != expected_config_sha256:
+    if expected_config_sha256 is not None and actual_hash != expected_config_sha256:
         raise DSparkConfigurationError(
             "Kimi K3 DSpark config.json does not match the pinned config hash"
+        )
+    checkpoint_contract = _DSPARK_CHECKPOINT_CONTRACTS_BY_CONFIG_SHA256.get(
+        actual_hash
+    )
+    if expected_config_sha256 is None and checkpoint_contract is None:
+        raise DSparkConfigurationError(
+            "Kimi K3 DSpark config.json does not match an audited config hash"
         )
     model_path = checkpoint_path / "model.safetensors"
     if not model_path.is_file():
@@ -345,6 +387,7 @@ def validate_local_dspark_checkpoint(
         raise DSparkConfigurationError(
             "Kimi K3 DSpark model.safetensors does not match the pinned byte size"
         )
+    return checkpoint_contract
 
 
 def kimi_k3_dspark_config(
@@ -353,7 +396,9 @@ def kimi_k3_dspark_config(
     is_batch: bool,
     environ: Mapping[str, str] | None = None,
     warning: Callable[[str], None] = logger.warning,
-    checkpoint_validator: Callable[[Path], None] = validate_local_dspark_checkpoint,
+    checkpoint_validator: Callable[
+        [Path], KimiK3DSparkCheckpointContract | None
+    ] = validate_local_dspark_checkpoint,
 ) -> KimiK3DSparkConfig | None:
     """Parse the fail-closed EXO and MLX-LM DSpark opt-ins.
 
@@ -396,7 +441,13 @@ def kimi_k3_dspark_config(
             f"{DSPARK_CHECKPOINT_ENV} is required when {DSPARK_ENABLE_ENV}=1"
         )
     checkpoint_path = Path(checkpoint_raw)
-    checkpoint_validator(checkpoint_path)
+    checkpoint_contract = checkpoint_validator(checkpoint_path)
+    if checkpoint_contract is not None and not isinstance(
+        checkpoint_contract, KimiK3DSparkCheckpointContract
+    ):
+        raise DSparkConfigurationError(
+            "Kimi K3 DSpark checkpoint validator returned an invalid contract"
+        )
 
     verify_width = _strict_verify_width(
         values.get(
@@ -422,10 +473,23 @@ def kimi_k3_dspark_config(
         values,
         verify_width=verify_width,
     )
+    revision = RADIXARK_KIMI_K3_DSPARK_REVISION
+    config_sha256 = RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256
+    model_bytes = RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES
+    model_sha256 = RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256
+    if checkpoint_contract is not None:
+        revision = checkpoint_contract.revision
+        config_sha256 = checkpoint_contract.config_sha256
+        model_bytes = checkpoint_contract.model_bytes
+        model_sha256 = checkpoint_contract.model_sha256
     return KimiK3DSparkConfig(
         checkpoint_path=checkpoint_path,
         verify_width=verify_width,
         round_telemetry=round_telemetry,
+        revision=revision,
+        config_sha256=config_sha256,
+        model_bytes=model_bytes,
+        model_sha256=model_sha256,
         aux_only_prefill=aux_only_prefill,
         confidence_capture=confidence_capture,
     )

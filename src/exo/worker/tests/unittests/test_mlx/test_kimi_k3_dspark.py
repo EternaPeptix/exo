@@ -331,6 +331,74 @@ def test_local_checkpoint_validation_is_hash_pinned(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("config_sha256", "revision", "model_sha256"),
+    [
+        (
+            dspark_module.RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256,
+            dspark_module.RADIXARK_KIMI_K3_DSPARK_REVISION,
+            dspark_module.RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256,
+        ),
+        (
+            dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256,
+            dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_REVISION,
+            dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256,
+        ),
+    ],
+)
+def test_local_checkpoint_validation_selects_only_audited_pairs(
+    tmp_path: Path,
+    config_sha256: str,
+    revision: str,
+    model_sha256: str,
+) -> None:
+    (tmp_path / "config.json").write_bytes(b"audited config")
+    (tmp_path / "model.safetensors").write_bytes(b"x")
+
+    contract = validate_local_dspark_checkpoint(
+        tmp_path,
+        expected_model_bytes=1,
+        sha256=lambda _path: config_sha256,
+    )
+
+    assert contract is not None
+    assert contract.revision == revision
+    assert contract.config_sha256 == config_sha256
+    assert contract.model_sha256 == model_sha256
+
+
+def test_local_checkpoint_validation_rejects_unknown_pair(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_bytes(b"unknown config")
+    (tmp_path / "model.safetensors").write_bytes(b"x")
+    with pytest.raises(DSparkConfigurationError, match="audited config hash"):
+        validate_local_dspark_checkpoint(
+            tmp_path,
+            expected_model_bytes=1,
+            sha256=lambda _path: "f" * 64,
+        )
+
+
+def test_yarn_checkpoint_identity_is_bound_into_runtime_config(tmp_path: Path) -> None:
+    yarn_contract = dspark_module.KimiK3DSparkCheckpointContract(
+        revision=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_REVISION,
+        config_sha256=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256,
+        model_bytes=dspark_module.RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES,
+        model_sha256=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256,
+    )
+    config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=_enabled_environment(tmp_path, width="3"),
+        checkpoint_validator=lambda _path: yarn_contract,
+    )
+
+    assert config is not None
+    assert config.revision == yarn_contract.revision
+    assert config.config_sha256 == yarn_contract.config_sha256
+    assert config.model_bytes == yarn_contract.model_bytes
+    assert config.model_sha256 == yarn_contract.model_sha256
+
+
 @dataclass
 class _FakeDraftRound:
     proposal_tokens: Sequence[int]
