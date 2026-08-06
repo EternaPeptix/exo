@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -30,6 +31,15 @@ RANK_LOCAL_VOCAB_PARALLEL_HEAD_ENV = "EXO_MLX_K3_VOCAB_PARALLEL_HEAD"
 
 SUPPORTED_MODEL_ID = "kernelpool/Kimi-K3-2bit-UVMAX"
 SUPPORTED_LOADER_SCHEMA = "k3-rank-local-tp/v2"
+SUPPORTED_RUNTIME_MLX_LM_COMMIT = "7216b0d2c71b09f21e9e55c642c24467cb4fc15e"
+RANK_LOCAL_METADATA_CONTRACT_CONFIG_KEY = "_rank_local_metadata_contract_sha256"
+RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_CONFIG_KEY = "_rank_local_runtime_mlx_lm_commit"
+RANK_LOCAL_METADATA_CONTRACT_MODEL_ATTRIBUTE = (
+    "_exo_rank_local_metadata_contract_sha256"
+)
+RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_MODEL_ATTRIBUTE = (
+    "_exo_rank_local_runtime_mlx_lm_commit"
+)
 SUPPORTED_SOURCE_REVISION = "edb5113218df612f4a92f95145680f3f8eacd375"
 SUPPORTED_SOURCE_CONFIG_SHA256 = (
     "d041003554810a367bb600d18733976bdd21041bb46e75cc1e27c7b15fe034d0"
@@ -116,6 +126,39 @@ _ALLOWED_CHECKPOINT_TEMPLATE_FIELDS = frozenset({"rank", "world_size"})
 
 class RankLocalConfigurationError(RuntimeError):
     """The rank-local opt-in is present but cannot be used safely."""
+
+
+def _rank_local_metadata_contract_sha256(checkpoint_path: Path) -> str:
+    """Read the immutable, cross-rank-agreed target checkpoint lineage."""
+
+    manifest_path = checkpoint_path / "tp_manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint has no regular tp_manifest.json"
+    )
+    try:
+        raw_manifest = cast(
+            object,
+            json.loads(manifest_path.read_text(encoding="utf-8")),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint manifest could not be read"
+        ) from error
+    if not isinstance(raw_manifest, Mapping):
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint manifest must be a JSON object"
+        )
+    digest = cast(Mapping[object, object], raw_manifest).get("metadata_contract_sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise RankLocalConfigurationError(
+            "rank-local checkpoint has no valid metadata contract digest"
+        )
+    return digest
 
 
 class DistributedGroup(Protocol):
@@ -409,6 +452,12 @@ def load_preflighted_rank_local_model(
         raise RankLocalConfigurationError(
             "external rank-local loader did not attest its compatibility transform"
         )
+    config[RANK_LOCAL_METADATA_CONTRACT_CONFIG_KEY] = (
+        _rank_local_metadata_contract_sha256(prepared.checkpoint_path)
+    )
+    config[RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_CONFIG_KEY] = (
+        SUPPORTED_RUNTIME_MLX_LM_COMMIT
+    )
     return RankLocalLoad(
         model=model,
         checkpoint_path=prepared.checkpoint_path,

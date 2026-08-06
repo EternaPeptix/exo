@@ -452,7 +452,12 @@ def test_rank_local_load_has_no_progress_yield_after_terminal_barrier(
     loaded = SimpleNamespace(
         model=model,
         checkpoint_path=SimpleNamespace(),
-        config={},
+        config={
+            utils_mlx.RANK_LOCAL_METADATA_CONTRACT_CONFIG_KEY: "1" * 64,
+            utils_mlx.RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_CONFIG_KEY: (
+                "7216b0d2c71b09f21e9e55c642c24467cb4fc15e"
+            ),
+        },
     )
     events: list[str] = []
 
@@ -1380,7 +1385,6 @@ def test_dspark_setup_fingerprint_binds_generation_callback_presence(
         packed_agreements=True,
     )
 
-
 def test_packed_selector_activates_only_after_legacy_setup_sequence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1491,6 +1495,138 @@ def test_dspark_setup_fingerprint_binds_dual_selection_without_changing_default(
     assert old_fingerprint != yarn_fingerprint
 
 
+def test_dspark_setup_fingerprint_binds_prefix_kind_offset_and_model() -> None:
+    common = {
+        "prompt_tokens": cast(object, _PromptTokens((1, 2, 3))),
+        "max_tokens": 16,
+        "prefill_step_size": 4,
+        "capacity_hint": 18,
+        "verify_width": 3,
+        "seed": 42,
+        "is_bench": False,
+        "compact_greedy": False,
+        "generation_progress": False,
+        "eos_token_ids": (2,),
+        "banned_token_ids": (),
+        "terminal_token_ids": (2,),
+        "stop_sequences": (),
+        "prefix_cache_enabled": True,
+        "prefix_model_binding": (10, 11, 12, 13),
+    }
+    miss = generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        request_model_id="model-a",
+        prefix_hit_kind="miss",
+        prefix_hit_length=0,
+    )
+    append = generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        request_model_id="model-a",
+        prefix_hit_kind="append",
+        prefix_hit_length=2,
+    )
+    different_model = generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        request_model_id="model-b",
+        prefix_hit_kind="append",
+        prefix_hit_length=2,
+    )
+
+    assert miss != append
+    assert append != different_model
+
+
+def test_setup_fingerprint_disagreement_clears_cache_before_any_graph() -> None:
+    agreement = _LocalAgreement(use_local_token=False, token_outcome=None)
+    trace: list[str] = []
+
+    with pytest.raises(
+        DSparkDistributedStateError,
+        match="setup outcomes or request controls disagreed",
+    ):
+        generate_module._rank_agreed_dspark_setup(
+            cast(object, agreement),
+            lambda: cast(
+                object,
+                SimpleNamespace(fingerprint=(1, 2, 3, 4)),
+            ),
+            failure_cleanup=lambda: trace.append("clear"),
+        )
+
+    assert agreement.stage_calls == [True]
+    assert len(agreement.token_calls) == 5
+    assert trace == ["clear"]
+
+
+def test_peer_prefix_restore_failure_clears_before_any_target_graph() -> None:
+    agreement = _LocalAgreement(stage_outcome=None)
+    trace: list[str] = []
+    inspection = generate_module.KimiK3DSparkPrefixCacheInspection(
+        hit_kind="append",
+        restored_offset=2,
+        model_binding=(10, 11, 12, 13),
+        entry=None,
+    )
+    lookup = generate_module.KimiK3DSparkPrefixCacheLookup(
+        hit_kind="append",
+        target_cache=object(),
+        draft_context_cache=object(),
+        restored_offset=2,
+        model_binding=(10, 11, 12, 13),
+    )
+
+    with pytest.raises(
+        DSparkDistributedStateError,
+        match="paired prefix restore disagreed or failed",
+    ):
+        generate_module._rank_agreed_dspark_prefix_restore(
+            cast(object, agreement),
+            lambda: lookup,
+            inspection,
+            (1, 2, 3, 4),
+            lambda _lookup: (1, 2, 3, 4),
+            lambda: trace.append("clear"),
+        )
+
+    assert agreement.stage_calls == [True]
+    assert len(agreement.token_calls) == 5
+    assert trace == ["clear"]
+
+
+def test_prefix_restore_metadata_change_is_rejected_before_rank_agreement() -> None:
+    agreement = _LocalAgreement()
+    trace: list[str] = []
+    inspection = generate_module.KimiK3DSparkPrefixCacheInspection(
+        hit_kind="exact",
+        restored_offset=2,
+        model_binding=(10, 11, 12, 13),
+        entry=None,
+    )
+    changed_lookup = generate_module.KimiK3DSparkPrefixCacheLookup(
+        hit_kind="append",
+        target_cache=object(),
+        draft_context_cache=object(),
+        restored_offset=2,
+        model_binding=(10, 11, 12, 13),
+    )
+
+    with pytest.raises(
+        DSparkDistributedStateError,
+        match="paired prefix restore disagreed or failed",
+    ):
+        generate_module._rank_agreed_dspark_prefix_restore(
+            cast(object, agreement),
+            lambda: changed_lookup,
+            inspection,
+            (1, 2, 3, 4),
+            lambda _lookup: (1, 2, 3, 4),
+            lambda: trace.append("clear"),
+        )
+
+    assert agreement.stage_calls == [False]
+    assert trace == ["clear"]
+
+
 @dataclass
 class _Detokenizer:
     pieces: dict[int, str]
@@ -1561,11 +1697,14 @@ def _run_mlx_generate_dspark_scenario(
     generation_callback: Callable[[], None] | None = None,
     lifecycle_events: list[str] | None = None,
     capture_finalizations: list[bool] | None = None,
+    prompt_tokens: tuple[int, ...] = (1, 2, 10),
 ) -> list[object]:
     model = object()
     tokenizer = SimpleNamespace(detokenizer=_Detokenizer(pieces))
 
     def seed_prompt(*_args: object, **kwargs: object) -> tuple[float, int]:
+        if lifecycle_events is not None:
+            lifecycle_events.append("seed_prompt")
         if seed_contracts is not None:
             seed_contracts.append(
                 {
@@ -1574,6 +1713,10 @@ def _run_mlx_generate_dspark_scenario(
                 }
             )
         return 100.0, 2
+
+    def commit_prompt_prefix_cache(*_args: object, **_kwargs: object) -> None:
+        if lifecycle_events is not None:
+            lifecycle_events.append("prefix_commit")
 
     def agree_local_value(name: str, operation: Callable[[], object]) -> object:
         if lifecycle_events is not None:
@@ -1587,6 +1730,7 @@ def _run_mlx_generate_dspark_scenario(
 
     runtime = SimpleNamespace(
         seed_prompt=seed_prompt,
+        commit_prompt_prefix_cache=commit_prompt_prefix_cache,
         make_round_engine=lambda: engine,
         agree_local_value=agree_local_value,
         agree_local_side_effect=agree_local_side_effect,
@@ -1652,7 +1796,7 @@ def _run_mlx_generate_dspark_scenario(
     def encode(*_args: object) -> _PromptTokens:
         if lifecycle_events is not None:
             lifecycle_events.append("encode")
-        return _PromptTokens((1, 2, 10))
+        return _PromptTokens(prompt_tokens)
 
     def fix(tokens: object, _tokenizer: object) -> object:
         if lifecycle_events is not None:
@@ -1754,6 +1898,34 @@ def test_dspark_selects_after_final_tokenization_before_any_request_cache(
     assert lifecycle.index("fix") < lifecycle.index("select")
     assert lifecycle.index("select") < lifecycle.index("target_cache")
     assert lifecycle.index("target_cache") < lifecycle.index("runtime_create")
+
+
+def test_dspark_ordinary_cutoff_still_seeds_and_commits_paired_prefix_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle: list[str] = []
+
+    _run_mlx_generate_dspark_scenario(
+        monkeypatch,
+        engine=_ScenarioRoundEngine(
+            [],
+            ordinary=[_round((11,), proposed=0, accepted=0)],
+        ),
+        pieces={11: "done"},
+        eos_ids=(),
+        stop=None,
+        max_tokens=1,
+        environment={
+            "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT": "3072",
+        },
+        lifecycle_events=lifecycle,
+        prompt_tokens=tuple(range(3072)),
+    )
+
+    assert lifecycle.index("seed_prompt") < lifecycle.index("prefix_commit")
+    assert lifecycle.index("prefix_commit") < lifecycle.index(
+        "agree:round engine construction"
+    )
 
 
 @pytest.mark.parametrize(

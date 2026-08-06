@@ -15,6 +15,7 @@ RadixArk artifact.
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import gc
 import hashlib
@@ -33,6 +34,17 @@ from typing import Literal, Protocol, cast, final
 
 import mlx.core as mx
 
+from exo.worker.engines.mlx.rank_local_checkpoint import (
+    RANK_LOCAL_METADATA_CONTRACT_MODEL_ATTRIBUTE,
+    RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_MODEL_ATTRIBUTE,
+    SUPPORTED_MODEL_ID,
+    SUPPORTED_RUNTIME_MLX_LM_COMMIT,
+    SUPPORTED_SOURCE_CONFIG_SHA256,
+    SUPPORTED_SOURCE_INDEX_SHA256,
+    SUPPORTED_SOURCE_REVISION,
+    SUPPORTED_TP_CONTRACT,
+    SUPPORTED_TP_CONTRACT_DIGEST,
+)
 from exo.worker.runner.bootstrap import logger
 
 DSPARK_ENABLE_ENV = "EXO_MLX_KIMI_K3_DSPARK_SPECULATIVE"
@@ -40,6 +52,7 @@ DSPARK_CHECKPOINT_ENV = "EXO_MLX_KIMI_K3_DSPARK_CHECKPOINT"
 DSPARK_VERIFY_WIDTH_ENV = "EXO_MLX_KIMI_K3_DSPARK_VERIFY_WIDTH"
 DSPARK_TELEMETRY_ENV = "EXO_MLX_KIMI_K3_DSPARK_ROUND_TELEMETRY"
 DSPARK_AUX_ONLY_PREFILL_ENV = "EXO_MLX_KIMI_K3_DSPARK_AUX_ONLY_PREFILL"
+DSPARK_PREFIX_CACHE_ENV = "EXO_MLX_KIMI_K3_DSPARK_PREFIX_CACHE"
 DSPARK_CONFIDENCE_JSONL_ENV = "EXO_MLX_KIMI_K3_DSPARK_CONFIDENCE_JSONL"
 DSPARK_CONFIDENCE_SESSION_ENV = "EXO_MLX_KIMI_K3_DSPARK_CONFIDENCE_SESSION"
 DSPARK_DUAL_PROPOSER_ENV = "EXO_MLX_KIMI_K3_DSPARK_DUAL_PROPOSER"
@@ -52,7 +65,6 @@ DSPARK_PACKED_AGREEMENTS_ENV = "EXO_MLX_KIMI_K3_DSPARK_PACKED_AGREEMENTS"
 # These controls live on separate experimental branches.  The first dual
 # proposer deliberately rejects them instead of silently composing untested
 # request-state machines when those branches are integrated.
-DSPARK_PREFIX_CACHE_ENV = "EXO_MLX_KIMI_K3_DSPARK_PREFIX_CACHE"
 DSPARK_ADAPTIVE_GATE_ENV = "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_W3_GATE"
 DSPARK_ADAPTIVE_GATE_POLICY_ENV = "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_W3_GATE_POLICY"
 DSPARK_ADAPTIVE_GATE_POLICY_SHA256_ENV = (
@@ -105,6 +117,7 @@ _EXO_COMPANION_ENVS = (
     DSPARK_VERIFY_WIDTH_ENV,
     DSPARK_TELEMETRY_ENV,
     DSPARK_AUX_ONLY_PREFILL_ENV,
+    DSPARK_PREFIX_CACHE_ENV,
     DSPARK_CONFIDENCE_JSONL_ENV,
     DSPARK_CONFIDENCE_SESSION_ENV,
     DSPARK_DUAL_PROPOSER_ENV,
@@ -179,6 +192,7 @@ class KimiK3DSparkConfig:
     model_sha256: str = RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256
     target_layer_ids: tuple[int, ...] = RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS
     aux_only_prefill: bool = False
+    prefix_cache: bool = False
     confidence_capture: DSparkConfidenceCaptureConfig | None = None
     rank_zero_proposal_recovery: bool = False
     packed_agreements: bool = False
@@ -235,6 +249,7 @@ class KimiK3DSparkDualConfig:
             "model_bytes",
             "target_layer_ids",
             "aux_only_prefill",
+            "prefix_cache",
             "confidence_capture",
             "rank_zero_proposal_recovery",
             "packed_agreements",
@@ -250,6 +265,10 @@ class KimiK3DSparkDualConfig:
             raise DSparkConfigurationError(
                 "Kimi K3 dual DSpark cannot be combined with confidence capture"
             )
+        if self.old.prefix_cache or self.yarn.prefix_cache:
+            raise DSparkConfigurationError(
+                "Kimi K3 dual DSpark cannot be combined with paired prefix cache"
+            )
 
     @property
     def verify_width(self) -> Literal[3, 8]:
@@ -262,6 +281,12 @@ class KimiK3DSparkDualConfig:
     @property
     def packed_agreements(self) -> bool:
         return self.old.packed_agreements
+
+    @property
+    def prefix_cache(self) -> Literal[False]:
+        """Dual selection never participates in paired prefix reuse."""
+
+        return False
 
 
 KimiK3DSparkDeploymentConfig = KimiK3DSparkConfig | KimiK3DSparkDualConfig
@@ -597,10 +622,18 @@ def kimi_k3_dspark_config(
         DSPARK_AUX_ONLY_PREFILL_ENV,
         values.get(DSPARK_AUX_ONLY_PREFILL_ENV, "0"),
     )
+    prefix_cache = _strict_flag(
+        DSPARK_PREFIX_CACHE_ENV,
+        values.get(DSPARK_PREFIX_CACHE_ENV, "0"),
+    )
     confidence_capture = _confidence_capture_config(
         values,
         verify_width=verify_width,
     )
+    if prefix_cache and confidence_capture is not None:
+        raise DSparkConfigurationError(
+            "Kimi K3 paired prefix cache cannot be combined with confidence capture"
+        )
     rank_zero_proposal_recovery = _strict_flag(
         DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV,
         values.get(DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV, "0"),
@@ -627,6 +660,7 @@ def kimi_k3_dspark_config(
         model_bytes=model_bytes,
         model_sha256=model_sha256,
         aux_only_prefill=aux_only_prefill,
+        prefix_cache=prefix_cache,
         confidence_capture=confidence_capture,
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
         packed_agreements=packed_agreements,
@@ -3312,6 +3346,8 @@ class LoadedMlxDSpark:
         *,
         capacity_hint: int,
         capture_confidence: bool = False,
+        context_cache: object | None = None,
+        restored_offset: int = 0,
     ) -> MlxDSparkRequestDraft:
         if type(capacity_hint) is not int or capacity_hint <= 0:
             raise ValueError("Kimi K3 DSpark context capacity hint must be positive")
@@ -3319,16 +3355,27 @@ class LoadedMlxDSpark:
             raise DSparkConfigurationError(
                 "Kimi K3 DSpark confidence materialization requires capture config"
             )
-        proposer = cast(_MlxDSparkProposer, self.proposer)
-        make_context_cache = proposer.make_context_cache
-        parameters = inspect.signature(make_context_cache).parameters
-        context_cache = (
-            make_context_cache(capacity_hint=capacity_hint)
-            if "capacity_hint" in parameters
-            else make_context_cache()
-        )
-        if _context_cache_offset(context_cache) != 0:
-            raise ValueError("MLX-LM DSpark request context must start empty")
+        if type(restored_offset) is not int or restored_offset < 0:
+            raise ValueError("Kimi K3 DSpark restored context offset is invalid")
+        if context_cache is None:
+            if restored_offset != 0:
+                raise ValueError(
+                    "Kimi K3 DSpark restored offset requires a context cache"
+                )
+            proposer = cast(_MlxDSparkProposer, self.proposer)
+            make_context_cache = proposer.make_context_cache
+            parameters = inspect.signature(make_context_cache).parameters
+            context_cache = (
+                make_context_cache(capacity_hint=capacity_hint)
+                if "capacity_hint" in parameters
+                else make_context_cache()
+            )
+        if _context_cache_offset(context_cache) != restored_offset:
+            raise ValueError(
+                "MLX-LM DSpark request context does not match its restored offset"
+            )
+        if restored_offset > 0:
+            _materialize_context_cache(context_cache, self.evaluate)
         return MlxDSparkRequestDraft(
             proposer=self.proposer,
             context_cache=context_cache,
@@ -3716,10 +3763,15 @@ def _validate_target_cache(
 
 
 def _target_cache_states(target_cache: object) -> tuple[object, ...]:
-    return tuple(
-        cast(_TargetCacheEntry, entry).state
-        for entry in cast(Sequence[object], target_cache)
-    )
+    states: list[object] = []
+    for entry in cast(Sequence[object], target_cache):
+        state: object = cast(_TargetCacheEntry, entry).state
+        if isinstance(state, (list, tuple)) and not state:
+            arrays = getattr(entry, "cache", None)
+            if isinstance(arrays, Sequence) and not isinstance(arrays, (str, bytes)):
+                state = cast(Sequence[object], arrays)
+        states.append(cast(object, state))
+    return tuple(states)
 
 
 def _target_cache_materialization_roots(target_cache: object) -> tuple[object, ...]:
@@ -3749,6 +3801,360 @@ def _target_cache_materialization_roots(target_cache: object) -> tuple[object, .
     if not roots:
         raise ValueError("Kimi K3 target cache has no materialization roots")
     return tuple(roots)
+
+
+DSparkPrefixHitKind = Literal["disabled", "miss", "exact", "append"]
+KIMI_K3_DSPARK_PREFIX_CACHE_MLX_LM_COMMIT = SUPPORTED_RUNTIME_MLX_LM_COMMIT
+KIMI_K3_DSPARK_PREFIX_TARGET_LINEAGE = (
+    SUPPORTED_MODEL_ID,
+    SUPPORTED_SOURCE_REVISION,
+    SUPPORTED_SOURCE_CONFIG_SHA256,
+    SUPPORTED_SOURCE_INDEX_SHA256,
+    SUPPORTED_TP_CONTRACT,
+    SUPPORTED_TP_CONTRACT_DIGEST,
+)
+
+
+def kimi_k3_dspark_prefix_model_binding(
+    loaded: LoadedMlxDSpark,
+    target_model: object,
+    request_model_id: str,
+) -> tuple[int, ...]:
+    """Return a rank-invariant immutable target/draft cache identity."""
+
+    if loaded.target_model is not target_model:
+        raise DSparkConfigurationError(
+            "Kimi K3 paired prefix cache target differs from the loaded target"
+        )
+    target_class = f"{type(target_model).__module__}.{type(target_model).__qualname__}"
+    target_metadata_contract = getattr(
+        target_model,
+        RANK_LOCAL_METADATA_CONTRACT_MODEL_ATTRIBUTE,
+        None,
+    )
+    if (
+        not isinstance(target_metadata_contract, str)
+        or len(target_metadata_contract) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in target_metadata_contract
+        )
+    ):
+        raise DSparkConfigurationError(
+            "Kimi K3 paired prefix cache requires the rank-local target "
+            "metadata contract digest"
+        )
+    target_runtime_commit = getattr(
+        target_model,
+        RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_MODEL_ATTRIBUTE,
+        None,
+    )
+    if target_runtime_commit != KIMI_K3_DSPARK_PREFIX_CACHE_MLX_LM_COMMIT:
+        raise DSparkConfigurationError(
+            "Kimi K3 paired prefix cache requires the pinned golden MLX-LM "
+            f"runtime {KIMI_K3_DSPARK_PREFIX_CACHE_MLX_LM_COMMIT}"
+        )
+    payload = json.dumps(
+        {
+            "request_model_id": request_model_id,
+            "target_class": target_class,
+            "target_metadata_contract_sha256": target_metadata_contract,
+            "target_runtime_mlx_lm_commit": target_runtime_commit,
+            "target_checkpoint_lineage": KIMI_K3_DSPARK_PREFIX_TARGET_LINEAGE,
+            "draft_model_id": loaded.config.model_id,
+            "draft_revision": loaded.config.revision,
+            "draft_config_sha256": loaded.config.config_sha256,
+            "draft_model_sha256": loaded.config.model_sha256,
+            "verify_width": loaded.verify_width,
+            "target_layer_ids": loaded.config.target_layer_ids,
+            "target_route_top_k": loaded.target_route_top_k,
+            "aux_only_prefill": loaded.config.aux_only_prefill,
+            "placement": loaded.placement,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    raw = hashlib.sha256(b"exo-kimi-k3-dspark-prefix-model/v2\0" + payload).digest()
+    return tuple(
+        int.from_bytes(raw[offset : offset + 4], "big") & 0x7FFFFFFF
+        for offset in range(0, 16, 4)
+    )
+
+
+@dataclass(frozen=True)
+class KimiK3DSparkPrefixCacheEntry:
+    """One materialized L-1 target/draft snapshot; prompt text is never retained."""
+
+    logical_prompt_tokens: tuple[int, ...]
+    target_cache: object
+    draft_context_cache: object
+    terminal_offset: int
+    cold_prefill_tps: float
+    model_binding: tuple[int, ...]
+
+    @property
+    def contract_fingerprint(self) -> tuple[int, ...]:
+        return _token_contract_fingerprint(
+            self.logical_prompt_tokens,
+            self.model_binding,
+            (self.terminal_offset,),
+        )
+
+
+@dataclass(frozen=True)
+class KimiK3DSparkPrefixCacheLookup:
+    hit_kind: DSparkPrefixHitKind
+    target_cache: object | None
+    draft_context_cache: object | None
+    restored_offset: int
+    model_binding: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class KimiK3DSparkPrefixCacheInspection:
+    """Non-mutating local outcome agreed before either cache half is cloned."""
+
+    hit_kind: DSparkPrefixHitKind
+    restored_offset: int
+    model_binding: tuple[int, ...]
+    entry: KimiK3DSparkPrefixCacheEntry | None
+
+
+class KimiK3DSparkPrefixCache:
+    """Disabled-by-default, one-entry paired target and DSpark context cache."""
+
+    def __init__(self) -> None:
+        self._entry: KimiK3DSparkPrefixCacheEntry | None = None
+        self._staged_entry: KimiK3DSparkPrefixCacheEntry | None = None
+
+    @property
+    def entry(self) -> KimiK3DSparkPrefixCacheEntry | None:
+        return self._entry
+
+    def clear(self) -> None:
+        had_retained_state = self._entry is not None or self._staged_entry is not None
+        self._staged_entry = None
+        self._entry = None
+        if not had_retained_state:
+            return
+        with contextlib.suppress(Exception):
+            gc.collect()
+        with contextlib.suppress(Exception):
+            mx.clear_cache()
+
+    @staticmethod
+    def _validate_logical_prompt(tokens: tuple[int, ...]) -> None:
+        if len(tokens) < 2:
+            raise ValueError("Kimi K3 paired prefix cache requires two prompt tokens")
+        if len(tokens) > KIMI_K3_MAX_CONTEXT_LENGTH:
+            raise ValueError(
+                "Kimi K3 paired prefix cache prompt exceeds the context limit"
+            )
+        if any(
+            type(token) is not int or not 0 <= token <= 0x7FFFFFFF for token in tokens
+        ):
+            raise ValueError(
+                "Kimi K3 paired prefix cache prompt must contain non-negative int32 tokens"
+            )
+
+    @staticmethod
+    def _validate_pair(
+        target_cache: object,
+        draft_context_cache: object,
+        *,
+        expected_offset: int,
+        evaluate: Callable[..., None],
+    ) -> None:
+        if expected_offset <= 0:
+            raise ValueError("Kimi K3 paired prefix cache offset must be positive")
+        _validate_target_cache(
+            target_cache,
+            expected_offset=expected_offset,
+            require_kda_state=True,
+        )
+        evaluate(*_target_cache_materialization_roots(target_cache))
+        if _context_cache_offset(draft_context_cache) != expected_offset:
+            raise ValueError("Kimi K3 paired prefix target and draft offsets disagree")
+        _materialize_context_cache(draft_context_cache, evaluate)
+
+    @classmethod
+    def _clone_pair(
+        cls,
+        target_cache: object,
+        draft_context_cache: object,
+        *,
+        expected_offset: int,
+        evaluate: Callable[..., None],
+    ) -> tuple[object, object]:
+        cloned_target, cloned_draft = copy.deepcopy((target_cache, draft_context_cache))
+        if cloned_target is target_cache or cloned_draft is draft_context_cache:
+            raise ValueError("Kimi K3 paired prefix cache clone retained mutable roots")
+        cls._validate_pair(
+            cloned_target,
+            cloned_draft,
+            expected_offset=expected_offset,
+            evaluate=evaluate,
+        )
+        return cloned_target, cloned_draft
+
+    def inspect(
+        self,
+        logical_prompt_tokens: tuple[int, ...],
+        *,
+        model_binding: tuple[int, ...],
+        enabled: bool = True,
+    ) -> KimiK3DSparkPrefixCacheInspection:
+        """Classify one request without cloning, materializing, or clearing."""
+
+        self._validate_logical_prompt(logical_prompt_tokens)
+        if not enabled:
+            return KimiK3DSparkPrefixCacheInspection(
+                "disabled",
+                0,
+                model_binding,
+                None,
+            )
+        entry = self._entry
+        miss = KimiK3DSparkPrefixCacheInspection(
+            "miss",
+            0,
+            model_binding,
+            None,
+        )
+        if entry is None:
+            return miss
+        if entry.model_binding != model_binding:
+            return miss
+        if (
+            entry.terminal_offset != len(entry.logical_prompt_tokens) - 1
+            or entry.terminal_offset <= 0
+        ):
+            raise ValueError("Kimi K3 paired prefix cache entry metadata is invalid")
+
+        if logical_prompt_tokens == entry.logical_prompt_tokens:
+            hit_kind: DSparkPrefixHitKind = "exact"
+        elif (
+            len(logical_prompt_tokens) > len(entry.logical_prompt_tokens)
+            and logical_prompt_tokens[: len(entry.logical_prompt_tokens)]
+            == entry.logical_prompt_tokens
+        ):
+            hit_kind = "append"
+        else:
+            return miss
+
+        return KimiK3DSparkPrefixCacheInspection(
+            hit_kind,
+            entry.terminal_offset,
+            model_binding,
+            entry,
+        )
+
+    def restore(
+        self,
+        inspection: KimiK3DSparkPrefixCacheInspection,
+        *,
+        evaluate: Callable[..., None],
+    ) -> KimiK3DSparkPrefixCacheLookup:
+        """Clone and validate both halves after the inspection was rank-agreed."""
+
+        if inspection.hit_kind in {"disabled", "miss"}:
+            self.clear()
+            return KimiK3DSparkPrefixCacheLookup(
+                inspection.hit_kind,
+                None,
+                None,
+                0,
+                inspection.model_binding,
+            )
+        entry = inspection.entry
+        if entry is None or entry is not self._entry:
+            self.clear()
+            raise ValueError("Kimi K3 paired prefix cache changed after inspection")
+
+        try:
+            self._validate_pair(
+                entry.target_cache,
+                entry.draft_context_cache,
+                expected_offset=entry.terminal_offset,
+                evaluate=evaluate,
+            )
+            target_cache, draft_context_cache = self._clone_pair(
+                entry.target_cache,
+                entry.draft_context_cache,
+                expected_offset=entry.terminal_offset,
+                evaluate=evaluate,
+            )
+        except Exception:
+            self.clear()
+            raise
+        return KimiK3DSparkPrefixCacheLookup(
+            inspection.hit_kind,
+            target_cache,
+            draft_context_cache,
+            entry.terminal_offset,
+            inspection.model_binding,
+        )
+
+    def lookup(
+        self,
+        logical_prompt_tokens: tuple[int, ...],
+        *,
+        model_binding: tuple[int, ...],
+        evaluate: Callable[..., None],
+    ) -> KimiK3DSparkPrefixCacheLookup:
+        """Single-rank convenience wrapper; distributed callers use two phases."""
+
+        inspection = self.inspect(
+            logical_prompt_tokens,
+            model_binding=model_binding,
+        )
+        return self.restore(inspection, evaluate=evaluate)
+
+    def stage(
+        self,
+        logical_prompt_tokens: tuple[int, ...],
+        target_cache: object,
+        draft_context_cache: object,
+        *,
+        model_binding: tuple[int, ...],
+        prefill_tps: float,
+        evaluate: Callable[..., None],
+    ) -> KimiK3DSparkPrefixCacheEntry:
+        self._staged_entry = None
+        self._validate_logical_prompt(logical_prompt_tokens)
+        terminal_offset = len(logical_prompt_tokens) - 1
+        if not math.isfinite(prefill_tps) or prefill_tps < 0:
+            raise ValueError("Kimi K3 paired prefix cache prefill rate is invalid")
+        self._validate_pair(
+            target_cache,
+            draft_context_cache,
+            expected_offset=terminal_offset,
+            evaluate=evaluate,
+        )
+        cloned_target, cloned_draft = self._clone_pair(
+            target_cache,
+            draft_context_cache,
+            expected_offset=terminal_offset,
+            evaluate=evaluate,
+        )
+        staged = KimiK3DSparkPrefixCacheEntry(
+            logical_prompt_tokens=logical_prompt_tokens,
+            target_cache=cloned_target,
+            draft_context_cache=cloned_draft,
+            terminal_offset=terminal_offset,
+            cold_prefill_tps=float(prefill_tps),
+            model_binding=model_binding,
+        )
+        self._staged_entry = staged
+        return staged
+
+    def commit(self, entry: KimiK3DSparkPrefixCacheEntry) -> None:
+        if entry is not self._staged_entry:
+            raise ValueError(
+                "Kimi K3 paired prefix cache commit requires its validated staged entry"
+            )
+        self._staged_entry = None
+        self._entry = entry
 
 
 def _validate_target_final_hidden_state(
@@ -4085,7 +4491,7 @@ class _BuiltKimiK3OrdinaryDecode:
 
 @dataclass
 class KimiK3DSparkRequestRuntime:
-    """One fresh target/draft cache pair for sequential greedy TP2 generation."""
+    """One rank-local target/draft cache pair for sequential greedy TP2 generation."""
 
     loaded: LoadedMlxDSpark
     target_model: object
@@ -4096,6 +4502,10 @@ class KimiK3DSparkRequestRuntime:
     terminal_token_ids: tuple[int, ...] = ()
     compact_greedy: bool = False
     confidence_request: DSparkConfidenceCaptureRequest | None = None
+    prefix_cache: KimiK3DSparkPrefixCache | None = None
+    prefix_hit_kind: DSparkPrefixHitKind = "miss"
+    restored_offset: int = 0
+    prefix_model_binding: tuple[int, ...] = ()
     evaluate: Callable[..., None] = mx.eval
     clock: Callable[[], float] = time.perf_counter
     _confidence_recorder: DSparkConfidenceRecorder | None = field(
@@ -4150,16 +4560,31 @@ class KimiK3DSparkRequestRuntime:
             raise DSparkConfigurationError(
                 "Kimi K3 fresh target cache does not match the target layers"
             )
+        if type(self.restored_offset) is not int or self.restored_offset < 0:
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark restored prefix offset is invalid"
+            )
+        if self.prefix_hit_kind in {"disabled", "miss"} and self.restored_offset != 0:
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark disabled cache or miss cannot restore a prefix"
+            )
+        if self.prefix_hit_kind in {"exact", "append"} and self.restored_offset <= 0:
+            raise DSparkConfigurationError(
+                "Kimi K3 DSpark cache hit requires a positive restored offset"
+            )
         target_cache_object: object = target_entries
         _validate_target_cache(
             target_cache_object,
-            expected_offset=0,
-            require_kda_state=False,
+            expected_offset=self.restored_offset,
+            require_kda_state=self.restored_offset > 0,
         )
-        if _context_cache_offset(self.draft.context_cache) != 0:
+        if _context_cache_offset(self.draft.context_cache) != self.restored_offset:
             raise DSparkConfigurationError(
-                "Kimi K3 DSpark request context must begin empty"
+                "Kimi K3 DSpark target and draft restored offsets disagree"
             )
+        if self.restored_offset > 0:
+            self.evaluate(*_target_cache_materialization_roots(target_cache_object))
+            _materialize_context_cache(self.draft.context_cache, self.evaluate)
 
     @classmethod
     def create(
@@ -4174,6 +4599,11 @@ class KimiK3DSparkRequestRuntime:
         terminal_token_ids: Sequence[int] = (),
         compact_greedy: bool = False,
         confidence_request: DSparkConfidenceCaptureRequest | None = None,
+        prefix_cache: KimiK3DSparkPrefixCache | None = None,
+        prefix_hit_kind: DSparkPrefixHitKind = "miss",
+        restored_offset: int = 0,
+        prefix_model_binding: tuple[int, ...] = (),
+        draft_context_cache: object | None = None,
         evaluate: Callable[..., None] = mx.eval,
     ) -> "KimiK3DSparkRequestRuntime":
         draft = loaded.new_request(
@@ -4181,6 +4611,8 @@ class KimiK3DSparkRequestRuntime:
             capture_confidence=(
                 loaded.config.confidence_capture is not None and collective.rank == 0
             ),
+            context_cache=draft_context_cache,
+            restored_offset=restored_offset,
         )
         return cls(
             loaded=loaded,
@@ -4192,6 +4624,10 @@ class KimiK3DSparkRequestRuntime:
             terminal_token_ids=tuple(terminal_token_ids),
             compact_greedy=compact_greedy,
             confidence_request=confidence_request,
+            prefix_cache=prefix_cache,
+            prefix_hit_kind=prefix_hit_kind,
+            restored_offset=restored_offset,
+            prefix_model_binding=prefix_model_binding,
             evaluate=evaluate,
         )
 
@@ -4229,6 +4665,52 @@ class KimiK3DSparkRequestRuntime:
         """Agree local success before a peer can enter another TP graph."""
 
         return self._agreed_operation(name, operation)
+
+    def _clear_prefix_cache(self) -> None:
+        if self.prefix_cache is not None:
+            with contextlib.suppress(Exception):
+                self.prefix_cache.clear()
+
+    def commit_prompt_prefix_cache(
+        self,
+        logical_prompt_tokens: tuple[int, ...],
+        *,
+        prefill_tps: float,
+    ) -> None:
+        """Stage and unanimously publish an L-1 pair before decode mutates it."""
+
+        prefix_cache = self.prefix_cache
+        if prefix_cache is None or self.prefix_hit_kind == "exact":
+            return
+        if self.prefix_hit_kind == "append":
+            # The active request already owns validated clones. Drop the old
+            # entry before making the replacement pair to cap retained overlap.
+            self._clear_prefix_cache()
+        try:
+            staged = self._agreed_operation(
+                "paired prefix cache staging",
+                lambda: prefix_cache.stage(
+                    logical_prompt_tokens,
+                    self.target_cache,
+                    self.draft.context_cache,
+                    model_binding=self.prefix_model_binding,
+                    prefill_tps=prefill_tps,
+                    evaluate=self.evaluate,
+                ),
+            )
+            for word in staged.contract_fingerprint:
+                if self.collective.agree_token(word) != word:
+                    raise DSparkDistributedStateError(
+                        "Kimi K3 DSpark paired prefix cache staging disagreed "
+                        "across ranks; request caches cannot continue"
+                    ) from None
+            self._agreed_operation(
+                "paired prefix cache commit",
+                lambda: prefix_cache.commit(staged),
+            )
+        except Exception:
+            self._clear_prefix_cache()
+            raise
 
     def agree_local_side_effect(self, name: str, operation: Callable[[], None]) -> None:
         """Agree a callback, preserving only a unanimous callback exception."""
@@ -4598,10 +5080,22 @@ class KimiK3DSparkRequestRuntime:
                     "Kimi K3 DSpark prompt/request contract disagreed across ranks; "
                     "no target TP graph was built"
                 ) from None
+        if self.restored_offset > total:
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark restored prefix exceeds the prompt boundary"
+            )
+        if self.prefix_hit_kind == "exact" and self.restored_offset != total:
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark exact prefix hit does not reach the prompt boundary"
+            )
+        if self.prefix_hit_kind == "append" and self.restored_offset >= total:
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark append prefix hit is not a strict extension"
+            )
         aux_prefill_forward: (
             Callable[[mx.array, object, tuple[int, ...]], object] | None
         ) = None
-        if self.loaded.config.aux_only_prefill:
+        if self.loaded.config.aux_only_prefill and self.restored_offset < total:
             # The opt-in bit is already bound into the agreed prompt digest, so
             # every rank enters this preflight or none do. Feature asymmetry is
             # agreed before a target graph capable of TP collective entry exists.
@@ -4609,11 +5103,11 @@ class KimiK3DSparkRequestRuntime:
                 "target auxiliary prompt prefill API preflight",
                 self._target_aux_prefill_forward,
             )
-        processed = 0
+        processed = self.restored_offset
         started = self.clock()
         self.agree_local_side_effect(
             "initial prompt progress publication",
-            lambda: progress_callback(0, total),
+            lambda: progress_callback(processed, total),
         )
         while processed < total:
             chunk_size = min(prefill_step_size, total - processed)
@@ -4719,7 +5213,16 @@ class KimiK3DSparkRequestRuntime:
             validate_complete_prompt,
         )
         elapsed = self.clock() - started
-        return (total / elapsed if elapsed > 0 else 0.0), total
+        newly_processed = total - self.restored_offset
+        if newly_processed == 0:
+            # Do not present the retained cold-prefill rate as exact-hit
+            # throughput. Wall-clock TTFT and zero newly processed tokens are
+            # the authoritative cache-hit measurements.
+            return 0.0, 0
+        return (
+            newly_processed / elapsed if elapsed > 0 else 0.0,
+            newly_processed,
+        )
 
     def _verification_plan(
         self,

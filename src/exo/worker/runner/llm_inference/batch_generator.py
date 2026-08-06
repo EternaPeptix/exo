@@ -40,6 +40,7 @@ from exo.worker.engines.mlx.generator.generate import (
     warmup_inference,
 )
 from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
+    KimiK3DSparkPrefixCache,
     LoadedKimiK3DSpark,
     LoadedMlxDSparkDual,
 )
@@ -137,6 +138,7 @@ class SequentialGenerator(Engine):
     event_sender: MpSender[Event]
     vision_processor: VisionProcessor | None = None
     dspark: LoadedKimiK3DSpark | None = None
+    dspark_prefix_cache: KimiK3DSparkPrefixCache | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -435,12 +437,21 @@ class SequentialGenerator(Engine):
             group=self.group,
             vision_processor=self.vision_processor,
             dspark=self.dspark,
+            dspark_prefix_cache=self.dspark_prefix_cache,
         )
 
     def close(self) -> None:
         if isinstance(self.dspark, LoadedMlxDSparkDual):
             self.dspark.close()
-        del self.model, self.tokenizer, self.group, self.dspark
+        if self.dspark_prefix_cache is not None:
+            self.dspark_prefix_cache.clear()
+        del (
+            self.model,
+            self.tokenizer,
+            self.group,
+            self.dspark,
+            self.dspark_prefix_cache,
+        )
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
         cache = run_prefill_for_request(

@@ -28,6 +28,7 @@ from .generator.kimi_k3_dspark import (
     KimiK3DSparkConfig,
     KimiK3DSparkDeploymentConfig,
     KimiK3DSparkDualConfig,
+    KimiK3DSparkPrefixCache,
     LoadedKimiK3DSpark,
     LoadedMlxDSpark,
     LoadedMlxDSparkDual,
@@ -56,6 +57,7 @@ def _dspark_checkpoint_contract(config: KimiK3DSparkConfig) -> dict[str, object]
         "config_sha256": config.config_sha256,
         "model_bytes": config.model_bytes,
         "model_sha256": config.model_sha256,
+        "prefix_cache": config.prefix_cache,
     }
     if config.packed_agreements:
         payload["packed_agreements"] = True
@@ -137,6 +139,7 @@ class MlxBuilder(Builder):
     vision_processor: VisionProcessor | None = None
     dspark_config: KimiK3DSparkDeploymentConfig | None = None
     dspark: LoadedKimiK3DSpark | None = None
+    dspark_prefix_cache: KimiK3DSparkPrefixCache | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
         self.group = initialize_mlx(bound_instance)
@@ -217,6 +220,10 @@ class MlxBuilder(Builder):
             if isinstance(self.dspark, LoadedMlxDSparkDual):
                 self.dspark.close()
         with contextlib.suppress(NameError, AttributeError):
+            if self.dspark_prefix_cache is not None:
+                self.dspark_prefix_cache.clear()
+            del self.dspark_prefix_cache
+        with contextlib.suppress(NameError, AttributeError):
             del self.inference_model
         with contextlib.suppress(NameError, AttributeError):
             del self.tokenizer
@@ -249,6 +256,13 @@ class MlxBuilder(Builder):
             )
 
         kv_prefix_cache = None if self.dspark is not None else KVPrefixCache(self.group)
+        if self.dspark is not None and bool(
+            getattr(getattr(self.dspark, "config", None), "prefix_cache", False)
+        ):
+            if self.dspark_prefix_cache is None:
+                self.dspark_prefix_cache = KimiK3DSparkPrefixCache()
+        else:
+            self.dspark_prefix_cache = None
 
         device_rank = 0 if self.group is None else self.group.rank()
         if self.dspark is not None and os.environ.get("EXO_NO_BATCH") != "1":
@@ -269,6 +283,7 @@ class MlxBuilder(Builder):
                 event_sender=self.event_sender,
                 vision_processor=vision_processor,
                 dspark=self.dspark,
+                dspark_prefix_cache=self.dspark_prefix_cache,
             )
         else:
             logger.info("using BatchGenerator")

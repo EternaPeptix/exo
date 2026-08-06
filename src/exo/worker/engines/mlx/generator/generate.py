@@ -70,7 +70,11 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSparkConfidenceCaptureConfig,
     DSparkDecodedToken,
     DSparkDistributedStateError,
+    DSparkPrefixHitKind,
     DSparkRoundTelemetry,
+    KimiK3DSparkPrefixCache,
+    KimiK3DSparkPrefixCacheInspection,
+    KimiK3DSparkPrefixCacheLookup,
     KimiK3DSparkProposerSelection,
     KimiK3DSparkRequestRuntime,
     LoadedKimiK3DSpark,
@@ -78,6 +82,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     dspark_confidence_capture_request,
     dspark_context_capacity_hint,
     dspark_decode_tokens,
+    kimi_k3_dspark_prefix_model_binding,
     select_loaded_mlx_dspark,
     validate_dspark_greedy_sampling,
 )
@@ -131,6 +136,7 @@ class _DSparkRequestSetup:
     is_pipeline: bool
     prompt_lookup_configuration: _PromptLookupConfig | None
     all_prompt_tokens: mx.array
+    logical_prompt_tokens: tuple[int, ...]
     caches: KVCacheType
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]]
     sampler: Callable[[mx.array], mx.array]
@@ -145,6 +151,9 @@ class _DSparkRequestSetup:
     prefill_step_size: int
     force_ordinary: bool
     packed_agreements: bool
+    prefix_hit_kind: DSparkPrefixHitKind
+    prefix_hit_length: int
+    is_exact_hit: bool
     runtime: KimiK3DSparkRequestRuntime
     proposer_selection: KimiK3DSparkProposerSelection | None
     fingerprint: tuple[int, ...]
@@ -1136,6 +1145,7 @@ def _validate_dspark_request(
     task: TextGenerationTaskParams,
     group: mx.distributed.Group | None,
     kv_prefix_cache: KVPrefixCache | None,
+    dspark_prefix_cache: KimiK3DSparkPrefixCache | None,
     vision_processor: VisionProcessor | None,
     is_pipeline: bool,
     prompt_lookup_configuration: _PromptLookupConfig | None,
@@ -1150,8 +1160,14 @@ def _validate_dspark_request(
         raise ValueError("Kimi K3 DSpark is bound to a different target model")
     if type(model).__module__ != "mlx_lm.models.kimi_k3":
         raise ValueError("Kimi K3 DSpark requires the exact MLX-LM Kimi K3 target")
-    if kv_prefix_cache is not None or task.use_prefix_cache:
-        raise ValueError("Kimi K3 DSpark requires a fresh per-request target cache")
+    if kv_prefix_cache is not None:
+        raise ValueError("Kimi K3 DSpark cannot use the generic KV prefix cache")
+    if dspark_prefix_cache is not None and not dspark.config.prefix_cache:
+        raise ValueError("Kimi K3 DSpark paired prefix cache was not enabled at load")
+    if task.use_prefix_cache and dspark_prefix_cache is None:
+        raise ValueError(
+            "Kimi K3 DSpark prefix reuse requires the paired cache load-time opt-in"
+        )
     if task.prefill_endpoint is not None:
         raise ValueError("Kimi K3 DSpark does not support remote prefill")
     if vision_processor is not None or task.images or task.image_hashes:
@@ -1188,6 +1204,11 @@ def _dspark_setup_fingerprint(
     force_ordinary: bool = False,
     ordinary_after_context: int = 0,
     packed_agreements: bool = False,
+    request_model_id: str = "",
+    prefix_cache_enabled: bool = False,
+    prefix_hit_kind: DSparkPrefixHitKind = "miss",
+    prefix_hit_length: int = 0,
+    prefix_model_binding: tuple[int, ...] = (),
     eos_token_ids: tuple[int, ...],
     banned_token_ids: tuple[int, ...],
     terminal_token_ids: tuple[int, ...],
@@ -1243,6 +1264,17 @@ def _dspark_setup_fingerprint(
     add_integer(ordinary_after_context, name="ordinary-after-context threshold")
     if packed_agreements:
         digest.update(b"exo-kimi-k3-dspark-packed-agreements/v1\0")
+    add_text(request_model_id, name="request model identity")
+    add_integer(int(prefix_cache_enabled), name="paired prefix cache flag")
+    hit_codes: dict[DSparkPrefixHitKind, int] = {
+        "disabled": 0,
+        "miss": 1,
+        "exact": 2,
+        "append": 3,
+    }
+    add_integer(hit_codes[prefix_hit_kind], name="paired prefix hit kind")
+    add_integer(prefix_hit_length, name="paired prefix restored offset")
+    add_tokens(prefix_model_binding, name="paired prefix model binding")
     add_tokens(eos_token_ids, name="EOS tokens")
     add_tokens(banned_token_ids, name="banned tokens")
     add_tokens(terminal_token_ids, name="terminal tokens")
@@ -1306,6 +1338,7 @@ def _dspark_setup_error_fingerprint(error: str | None) -> int:
 def _rank_agreed_dspark_setup(
     agreement: MlxRankAgreement,
     operation: Callable[[], _DSparkRequestSetup],
+    failure_cleanup: Callable[[], None] | None = None,
 ) -> _DSparkRequestSetup:
     """Run local setup, then fixed-order agree success and its full contract."""
 
@@ -1316,20 +1349,29 @@ def _rank_agreed_dspark_setup(
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
 
-    outcome = agreement.agree_stage_success(local_error is None)
-    error_fingerprint = agreement.agree_token(
-        _dspark_setup_error_fingerprint(local_error)
-    )
-    local_fingerprint = result.fingerprint if result is not None else (0, 0, 0, 0)
-    fingerprint_agreement = tuple(
-        agreement.agree_token(word) for word in local_fingerprint
-    )
+    try:
+        outcome = agreement.agree_stage_success(local_error is None)
+        error_fingerprint = agreement.agree_token(
+            _dspark_setup_error_fingerprint(local_error)
+        )
+        local_fingerprint = result.fingerprint if result is not None else (0, 0, 0, 0)
+        fingerprint_agreement = tuple(
+            agreement.agree_token(word) for word in local_fingerprint
+        )
+    except Exception:
+        if failure_cleanup is not None:
+            with contextlib.suppress(Exception):
+                failure_cleanup()
+        raise
 
     if (
         outcome is not True
         or error_fingerprint != 0
         or fingerprint_agreement != local_fingerprint
     ):
+        if failure_cleanup is not None:
+            with contextlib.suppress(Exception):
+                failure_cleanup()
         detail = (
             f"failed on every rank: {local_error}"
             if outcome is False and local_error is not None
@@ -1344,6 +1386,105 @@ def _rank_agreed_dspark_setup(
     return agreed_result
 
 
+def _rank_agreed_dspark_prefix_inspection(
+    agreement: MlxRankAgreement,
+    operation: Callable[[], KimiK3DSparkPrefixCacheInspection],
+    fingerprint: Callable[[KimiK3DSparkPrefixCacheInspection], tuple[int, ...]],
+    failure_cleanup: Callable[[], None],
+) -> tuple[KimiK3DSparkPrefixCacheInspection, tuple[int, ...]]:
+    """Agree the non-mutating cache outcome before either half is cloned."""
+
+    result: KimiK3DSparkPrefixCacheInspection | None = None
+    local_error: str | None = None
+    local_fingerprint = (0, 0, 0, 0)
+    try:
+        result = operation()
+        local_fingerprint = fingerprint(result)
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+    try:
+        outcome = agreement.agree_stage_success(local_error is None)
+        error_fingerprint = agreement.agree_token(
+            _dspark_setup_error_fingerprint(local_error)
+        )
+        fingerprint_agreement = tuple(
+            agreement.agree_token(word) for word in local_fingerprint
+        )
+    except Exception:
+        with contextlib.suppress(Exception):
+            failure_cleanup()
+        raise
+    if (
+        outcome is not True
+        or error_fingerprint != 0
+        or fingerprint_agreement != local_fingerprint
+    ):
+        with contextlib.suppress(Exception):
+            failure_cleanup()
+        raise DSparkDistributedStateError(
+            "Kimi K3 DSpark paired prefix inspection disagreed or failed across "
+            "ranks; no cache was cloned and no target TP graph was built"
+        ) from None
+    return cast(KimiK3DSparkPrefixCacheInspection, result), local_fingerprint
+
+
+def _rank_agreed_dspark_prefix_restore(
+    agreement: MlxRankAgreement,
+    operation: Callable[[], KimiK3DSparkPrefixCacheLookup],
+    inspection: KimiK3DSparkPrefixCacheInspection,
+    inspection_fingerprint: tuple[int, ...],
+    fingerprint: Callable[[KimiK3DSparkPrefixCacheLookup], tuple[int, ...]],
+    failure_cleanup: Callable[[], None],
+) -> KimiK3DSparkPrefixCacheLookup:
+    """Clone/materialize both halves, then agree validation before target TP."""
+
+    result: KimiK3DSparkPrefixCacheLookup | None = None
+    local_error: str | None = None
+    local_fingerprint = (0, 0, 0, 0)
+    try:
+        result = operation()
+        if (
+            result.hit_kind != inspection.hit_kind
+            or result.restored_offset != inspection.restored_offset
+            or result.model_binding != inspection.model_binding
+        ):
+            raise ValueError(
+                "paired prefix lookup does not match the agreed inspection"
+            )
+        local_fingerprint = fingerprint(result)
+        if local_fingerprint != inspection_fingerprint:
+            raise ValueError(
+                "paired prefix lookup fingerprint changed after inspection"
+            )
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+    try:
+        outcome = agreement.agree_stage_success(local_error is None)
+        error_fingerprint = agreement.agree_token(
+            _dspark_setup_error_fingerprint(local_error)
+        )
+        fingerprint_agreement = tuple(
+            agreement.agree_token(word) for word in local_fingerprint
+        )
+    except Exception:
+        with contextlib.suppress(Exception):
+            failure_cleanup()
+        raise
+    if (
+        outcome is not True
+        or error_fingerprint != 0
+        or fingerprint_agreement != local_fingerprint
+        or local_fingerprint != inspection_fingerprint
+    ):
+        with contextlib.suppress(Exception):
+            failure_cleanup()
+        raise DSparkDistributedStateError(
+            "Kimi K3 DSpark paired prefix restore disagreed or failed across "
+            "ranks; no target TP graph was built"
+        ) from None
+    return cast(KimiK3DSparkPrefixCacheLookup, result)
+
+
 def _prepare_dspark_request_setup(
     *,
     dspark: LoadedKimiK3DSpark,
@@ -1352,6 +1493,7 @@ def _prepare_dspark_request_setup(
     task: TextGenerationTaskParams,
     prompt: str,
     kv_prefix_cache: KVPrefixCache | None,
+    dspark_prefix_cache: KimiK3DSparkPrefixCache | None,
     group: mx.distributed.Group,
     vision_processor: VisionProcessor | None,
     agreement: MlxRankAgreement,
@@ -1371,6 +1513,7 @@ def _prepare_dspark_request_setup(
         task=task,
         group=group,
         kv_prefix_cache=kv_prefix_cache,
+        dspark_prefix_cache=dspark_prefix_cache,
         vision_processor=vision_processor,
         is_pipeline=is_pipeline,
         prompt_lookup_configuration=prompt_lookup_configuration,
@@ -1388,6 +1531,12 @@ def _prepare_dspark_request_setup(
         dspark,
         initial_prompt_tokens=len(all_prompt_tokens),
     )
+    raw_prompt_tokens = all_prompt_tokens.tolist()
+    if not isinstance(raw_prompt_tokens, list) or any(
+        type(token) is not int for token in raw_prompt_tokens
+    ):
+        raise ValueError("Kimi K3 DSpark prompt tokens must be one-dimensional")
+    logical_prompt_tokens = cast(tuple[int, ...], tuple(raw_prompt_tokens))
     anchor_token = int(all_prompt_tokens[-1].item())
     if not 0 <= anchor_token <= 0x7FFFFFFF:
         raise ValueError("Kimi K3 DSpark anchor token must fit non-negative int32")
@@ -1402,7 +1551,7 @@ def _prepare_dspark_request_setup(
     empty_logprobs = mx.array([], dtype=mx.float32)
 
     is_bench = task.bench
-    caches = make_kv_cache(model=model)
+    request_model_id = str(task.model)
     logits_processors = make_logits_processors(
         repetition_penalty=task.repetition_penalty,
         repetition_context_size=(
@@ -1457,12 +1606,92 @@ def _prepare_dspark_request_setup(
     )
     confidence_request = None
     if request_dspark.config.confidence_capture is not None:
-        raw_prompt_tokens = all_prompt_tokens.tolist()
-        if not isinstance(raw_prompt_tokens, list):
-            raise ValueError("Kimi K3 DSpark prompt tokens must be one-dimensional")
         confidence_request = dspark_confidence_capture_request(
             cast(list[int], raw_prompt_tokens)
         )
+    prefix_model_binding: tuple[int, ...] = ()
+    prefix_hit_kind: DSparkPrefixHitKind = "disabled"
+    prefix_hit_length = 0
+    draft_context_cache: object | None = None
+    active_prefix_cache = dspark_prefix_cache if task.use_prefix_cache else None
+
+    def setup_fingerprint(
+        hit_kind: DSparkPrefixHitKind,
+        restored_offset: int,
+        model_binding: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        return _dspark_setup_fingerprint(
+            prompt_tokens=all_prompt_tokens,
+            max_tokens=max_tokens,
+            prefill_step_size=prefill_step_size,
+            capacity_hint=capacity_hint,
+            verify_width=request_dspark.verify_width,
+            seed=seed,
+            is_bench=is_bench,
+            compact_greedy=compact_greedy,
+            generation_progress=generation_progress,
+            force_ordinary=force_ordinary,
+            ordinary_after_context=ordinary_after_context,
+            packed_agreements=request_dspark.config.packed_agreements,
+            request_model_id=request_model_id,
+            prefix_cache_enabled=active_prefix_cache is not None,
+            prefix_hit_kind=hit_kind,
+            prefix_hit_length=restored_offset,
+            prefix_model_binding=model_binding,
+            eos_token_ids=eos_token_ids,
+            banned_token_ids=banned_token_ids,
+            terminal_token_ids=terminal_token_ids,
+            stop_sequences=stop_sequences,
+            confidence_capture=request_dspark.config.confidence_capture,
+            target_route_top_k=request_dspark.target_route_top_k,
+            proposer_selection=proposer_selection,
+        )
+
+    caches: KVCacheType
+    if dspark_prefix_cache is None:
+        caches = make_kv_cache(model=model)
+    else:
+        prefix_model_binding = kimi_k3_dspark_prefix_model_binding(
+            request_dspark,
+            model,
+            request_model_id,
+        )
+        inspection, inspection_fingerprint = _rank_agreed_dspark_prefix_inspection(
+            agreement,
+            lambda: dspark_prefix_cache.inspect(
+                logical_prompt_tokens,
+                model_binding=prefix_model_binding,
+                enabled=task.use_prefix_cache,
+            ),
+            lambda inspected: setup_fingerprint(
+                inspected.hit_kind,
+                inspected.restored_offset,
+                inspected.model_binding,
+            ),
+            dspark_prefix_cache.clear,
+        )
+        lookup = _rank_agreed_dspark_prefix_restore(
+            agreement,
+            lambda: dspark_prefix_cache.restore(
+                inspection,
+                evaluate=request_dspark.evaluate,
+            ),
+            inspection,
+            inspection_fingerprint,
+            lambda restored: setup_fingerprint(
+                restored.hit_kind,
+                restored.restored_offset,
+                restored.model_binding,
+            ),
+            dspark_prefix_cache.clear,
+        )
+        prefix_hit_kind = lookup.hit_kind
+        prefix_hit_length = lookup.restored_offset
+        if lookup.target_cache is None:
+            caches = make_kv_cache(model=model)
+        else:
+            caches = cast(KVCacheType, lookup.target_cache)
+            draft_context_cache = lookup.draft_context_cache
     runtime = KimiK3DSparkRequestRuntime.create(
         request_dspark,
         model,
@@ -1473,32 +1702,22 @@ def _prepare_dspark_request_setup(
         terminal_token_ids=terminal_token_ids,
         compact_greedy=compact_greedy,
         confidence_request=confidence_request,
+        prefix_cache=active_prefix_cache,
+        prefix_hit_kind=prefix_hit_kind,
+        restored_offset=prefix_hit_length,
+        prefix_model_binding=prefix_model_binding,
+        draft_context_cache=draft_context_cache,
     )
-    fingerprint = _dspark_setup_fingerprint(
-        prompt_tokens=all_prompt_tokens,
-        max_tokens=max_tokens,
-        prefill_step_size=prefill_step_size,
-        capacity_hint=capacity_hint,
-        verify_width=request_dspark.verify_width,
-        seed=seed,
-        is_bench=is_bench,
-        compact_greedy=compact_greedy,
-        generation_progress=generation_progress,
-        force_ordinary=force_ordinary,
-        ordinary_after_context=ordinary_after_context,
-        packed_agreements=request_dspark.config.packed_agreements,
-        eos_token_ids=eos_token_ids,
-        banned_token_ids=banned_token_ids,
-        terminal_token_ids=terminal_token_ids,
-        stop_sequences=stop_sequences,
-        confidence_capture=request_dspark.config.confidence_capture,
-        target_route_top_k=request_dspark.target_route_top_k,
-        proposer_selection=proposer_selection,
+    fingerprint = setup_fingerprint(
+        prefix_hit_kind,
+        prefix_hit_length,
+        prefix_model_binding,
     )
     return _DSparkRequestSetup(
         is_pipeline=is_pipeline,
         prompt_lookup_configuration=prompt_lookup_configuration,
         all_prompt_tokens=all_prompt_tokens,
+        logical_prompt_tokens=logical_prompt_tokens,
         caches=caches,
         logits_processors=logits_processors,
         sampler=sampler,
@@ -1513,6 +1732,9 @@ def _prepare_dspark_request_setup(
         prefill_step_size=prefill_step_size,
         force_ordinary=force_ordinary,
         packed_agreements=request_dspark.config.packed_agreements,
+        prefix_hit_kind=prefix_hit_kind,
+        prefix_hit_length=prefix_hit_length,
+        is_exact_hit=prefix_hit_kind == "exact",
         runtime=runtime,
         proposer_selection=proposer_selection,
         fingerprint=fingerprint,
@@ -1649,6 +1871,7 @@ def mlx_generate(
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
     dspark: LoadedKimiK3DSpark | None = None,
+    dspark_prefix_cache: KimiK3DSparkPrefixCache | None = None,
 ) -> Generator[GenerationResponse]:
     dspark_setup: _DSparkRequestSetup | None = None
     if dspark is not None:
@@ -1669,10 +1892,14 @@ def mlx_generate(
                 task=task,
                 prompt=prompt,
                 kv_prefix_cache=kv_prefix_cache,
+                dspark_prefix_cache=dspark_prefix_cache,
                 group=group,
                 vision_processor=vision_processor,
                 agreement=agreement,
                 generation_progress=on_generation_token is not None,
+            ),
+            failure_cleanup=(
+                dspark_prefix_cache.clear if dspark_prefix_cache is not None else None
             ),
         )
         selection = dspark_setup.proposer_selection
@@ -1746,6 +1973,8 @@ def mlx_generate(
         kv_prefix_cache = None
         caches = dspark_setup.caches
         prompt_tokens = all_prompt_tokens
+        prefix_hit_length = dspark_setup.prefix_hit_length
+        is_exact_hit = dspark_setup.is_exact_hit
     elif kv_prefix_cache is None:
         caches = make_kv_cache(model=model)
         prompt_tokens = all_prompt_tokens
@@ -1841,6 +2070,10 @@ def mlx_generate(
                 stop_sequences=stop_sequences,
                 progress_callback=on_prefill_progress or (lambda _done, _total: None),
                 distributed_progress_callback=distributed_prompt_progress_callback,
+            )
+            dspark_runtime.commit_prompt_prefix_cache(
+                dspark_setup.logical_prompt_tokens,
+                prefill_tps=prefill_tps,
             )
         elif use_remote and task.prefill_endpoint is not None:
             try:

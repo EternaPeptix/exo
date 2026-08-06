@@ -6,12 +6,13 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import FrozenInstanceError, dataclass, field
+from dataclasses import FrozenInstanceError, dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from exo.worker.engines.mlx.generator import kimi_k3_dspark as dspark_module
@@ -51,6 +52,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     KimiK3DSparkCheckpointContract,
     KimiK3DSparkConfig,
     KimiK3DSparkDualConfig,
+    KimiK3DSparkPrefixCache,
     KimiK3DSparkRequestRuntime,
     KimiK3DSparkRoundEngine,
     LoadedMlxDSpark,
@@ -402,6 +404,36 @@ def test_dual_proposer_threshold_is_fixed_not_operator_tunable(
 
 
 @pytest.mark.parametrize(
+    ("old_prefix", "yarn_prefix"),
+    [(True, False), (False, True)],
+)
+def test_dual_config_rejects_asymmetric_prefix_cache_contract(
+    tmp_path: Path,
+    old_prefix: bool,
+    yarn_prefix: bool,
+) -> None:
+    config = _dual_config(tmp_path)
+
+    with pytest.raises(DSparkConfigurationError, match="runtime contracts disagree"):
+        KimiK3DSparkDualConfig(
+            old=replace(config.old, prefix_cache=old_prefix),
+            yarn=replace(config.yarn, prefix_cache=yarn_prefix),
+        )
+
+
+def test_dual_config_rejects_paired_prefix_even_when_both_configs_match(
+    tmp_path: Path,
+) -> None:
+    config = _dual_config(tmp_path)
+
+    with pytest.raises(DSparkConfigurationError, match="paired prefix cache"):
+        KimiK3DSparkDualConfig(
+            old=replace(config.old, prefix_cache=True),
+            yarn=replace(config.yarn, prefix_cache=True),
+        )
+
+
+@pytest.mark.parametrize(
     "missing_opt_in",
     [MLX_DSPARK_PROPOSER_ENV, MLX_REPLAYSSM_ENV],
 )
@@ -551,6 +583,83 @@ def test_aux_only_prefill_flag_is_strict_and_default_off(
     )
     assert config is not None
     assert config.aux_only_prefill
+
+
+@pytest.mark.parametrize("raw", ["", "2", "true", " 1", "1 "])
+def test_paired_prefix_cache_flag_is_strict_and_default_off(
+    tmp_path: Path,
+    raw: str,
+) -> None:
+    environment = _enabled_environment(tmp_path)
+    default_config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=environment,
+        checkpoint_validator=lambda _path: None,
+    )
+    assert default_config is not None
+    assert not default_config.prefix_cache
+
+    environment[DSPARK_PREFIX_CACHE_ENV] = raw
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{DSPARK_PREFIX_CACHE_ENV} must be 0 or 1",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+
+def test_paired_prefix_cache_requires_dspark_and_explicitly_enables(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{DSPARK_PREFIX_CACHE_ENV} requires {DSPARK_ENABLE_ENV}=1",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ={DSPARK_PREFIX_CACHE_ENV: "1"},
+        )
+
+    environment = _enabled_environment(tmp_path)
+    environment[DSPARK_PREFIX_CACHE_ENV] = "1"
+    config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=environment,
+        checkpoint_validator=lambda _path: None,
+    )
+    assert config is not None
+    assert config.prefix_cache
+
+
+def test_paired_prefix_cache_rejects_confidence_capture(
+    tmp_path: Path,
+) -> None:
+    environment = _enabled_environment(
+        tmp_path,
+        width=str(DSPARK_CONSERVATIVE_VERIFY_WIDTH),
+    )
+    environment.update(
+        {
+            DSPARK_PREFIX_CACHE_ENV: "1",
+            DSPARK_CONFIDENCE_JSONL_ENV: str(tmp_path / "capture.jsonl"),
+            DSPARK_CONFIDENCE_SESSION_ENV: "prefix-capture",
+        }
+    )
+
+    with pytest.raises(DSparkConfigurationError, match="confidence capture"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
 
 
 def test_width_three_requires_explicit_override_and_warns(tmp_path: Path) -> None:
@@ -995,6 +1104,7 @@ def _config(
     aux_only_prefill: bool = False,
     rank_zero_proposal_recovery: bool = False,
     packed_agreements: bool = False,
+    prefix_cache: bool = False,
 ) -> KimiK3DSparkConfig:
     assert width in (3, 8)
     return KimiK3DSparkConfig(
@@ -1004,6 +1114,7 @@ def _config(
         aux_only_prefill=aux_only_prefill,
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
         packed_agreements=packed_agreements,
+        prefix_cache=prefix_cache,
     )
 
 
@@ -4753,3 +4864,786 @@ def test_target_only_fallback_compact_greedy_matches_full_path(
     assert target_cache[0].offset == 6
     assert target_cache[1].speculative_width == 0
     assert target_cache[1].speculative_ready is False
+
+
+def _complete_prefix_pair(
+    logical_prompt_tokens: tuple[int, ...],
+) -> tuple[list[object], list[_FakeContextCache]]:
+    prompt_prefix = logical_prompt_tokens[:-1]
+    offset = len(prompt_prefix)
+    target_cache: list[object] = [
+        _FakeTargetCache(
+            offset=offset,
+            state=("history", tuple(prompt_prefix)),
+        ),
+        _FakeKDATargetCache(
+            cache=[
+                ("kda-conv", tuple(prompt_prefix)),
+                {"ssm": tuple(prompt_prefix)},
+            ]
+        ),
+    ]
+    context_cache = [
+        _FakeContextCache(offset, object(), object()),
+        _FakeContextCache(offset, object(), object()),
+    ]
+    return target_cache, context_cache
+
+
+def _target_with_prefix_identity(metadata_contract_sha256: str) -> SimpleNamespace:
+    target = SimpleNamespace()
+    setattr(
+        target,
+        dspark_module.RANK_LOCAL_METADATA_CONTRACT_MODEL_ATTRIBUTE,
+        metadata_contract_sha256,
+    )
+    setattr(
+        target,
+        dspark_module.RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_MODEL_ATTRIBUTE,
+        dspark_module.KIMI_K3_DSPARK_PREFIX_CACHE_MLX_LM_COMMIT,
+    )
+    return target
+
+
+def test_paired_prefix_binding_rejects_stale_target_checkpoint(
+    tmp_path: Path,
+) -> None:
+    first_target = _target_with_prefix_identity("1" * 64)
+    replacement_target = _target_with_prefix_identity("2" * 64)
+    loaded = LoadedMlxDSpark(
+        config=_config(tmp_path, 3, prefix_cache=True),
+        target_model=first_target,
+        drafter=object(),
+        proposer=object(),
+        target_route_top_k=8,
+    )
+    replacement_loaded = LoadedMlxDSpark(
+        config=loaded.config,
+        target_model=replacement_target,
+        drafter=object(),
+        proposer=object(),
+        target_route_top_k=8,
+    )
+    first_binding = dspark_module.kimi_k3_dspark_prefix_model_binding(
+        loaded,
+        first_target,
+        "kernelpool/Kimi-K3-2bit-UVMAX",
+    )
+    replacement_binding = dspark_module.kimi_k3_dspark_prefix_model_binding(
+        replacement_loaded,
+        replacement_target,
+        "kernelpool/Kimi-K3-2bit-UVMAX",
+    )
+    assert first_binding != replacement_binding
+
+    prompt = (1, 2, 3, 4)
+    target_cache, context_cache = _complete_prefix_pair(prompt)
+    cache = KimiK3DSparkPrefixCache()
+    cache.commit(
+        cache.stage(
+            prompt,
+            target_cache,
+            context_cache,
+            model_binding=first_binding,
+            prefill_tps=1.0,
+            evaluate=lambda *_values: None,
+        )
+    )
+
+    lookup = cache.lookup(
+        prompt,
+        model_binding=replacement_binding,
+        evaluate=lambda *_values: None,
+    )
+
+    assert lookup.hit_kind == "miss"
+    assert lookup.target_cache is None
+    assert lookup.draft_context_cache is None
+    assert cache.entry is None
+
+
+def test_paired_prefix_binding_retains_draft_checkpoint_hashes(
+    tmp_path: Path,
+) -> None:
+    target = _target_with_prefix_identity("1" * 64)
+    old = LoadedMlxDSpark(
+        config=_config(tmp_path, 3, prefix_cache=True),
+        target_model=target,
+        drafter=object(),
+        proposer=object(),
+        target_route_top_k=8,
+    )
+    yarn = LoadedMlxDSpark(
+        config=KimiK3DSparkConfig(
+            checkpoint_path=tmp_path,
+            verify_width=3,
+            round_telemetry=False,
+            revision=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_REVISION,
+            config_sha256=(dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256),
+            model_sha256=dspark_module.RADIXARK_KIMI_K3_DSPARK_YARN_MODEL_SHA256,
+            prefix_cache=True,
+        ),
+        target_model=target,
+        drafter=object(),
+        proposer=object(),
+        target_route_top_k=8,
+    )
+
+    old_binding = dspark_module.kimi_k3_dspark_prefix_model_binding(
+        old,
+        target,
+        "kernelpool/Kimi-K3-2bit-UVMAX",
+    )
+    yarn_binding = dspark_module.kimi_k3_dspark_prefix_model_binding(
+        yarn,
+        target,
+        "kernelpool/Kimi-K3-2bit-UVMAX",
+    )
+
+    assert old_binding != yarn_binding
+
+
+def test_paired_prefix_binding_requires_golden_target_identity(
+    tmp_path: Path,
+) -> None:
+    target = SimpleNamespace()
+    loaded = LoadedMlxDSpark(
+        config=_config(tmp_path, 3, prefix_cache=True),
+        target_model=target,
+        drafter=object(),
+        proposer=object(),
+    )
+
+    with pytest.raises(DSparkConfigurationError, match="metadata contract digest"):
+        dspark_module.kimi_k3_dspark_prefix_model_binding(
+            loaded,
+            target,
+            "kernelpool/Kimi-K3-2bit-UVMAX",
+        )
+
+    setattr(
+        target,
+        dspark_module.RANK_LOCAL_METADATA_CONTRACT_MODEL_ATTRIBUTE,
+        "1" * 64,
+    )
+    setattr(
+        target,
+        dspark_module.RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_MODEL_ATTRIBUTE,
+        "unreviewed-runtime",
+    )
+    with pytest.raises(DSparkConfigurationError, match="pinned golden MLX-LM"):
+        dspark_module.kimi_k3_dspark_prefix_model_binding(
+            loaded,
+            target,
+            "kernelpool/Kimi-K3-2bit-UVMAX",
+        )
+
+
+def _restored_prefix_runtime(
+    tmp_path: Path,
+    *,
+    target_model: _FakeRuntimeTarget,
+    proposer: _FakeMlxProposer,
+    target_cache: object,
+    context_cache: object,
+    agreement: _FakeAgreement,
+    prefix_cache: KimiK3DSparkPrefixCache | None,
+    hit_kind: Literal["miss", "exact", "append"],
+    restored_offset: int,
+    model_binding: tuple[int, ...] = (1, 2, 3, 4),
+) -> KimiK3DSparkRequestRuntime:
+    loaded = LoadedMlxDSpark(
+        config=_config(
+            tmp_path,
+            3,
+            prefix_cache=prefix_cache is not None,
+        ),
+        target_model=target_model,
+        drafter=object(),
+        proposer=proposer,
+        evaluate=lambda *_values: None,
+    )
+    return KimiK3DSparkRequestRuntime(
+        loaded=loaded,
+        target_model=target_model,
+        target_cache=target_cache,
+        draft=MlxDSparkRequestDraft(
+            proposer=proposer,
+            context_cache=context_cache,
+            verify_width=3,
+            evaluate=lambda *_values: None,
+        ),
+        collective=agreement,
+        prefix_cache=prefix_cache,
+        prefix_hit_kind=hit_kind,
+        restored_offset=restored_offset,
+        prefix_model_binding=model_binding,
+        evaluate=lambda *_values: None,
+    )
+
+
+def _patch_deterministic_prompt_forward(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: KimiK3DSparkRequestRuntime,
+    history: list[int],
+    graph_chunks: list[tuple[int, ...]],
+) -> None:
+    def build(
+        chunk: _FakePromptBatch,
+        *,
+        initial_offset: int,
+        speculative_width: int | None = None,
+    ) -> _FakePendingForward:
+        assert speculative_width is None
+        assert initial_offset == len(history)
+        values = tuple(chunk.values)
+        graph_chunks.append(values)
+        history.extend(values)
+        entries = cast(list[object], runtime.target_cache)
+        mla_cache = cast(_FakeTargetCache, entries[0])
+        kda_cache = cast(_FakeKDATargetCache, entries[1])
+        mla_cache.offset = len(history)
+        mla_cache.state = ("history", tuple(history))
+        kda_cache.cache = [
+            ("kda-conv", tuple(history)),
+            {"ssm": tuple(history)},
+        ]
+        return _FakePendingForward(
+            SimpleNamespace(
+                aux_hidden_states=tuple(
+                    _FakeHidden((1, len(values), 7168), f"tap-{index}")
+                    for index in range(5)
+                )
+            )
+        )
+
+    monkeypatch.setattr(runtime, "_build_forward_with_taps", build)
+    monkeypatch.setattr(dspark_module.mx, "clear_cache", lambda: None, raising=False)
+
+
+@pytest.mark.parametrize(
+    ("target_offset", "draft_offset", "match"),
+    [
+        (0, 0, "offset 3"),
+        (2, 2, "offset 3"),
+        (3, 2, "target and draft offsets disagree"),
+    ],
+    ids=["zero", "nonterminal", "target-draft-mismatch"],
+)
+def test_paired_prefix_stage_rejects_invalid_terminal_boundaries(
+    target_offset: int,
+    draft_offset: int,
+    match: str,
+) -> None:
+    prompt = (1, 2, 3, 4)
+    target_cache: list[object] = [
+        _FakeTargetCache(target_offset, ("state",)),
+        _FakeKDATargetCache([("conv",), {"ssm": "state"}]),
+    ]
+    context_cache = [
+        _FakeContextCache(draft_offset, object(), object()),
+        _FakeContextCache(draft_offset, object(), object()),
+    ]
+
+    with pytest.raises(ValueError, match=match):
+        KimiK3DSparkPrefixCache().stage(
+            prompt,
+            target_cache,
+            context_cache,
+            model_binding=(1, 2, 3, 4),
+            prefill_tps=1.0,
+            evaluate=lambda *_values: None,
+        )
+
+
+def test_disabled_prefix_inspection_is_nonmutating_then_restore_clears() -> None:
+    prompt = (1, 2, 3, 4)
+    target_cache, context_cache = _complete_prefix_pair(prompt)
+    cache = KimiK3DSparkPrefixCache()
+    cache.commit(
+        cache.stage(
+            prompt,
+            target_cache,
+            context_cache,
+            model_binding=(1, 2, 3, 4),
+            prefill_tps=1.0,
+            evaluate=lambda *_values: None,
+        )
+    )
+    retained = cache.entry
+
+    inspection = cache.inspect(
+        prompt,
+        model_binding=(1, 2, 3, 4),
+        enabled=False,
+    )
+    assert inspection.hit_kind == "disabled"
+    assert cache.entry is retained
+
+    lookup = cache.restore(inspection, evaluate=lambda *_values: None)
+    assert lookup.hit_kind == "disabled"
+    assert lookup.target_cache is None
+    assert cache.entry is None
+
+
+def test_paired_prefix_cache_exact_repeat_clones_both_halves_without_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt = (1, 2, 3, 4)
+    target_cache, context_cache = _complete_prefix_pair(prompt)
+    cache = KimiK3DSparkPrefixCache()
+    staged = cache.stage(
+        prompt,
+        target_cache,
+        context_cache,
+        model_binding=(1, 2, 3, 4),
+        prefill_tps=12.5,
+        evaluate=lambda *_values: None,
+    )
+    cache.commit(staged)
+    retained_entry = cache.entry
+    assert retained_entry is not None
+
+    lookup = cache.lookup(
+        prompt,
+        model_binding=(1, 2, 3, 4),
+        evaluate=lambda *_values: None,
+    )
+    assert lookup.hit_kind == "exact"
+    assert lookup.restored_offset == 3
+    assert lookup.target_cache is not retained_entry.target_cache
+    assert lookup.draft_context_cache is not retained_entry.draft_context_cache
+    assert staged.logical_prompt_tokens == prompt
+    assert not hasattr(staged, "prompt")
+    assert all(type(token) is int for token in staged.logical_prompt_tokens)
+
+    target_model = _FakeRuntimeTarget()
+    proposer = _FakeMlxProposer(3, [], [[11, 12]])
+    runtime = _restored_prefix_runtime(
+        tmp_path,
+        target_model=target_model,
+        proposer=proposer,
+        target_cache=lookup.target_cache,
+        context_cache=lookup.draft_context_cache,
+        agreement=_FakeAgreement([]),
+        prefix_cache=cache,
+        hit_kind="exact",
+        restored_offset=lookup.restored_offset,
+    )
+    graph_chunks: list[tuple[int, ...]] = []
+    _patch_deterministic_prompt_forward(
+        monkeypatch,
+        runtime,
+        [1, 2, 3],
+        graph_chunks,
+    )
+    progress: list[tuple[int, int]] = []
+    prefill_tps, newly_processed = runtime.seed_prompt(
+        cast(mx.array, cast(object, _FakePromptArray(prompt[:-1]))),
+        prefill_step_size=8,
+        max_tokens=16,
+        stop_sequences=(),
+        progress_callback=lambda done, total: progress.append((done, total)),
+        distributed_progress_callback=None,
+    )
+    runtime.commit_prompt_prefix_cache(prompt, prefill_tps=prefill_tps)
+
+    assert graph_chunks == []
+    assert newly_processed == 0
+    assert prefill_tps == 0.0
+    assert progress == [(3, 3)]
+    assert cache.entry is retained_entry
+
+
+def test_strict_append_reuses_l_minus_one_and_matches_cold_prefill_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_prompt = (1, 2, 3, 4)
+    extended_prompt = (1, 2, 3, 4, 5, 6)
+    base_target, base_context = _complete_prefix_pair(base_prompt)
+    cache = KimiK3DSparkPrefixCache()
+    cache.commit(
+        cache.stage(
+            base_prompt,
+            base_target,
+            base_context,
+            model_binding=(1, 2, 3, 4),
+            prefill_tps=9.0,
+            evaluate=lambda *_values: None,
+        )
+    )
+    lookup = cache.lookup(
+        extended_prompt,
+        model_binding=(1, 2, 3, 4),
+        evaluate=lambda *_values: None,
+    )
+    assert lookup.hit_kind == "append"
+    assert lookup.restored_offset == len(base_prompt) - 1
+
+    append_model = _FakeRuntimeTarget()
+    append_proposer = _FakeMlxProposer(3, [], [[11, 12]])
+    append_runtime = _restored_prefix_runtime(
+        tmp_path,
+        target_model=append_model,
+        proposer=append_proposer,
+        target_cache=lookup.target_cache,
+        context_cache=lookup.draft_context_cache,
+        agreement=_FakeAgreement([]),
+        prefix_cache=cache,
+        hit_kind="append",
+        restored_offset=lookup.restored_offset,
+    )
+    append_history = list(base_prompt[:-1])
+    append_chunks: list[tuple[int, ...]] = []
+    _patch_deterministic_prompt_forward(
+        monkeypatch,
+        append_runtime,
+        append_history,
+        append_chunks,
+    )
+    append_tps, append_work = append_runtime.seed_prompt(
+        cast(mx.array, cast(object, _FakePromptArray(extended_prompt[:-1]))),
+        prefill_step_size=8,
+        max_tokens=16,
+        stop_sequences=(),
+        progress_callback=lambda _done, _total: None,
+        distributed_progress_callback=None,
+    )
+    append_runtime.commit_prompt_prefix_cache(
+        extended_prompt,
+        prefill_tps=append_tps,
+    )
+
+    cold_target: list[object] = [_FakeTargetCache(), _FakeKDATargetCache()]
+    cold_context = [_FakeContextCache(), _FakeContextCache()]
+    cold_model = _FakeRuntimeTarget()
+    cold_proposer = _FakeMlxProposer(3, [], [[11, 12]])
+    cold_runtime = _restored_prefix_runtime(
+        tmp_path,
+        target_model=cold_model,
+        proposer=cold_proposer,
+        target_cache=cold_target,
+        context_cache=cold_context,
+        agreement=_FakeAgreement([]),
+        prefix_cache=None,
+        hit_kind="miss",
+        restored_offset=0,
+    )
+    cold_history: list[int] = []
+    cold_chunks: list[tuple[int, ...]] = []
+    _patch_deterministic_prompt_forward(
+        monkeypatch,
+        cold_runtime,
+        cold_history,
+        cold_chunks,
+    )
+    _cold_tps, cold_work = cold_runtime.seed_prompt(
+        cast(mx.array, cast(object, _FakePromptArray(extended_prompt[:-1]))),
+        prefill_step_size=8,
+        max_tokens=16,
+        stop_sequences=(),
+        progress_callback=lambda _done, _total: None,
+        distributed_progress_callback=None,
+    )
+
+    assert append_chunks == [(4, 5)]
+    assert cold_chunks == [(1, 2, 3, 4, 5)]
+    assert append_work == 2
+    assert cold_work == 5
+    assert append_history == cold_history == list(extended_prompt[:-1])
+    assert append_runtime.target_cache == cold_runtime.target_cache
+    assert [entry.length for entry in append_runtime.draft.context_cache] == [
+        entry.length for entry in cold_runtime.draft.context_cache
+    ]
+    assert cache.entry is not None
+    assert cache.entry.logical_prompt_tokens == extended_prompt
+
+
+def test_paired_prefix_cache_mismatch_eviction_and_validation_fail_closed() -> None:
+    first_prompt = (1, 2, 3, 4)
+    second_prompt = (5, 6, 7, 8)
+    cache = KimiK3DSparkPrefixCache()
+    first_target, first_context = _complete_prefix_pair(first_prompt)
+    first_entry = cache.stage(
+        first_prompt,
+        first_target,
+        first_context,
+        model_binding=(1, 2, 3, 4),
+        prefill_tps=1.0,
+        evaluate=lambda *_values: None,
+    )
+    cache.commit(first_entry)
+
+    mismatch = cache.lookup(
+        first_prompt,
+        model_binding=(4, 3, 2, 1),
+        evaluate=lambda *_values: None,
+    )
+    assert mismatch.hit_kind == "miss"
+    assert cache.entry is None
+
+    with pytest.raises(ValueError, match="validated staged entry"):
+        cache.commit(first_entry)
+    cache.commit(
+        cache.stage(
+            first_prompt,
+            first_target,
+            first_context,
+            model_binding=(1, 2, 3, 4),
+            prefill_tps=1.0,
+            evaluate=lambda *_values: None,
+        )
+    )
+    second_target, second_context = _complete_prefix_pair(second_prompt)
+    cache.commit(
+        cache.stage(
+            second_prompt,
+            second_target,
+            second_context,
+            model_binding=(1, 2, 3, 4),
+            prefill_tps=2.0,
+            evaluate=lambda *_values: None,
+        )
+    )
+    assert cache.entry is not None
+    assert cache.entry.logical_prompt_tokens == second_prompt
+
+    corrupted_target = cast(list[object], cache.entry.target_cache)
+    cast(_FakeTargetCache, corrupted_target[0]).offset -= 1
+    with pytest.raises(ValueError, match="offset"):
+        cache.lookup(
+            second_prompt,
+            model_binding=(1, 2, 3, 4),
+            evaluate=lambda *_values: None,
+        )
+    assert cache.entry is None
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        (1, 2, 3),
+        (1, 2, 9, 4),
+        (8, 9, 10, 11),
+    ],
+    ids=["shortened", "edited", "unrelated"],
+)
+def test_paired_prefix_non_append_mismatch_clears_and_returns_cold(
+    query: tuple[int, ...],
+) -> None:
+    prompt = (1, 2, 3, 4)
+    target_cache, context_cache = _complete_prefix_pair(prompt)
+    cache = KimiK3DSparkPrefixCache()
+    cache.commit(
+        cache.stage(
+            prompt,
+            target_cache,
+            context_cache,
+            model_binding=(1, 2, 3, 4),
+            prefill_tps=1.0,
+            evaluate=lambda *_values: None,
+        )
+    )
+
+    lookup = cache.lookup(
+        query,
+        model_binding=(1, 2, 3, 4),
+        evaluate=lambda *_values: None,
+    )
+
+    assert lookup.hit_kind == "miss"
+    assert lookup.restored_offset == 0
+    assert lookup.target_cache is None
+    assert lookup.draft_context_cache is None
+    assert cache.entry is None
+
+
+@dataclass
+class _TracingAgreement(_FakeAgreement):
+    trace: list[str] = field(default_factory=list)
+
+    def agree_stage_success(self, local_success: bool) -> bool | None:
+        self.trace.append(f"agree_stage:{int(local_success)}")
+        return super().agree_stage_success(local_success)
+
+    def agree_token(self, local_token: int | None) -> int | None:
+        self.trace.append("agree_token")
+        return super().agree_token(local_token)
+
+
+class _TracingPrefixCache(KimiK3DSparkPrefixCache):
+    def __init__(self, trace: list[str]) -> None:
+        super().__init__()
+        self.trace = trace
+
+    def stage(self, *args: object, **kwargs: object) -> object:
+        self.trace.append("stage")
+        return super().stage(*args, **kwargs)  # type: ignore[arg-type]
+
+    def commit(self, entry: object) -> None:
+        self.trace.append("commit")
+        super().commit(entry)  # type: ignore[arg-type]
+
+
+def test_paired_prefix_commit_order_and_peer_failure_roll_back(
+    tmp_path: Path,
+) -> None:
+    prompt = (1, 2, 3, 4)
+    target_cache, context_cache = _complete_prefix_pair(prompt)
+    trace: list[str] = []
+    cache = _TracingPrefixCache(trace)
+    agreement = _TracingAgreement(
+        [],
+        stage_outcomes=[True, None],
+        trace=trace,
+    )
+    runtime = _restored_prefix_runtime(
+        tmp_path,
+        target_model=_FakeRuntimeTarget(),
+        proposer=_FakeMlxProposer(3, [], [[11, 12]]),
+        target_cache=target_cache,
+        context_cache=context_cache,
+        agreement=agreement,
+        prefix_cache=cache,
+        hit_kind="append",
+        restored_offset=len(prompt) - 1,
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="commit"):
+        runtime.commit_prompt_prefix_cache(prompt, prefill_tps=1.0)
+
+    assert trace[0] == "stage"
+    assert "commit" in trace
+    assert trace.index("stage") < trace.index("agree_token") < trace.index("commit")
+    assert trace[-2:] == ["agree_stage:1", "agree_token"]
+    assert cache.entry is None
+
+
+def test_paired_prefix_stage_error_clears_prior_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt = (1, 2, 3, 4)
+    target_cache, context_cache = _complete_prefix_pair(prompt)
+    cache = KimiK3DSparkPrefixCache()
+    cache.commit(
+        cache.stage(
+            prompt,
+            target_cache,
+            context_cache,
+            model_binding=(1, 2, 3, 4),
+            prefill_tps=1.0,
+            evaluate=lambda *_values: None,
+        )
+    )
+    runtime = _restored_prefix_runtime(
+        tmp_path,
+        target_model=_FakeRuntimeTarget(),
+        proposer=_FakeMlxProposer(3, [], [[11, 12]]),
+        target_cache=target_cache,
+        context_cache=context_cache,
+        agreement=_FakeAgreement([]),
+        prefix_cache=cache,
+        hit_kind="append",
+        restored_offset=len(prompt) - 1,
+    )
+    monkeypatch.setattr(
+        cache,
+        "stage",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected clone failure")
+        ),
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="staging"):
+        runtime.commit_prompt_prefix_cache(prompt, prefill_tps=1.0)
+    assert cache.entry is None
+
+
+def test_real_mlx_paired_prefix_clone_mutation_preserves_saved_arrays() -> None:
+    from mlx_lm.models.cache import ArraysCache, KVCache
+    from mlx_lm.models.kimi_k3_dspark import KimiK3DSparkContextCache
+
+    prompt = (1, 2, 3, 4)
+    kv_cache = KVCache()
+    initial_keys = mx.arange(6, dtype=mx.float32).reshape(1, 1, 3, 2)
+    initial_values = initial_keys + 10
+    kv_cache.update_and_fetch(initial_keys, initial_values)
+    kda_cache = ArraysCache(2)
+    kda_cache.cache = [
+        mx.arange(4, dtype=mx.float32).reshape(1, 4),
+        mx.arange(4, dtype=mx.float32).reshape(1, 4) + 20,
+    ]
+    target_cache = [kv_cache, kda_cache]
+    draft_context = [
+        KimiK3DSparkContextCache(capacity_hint=8, step=4),
+        KimiK3DSparkContextCache(capacity_hint=8, step=4),
+    ]
+    for context in draft_context:
+        context.append(initial_keys, initial_values)
+    mx.eval(
+        initial_keys,
+        initial_values,
+        *kda_cache.cache,
+        *(context.keys for context in draft_context),
+        *(context.values for context in draft_context),
+    )
+
+    cache = KimiK3DSparkPrefixCache()
+    cache.commit(
+        cache.stage(
+            prompt,
+            target_cache,
+            draft_context,
+            model_binding=(1, 2, 3, 4),
+            prefill_tps=1.0,
+            evaluate=mx.eval,
+        )
+    )
+    retained = cache.entry
+    assert retained is not None
+    retained_target = cast(list[object], retained.target_cache)
+    retained_draft = cast(
+        list[KimiK3DSparkContextCache],
+        retained.draft_context_cache,
+    )
+    retained_bytes = (
+        np.asarray(cast(KVCache, retained_target[0]).keys).tobytes(),
+        np.asarray(cast(ArraysCache, retained_target[1]).cache[0]).tobytes(),
+        np.asarray(retained_draft[0].keys).tobytes(),
+    )
+
+    lookup = cache.lookup(
+        prompt,
+        model_binding=(1, 2, 3, 4),
+        evaluate=mx.eval,
+    )
+    active_target = cast(list[object], lookup.target_cache)
+    active_draft = cast(
+        list[KimiK3DSparkContextCache],
+        lookup.draft_context_cache,
+    )
+    extra_keys = mx.full((1, 1, 1, 2), 99, dtype=mx.float32)
+    extra_values = mx.full((1, 1, 1, 2), 199, dtype=mx.float32)
+    cast(KVCache, active_target[0]).update_and_fetch(extra_keys, extra_values)
+    active_kda = cast(ArraysCache, active_target[1])
+    active_kda.cache[0] = active_kda.cache[0] + 100
+    for context in active_draft:
+        context.append(extra_keys, extra_values)
+    mx.eval(
+        cast(KVCache, active_target[0]).keys,
+        *active_kda.cache,
+        *(context.keys for context in active_draft),
+    )
+
+    assert cast(KVCache, active_target[0]).offset == 4
+    assert all(context.length == 4 for context in active_draft)
+    assert cast(KVCache, retained_target[0]).offset == 3
+    assert all(context.length == 3 for context in retained_draft)
+    assert retained_bytes == (
+        np.asarray(cast(KVCache, retained_target[0]).keys).tobytes(),
+        np.asarray(cast(ArraysCache, retained_target[1]).cache[0]).tobytes(),
+        np.asarray(retained_draft[0].keys).tobytes(),
+    )

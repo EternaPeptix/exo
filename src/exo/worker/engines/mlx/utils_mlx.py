@@ -69,6 +69,10 @@ from exo.worker.engines.mlx.auto_parallel import (
 )
 from exo.worker.engines.mlx.rank_local_checkpoint import (
     RANK_LOCAL_CHECKPOINT_ENV,
+    RANK_LOCAL_METADATA_CONTRACT_CONFIG_KEY,
+    RANK_LOCAL_METADATA_CONTRACT_MODEL_ATTRIBUTE,
+    RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_CONFIG_KEY,
+    RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_MODEL_ATTRIBUTE,
     SUPPORTED_MODEL_ID,
     PreparedRankLocalLoad,
     load_preflighted_rank_local_model,
@@ -444,6 +448,12 @@ def shard_and_load(
                     "vocab_parallel_head": loaded.config.get(
                         "_rank_local_vocab_parallel_head"
                     ),
+                    "metadata_contract_sha256": loaded.config.get(
+                        RANK_LOCAL_METADATA_CONTRACT_CONFIG_KEY
+                    ),
+                    "runtime_mlx_lm_commit": loaded.config.get(
+                        RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_CONFIG_KEY
+                    ),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -460,6 +470,28 @@ def shard_and_load(
             # Keep EXO's normal tensor-inference dependency patch, but do not call
             # tensor_auto_parallel because that would shard the model a second time.
             model = _patch_rank_local_tensor_model_once(model_value)
+            metadata_contract = rank_local.config.get(
+                RANK_LOCAL_METADATA_CONTRACT_CONFIG_KEY
+            )
+            runtime_mlx_lm_commit = rank_local.config.get(
+                RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_CONFIG_KEY
+            )
+            if not isinstance(metadata_contract, str) or not isinstance(
+                runtime_mlx_lm_commit, str
+            ):
+                raise TypeError(
+                    "rank-local loader did not expose immutable target identity"
+                )
+            setattr(
+                model,
+                RANK_LOCAL_METADATA_CONTRACT_MODEL_ATTRIBUTE,
+                metadata_contract,
+            )
+            setattr(
+                model,
+                RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_MODEL_ATTRIBUTE,
+                runtime_mlx_lm_commit,
+            )
             tokenizer = get_tokenizer(rank_local.checkpoint_path, shard_metadata)
             return model, tokenizer, rank_local.config
 
@@ -479,6 +511,12 @@ def shard_and_load(
                     ),
                     "vocab_parallel_head": config.get(
                         "_rank_local_vocab_parallel_head"
+                    ),
+                    "metadata_contract_sha256": config.get(
+                        RANK_LOCAL_METADATA_CONTRACT_CONFIG_KEY
+                    ),
+                    "runtime_mlx_lm_commit": config.get(
+                        RANK_LOCAL_RUNTIME_MLX_LM_COMMIT_CONFIG_KEY
                     ),
                 },
                 sort_keys=True,
