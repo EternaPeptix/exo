@@ -246,9 +246,7 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
 
 
 def test_execution_runtime_pin_matches_top8_kcut_candidate():
-    assert loader.RUNTIME_MLX_LM_COMMIT == (
-        "bda4ae8b0fa67124bdf7f84bcd0715e7e284b558"
-    )
+    assert loader.RUNTIME_MLX_LM_COMMIT == ("bda4ae8b0fa67124bdf7f84bcd0715e7e284b558")
     assert loader.MLX_LM_KIMI_K3_SHA256 == (
         "6d41a3743cb62af9c024997172034472c046a4f72ae154882fcd2b1cee72c4de"
     )
@@ -382,6 +380,13 @@ def test_metadata_digest_must_agree_across_ranks():
         loader._agree_metadata_contract(_FakeMx(peer), FakeGroup(), local)
 
 
+def test_dspark_runtime_source_must_agree_across_ranks():
+    local = "33" * 32
+    peer = list(bytes.fromhex("44" * 32))
+    with pytest.raises(loader.RankLocalLoadError, match="DSpark.*differs across"):
+        loader._agree_dspark_runtime_source(_FakeMx(peer), FakeGroup(), local)
+
+
 def test_runtime_source_verification_uses_execution_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -431,7 +436,7 @@ def test_runtime_source_verification_uses_execution_pin(
     monkeypatch.setitem(sys.modules, generate.__name__, generate)
     monkeypatch.setattr(loader, "MLX_LM_GENERATE_SHA256", generate_digest)
 
-    loader._verify_runtime_source()
+    assert loader._verify_runtime_source() == expected["MLX_LM_KIMI_K3_DSPARK_SHA256"]
     for module_name, constant_name in pins.items():
         monkeypatch.setattr(loader, constant_name, "0" * 64)
         with pytest.raises(loader.RankLocalLoadError, match=f"{module_name}.py"):
@@ -462,6 +467,16 @@ def test_runtime_source_verification_uses_execution_pin(
     with pytest.raises(loader.RankLocalLoadError, match="generate.py"):
         loader._verify_runtime_source()
 
+    dspark_digest = expected["MLX_LM_KIMI_K3_DSPARK_SHA256"]
+    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_DSPARK_SHA256", "0" * 64)
+    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_DSPARK_0731_SHA256", dspark_digest)
+    monkeypatch.setattr(loader, "MLX_LM_GENERATE_SHA256", generate_digest)
+    assert loader._verify_runtime_source() == dspark_digest
+
+    monkeypatch.setattr(loader, "MLX_LM_KIMI_K3_DSPARK_0731_SHA256", "1" * 64)
+    with pytest.raises(loader.RankLocalLoadError, match="either audited"):
+        loader._verify_runtime_source()
+
 
 @pytest.mark.parametrize("failure_rank", (0, 1))
 def test_execution_runtime_preinner_failure_never_enters_checkpoint_validation(
@@ -485,7 +500,7 @@ def test_execution_runtime_preinner_failure_never_enters_checkpoint_validation(
     def prepare(_model_dir: object, _utils: object) -> tuple:
         if failure_rank == 0:
             raise OSError("rank-local path preparation failed")
-        return (tmp_path, object(), object(), object(), False)
+        return (tmp_path, object(), object(), object(), False, "22" * 32)
 
     def agree(
         _mx: object,

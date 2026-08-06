@@ -30,12 +30,11 @@ CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
 RUNTIME_MLX_LM_COMMIT = "bda4ae8b0fa67124bdf7f84bcd0715e7e284b558"
+RUNTIME_MLX_LM_DSPARK_0731_COMMIT = "e041c6ac9296bd9a73bd4c8b1f4f0d4b55b62e35"
 MLX_LM_KIMI_K3_SHA256 = (
     "6d41a3743cb62af9c024997172034472c046a4f72ae154882fcd2b1cee72c4de"
 )
-MLX_LM_CACHE_SHA256 = (
-    "2011e972be37f5d22450cf5e0b3af0620337d1805d243d4de981430676ac68ca"
-)
+MLX_LM_CACHE_SHA256 = "2011e972be37f5d22450cf5e0b3af0620337d1805d243d4de981430676ac68ca"
 MLX_LM_GENERATE_SHA256 = (
     "096f24553953a90f8e331cb7c7415a75636db4eec8a5bd159b6ad3e93cc4e369"
 )
@@ -44,6 +43,9 @@ MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE_SHA256 = (
 )
 MLX_LM_KIMI_K3_DSPARK_SHA256 = (
     "6529e24f186f1f21bf048d84a0e5d2dd7f54439b1d3f477ed8a5f06e00276e3c"
+)
+MLX_LM_KIMI_K3_DSPARK_0731_SHA256 = (
+    "5aed25bdb2e5971d89dc264cab85e1fb4c97a05d5be41e6db26eddbf6152c1b1"
 )
 MLX_LM_GATED_DELTA_SHA256 = (
     "44aef2791ed0cd5cfb84e31ef00cb4df3d40ae184e6c6852b7f0dba7406d2f78"
@@ -334,18 +336,40 @@ def _agree_local_validation(
     raise RankLocalLoadError(f"{label} failed on peer: {', '.join(failures)}")
 
 
-def _agree_metadata_contract(mx: Any, group: Any, digest: str) -> None:
+def _agree_sha256_contract(
+    mx: Any,
+    group: Any,
+    digest: str,
+    *,
+    label: str,
+) -> None:
     if SHA256_RE.fullmatch(digest) is None:
-        raise RankLocalLoadError("invalid local metadata contract digest")
+        raise RankLocalLoadError(f"invalid local {label} digest")
     local_bytes = bytes.fromhex(digest)
     rows = _all_gather_rows(mx, group, tuple(local_bytes))
     if any(row != rows[0] for row in rows[1:]):
-        raise RankLocalLoadError(
-            "rank-local metadata contract differs across tensor-parallel ranks"
-        )
+        raise RankLocalLoadError(f"{label} differs across tensor-parallel ranks")
 
 
-def _verify_runtime_source() -> None:
+def _agree_metadata_contract(mx: Any, group: Any, digest: str) -> None:
+    _agree_sha256_contract(
+        mx,
+        group,
+        digest,
+        label="rank-local metadata contract",
+    )
+
+
+def _agree_dspark_runtime_source(mx: Any, group: Any, digest: str) -> None:
+    _agree_sha256_contract(
+        mx,
+        group,
+        digest,
+        label="DSpark execution runtime source",
+    )
+
+
+def _verify_runtime_source() -> str:
     """Fail closed if the pinned execution-time K3 source is not imported."""
 
     from mlx_lm import generate
@@ -369,11 +393,6 @@ def _verify_runtime_source() -> None:
         (kimi_k3, "models/kimi_k3.py", MLX_LM_KIMI_K3_SHA256),
         (cache, "models/cache.py", MLX_LM_CACHE_SHA256),
         (generate, "generate.py", MLX_LM_GENERATE_SHA256),
-        (
-            kimi_k3_dspark,
-            "kimi_k3_dspark.py",
-            MLX_LM_KIMI_K3_DSPARK_SHA256,
-        ),
         (gated_delta, "gated_delta.py", MLX_LM_GATED_DELTA_SHA256),
         (
             kimi_k3_derived_bias,
@@ -428,6 +447,21 @@ def _verify_runtime_source() -> None:
                 "update the execution runtime pin."
             )
 
+    dspark_source = Path(inspect.getfile(kimi_k3_dspark)).resolve()
+    dspark_actual = _sha256_file(dspark_source)
+    dspark_allowed = {
+        MLX_LM_KIMI_K3_DSPARK_SHA256,
+        MLX_LM_KIMI_K3_DSPARK_0731_SHA256,
+    }
+    if dspark_actual not in dspark_allowed:
+        raise RankLocalLoadError(
+            "mlx_lm/kimi_k3_dspark.py does not match either audited execution "
+            f"runtime pin: got {dspark_actual} at {dspark_source}. Stage "
+            f"mlx-lm runtime {RUNTIME_MLX_LM_COMMIT} or "
+            f"{RUNTIME_MLX_LM_DSPARK_0731_COMMIT}."
+        )
+    return dspark_actual
+
 
 def _prepare_execution_runtime(model_dir: str | Path, mlx_lm_utils: Any) -> tuple:
     """Perform every fallible local operation before the first agreement."""
@@ -448,13 +482,14 @@ def _prepare_execution_runtime(model_dir: str | Path, mlx_lm_utils: Any) -> tupl
     if not callable(tree_flatten):
         raise RankLocalLoadError("installed mlx.utils exposes no tree_flatten")
     vocab_parallel_head = _strict_env_flag("EXO_MLX_K3_VOCAB_PARALLEL_HEAD")
-    _verify_runtime_source()
+    dspark_runtime_sha256 = _verify_runtime_source()
     return (
         checkpoint_path,
         load_config,
         get_model_classes,
         tree_flatten,
         vocab_parallel_head,
+        dspark_runtime_sha256,
     )
 
 
@@ -810,7 +845,9 @@ def load_rank_local_model(
         get_model_classes,
         tree_flatten,
         vocab_parallel_head,
+        dspark_runtime_sha256,
     ) = execution_runtime
+    _agree_dspark_runtime_source(mx, group, dspark_runtime_sha256)
 
     manifest: dict[str, Any] | None = None
     manifest_error: Exception | None = None
