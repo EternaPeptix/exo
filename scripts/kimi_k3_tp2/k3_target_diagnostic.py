@@ -205,6 +205,7 @@ def _forward_with_capture(
 ) -> tuple[Any, list[Any], ForwardCapture, float]:
     cache = target.clone_k3_cache(base_cache, mx)
     started = time.perf_counter()
+    final_cache = cache
     with capture_k3_forward(model) as capture:
         if sequential:
             parts = []
@@ -216,24 +217,37 @@ def _forward_with_capture(
                 mx.eval(logits)
                 parts.append(logits)
             result = mx.concatenate(parts, axis=1)
+            mx.eval(
+                result,
+                *(value for _, value in capture.layer_outputs),
+                *capture.final_hidden_states,
+            )
+            mx.synchronize()
         else:
             inputs = mx.array([list(token_ids)], dtype=mx.uint32)
             mx.eval(inputs)
-            result = model(inputs, cache=cache)
-        mx.eval(
-            result,
-            *(value for _, value in capture.layer_outputs),
-            *capture.final_hidden_states,
-        )
-        mx.synchronize()
-    elapsed = time.perf_counter() - started
+            with target.speculative_target_cache(model, cache, len(token_ids)):
+                result = model(inputs, cache=cache)
+                mx.eval(
+                    result,
+                    *(value for _, value in capture.layer_outputs),
+                    *capture.final_hidden_states,
+                )
+                mx.synchronize()
+                elapsed = time.perf_counter() - started
+                # Preserve the authoritative post-forward state for the
+                # diagnostic, then cancel the disposable transaction.  The
+                # derived projected arrays are intentionally not cloned.
+                final_cache = target.clone_k3_cache(cache, mx)
+    if sequential:
+        elapsed = time.perf_counter() - started
     layer_count = len(_active_k3_parts(model)[1])
     validate_capture(
         capture,
         layer_count=layer_count,
         forward_calls=len(token_ids) if sequential else 1,
     )
-    return result, cache, capture, elapsed
+    return result, final_cache, capture, elapsed
 
 
 def cosine_from_sums(
@@ -537,15 +551,18 @@ def compare_layer_outputs(
 def cache_components(cache: Sequence[Any]) -> list[tuple[str, int, str, Any]]:
     components: list[tuple[str, int, str, Any]] = []
     for layer_index, layer_cache in enumerate(cache):
-        class_name = type(layer_cache).__name__
-        if class_name == "ArraysCache":
+        try:
+            family_name = target.cache_family_name(layer_cache)
+        except target.VerificationError as error:
+            raise DiagnosticError(f"layer {layer_index}: {error}") from error
+        if family_name == "ArraysCache":
             for state_index, value in enumerate(layer_cache.cache):
                 if value is not None:
                     components.append(
                         (
                             f"layer.{layer_index:03d}.state.{state_index}",
                             layer_index,
-                            class_name,
+                            family_name,
                             value,
                         )
                     )
@@ -556,11 +573,11 @@ def cache_components(cache: Sequence[Any]) -> list[tuple[str, int, str, Any]]:
                         (
                             f"layer.{layer_index:03d}.{name}",
                             layer_index,
-                            class_name,
+                            family_name,
                             value,
                         )
                     )
-        elif class_name == "KVCache":
+        else:
             for name in ("keys", "values"):
                 value = getattr(layer_cache, name)
                 if value is not None:
@@ -568,14 +585,10 @@ def cache_components(cache: Sequence[Any]) -> list[tuple[str, int, str, Any]]:
                         (
                             f"layer.{layer_index:03d}.{name}",
                             layer_index,
-                            class_name,
+                            family_name,
                             value,
                         )
                     )
-        else:
-            raise DiagnosticError(
-                f"layer {layer_index}: unsupported cache class {class_name!r}"
-            )
     if not components:
         raise DiagnosticError("cache comparison has no populated components")
     return components
@@ -586,6 +599,7 @@ def _compact_cache_layout(cache: Sequence[Any]) -> dict[str, Any]:
     return {
         "layers": layout["layers"],
         "class_counts": layout["class_counts"],
+        "physical_class_counts": layout["physical_class_counts"],
         "total_nbytes": layout["total_nbytes"],
         "total_gb_decimal": layout["total_gb_decimal"],
         "kv_offset": layout["kv_offset"],

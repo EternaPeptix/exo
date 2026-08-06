@@ -245,13 +245,18 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
     assert result["rank_data_bytes"] == 32
 
 
-def test_execution_runtime_pin_matches_staged_aux_prefill_candidate():
+def test_execution_runtime_pin_matches_projected_kv_cache_candidate():
     assert loader.RUNTIME_MLX_LM_COMMIT == (
-        "d66b1ed5fdbf57585591226adc18816854784735+"
-        "9521a9e655d2d9287be32755f949e02540a9b2d5"
+        "290e6aabdfc0b85961c2e1b21a1e8f43549ffacb"
     )
     assert loader.MLX_LM_KIMI_K3_SHA256 == (
-        "42ff290b82903982fe02cec4d6b2b1de06b61cec7089274b812618dc36375bdb"
+        "c4e4604bdfe520c69fa2a27458ab861099ba4838342ccf72a6e44413bbec9fd5"
+    )
+    assert loader.MLX_LM_CACHE_SHA256 == (
+        "2011e972be37f5d22450cf5e0b3af0620337d1805d243d4de981430676ac68ca"
+    )
+    assert loader.MLX_LM_GENERATE_SHA256 == (
+        "096f24553953a90f8e331cb7c7415a75636db4eec8a5bd159b6ad3e93cc4e369"
     )
 
 
@@ -371,12 +376,15 @@ def test_runtime_source_verification_uses_execution_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     mlx_lm = types.ModuleType("mlx_lm")
+    mlx_lm.__path__ = []  # type: ignore[attr-defined]
     models = types.ModuleType("mlx_lm.models")
+    models.__path__ = []  # type: ignore[attr-defined]
     mlx_lm.models = models
     monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm)
     monkeypatch.setitem(sys.modules, "mlx_lm.models", models)
 
     pins = {
+        "cache": "MLX_LM_CACHE_SHA256",
         "gated_delta": "MLX_LM_GATED_DELTA_SHA256",
         "kimi_k3": "MLX_LM_KIMI_K3_SHA256",
         "kimi_k3_derived_bias": "MLX_LM_KIMI_K3_DERIVED_BIAS_SHA256",
@@ -404,12 +412,25 @@ def test_runtime_source_verification_uses_execution_pin(
         monkeypatch.setattr(loader, constant_name, digest)
         expected[constant_name] = digest
 
+    generate_source = tmp_path / "generate.py"
+    generate_source.write_bytes(b"pinned mlx_lm generate execution runtime")
+    generate_digest = hashlib.sha256(generate_source.read_bytes()).hexdigest()
+    generate = types.ModuleType("mlx_lm.generate")
+    generate.__file__ = str(generate_source)
+    mlx_lm.generate = generate
+    monkeypatch.setitem(sys.modules, generate.__name__, generate)
+    monkeypatch.setattr(loader, "MLX_LM_GENERATE_SHA256", generate_digest)
+
     loader._verify_runtime_source()
     for module_name, constant_name in pins.items():
         monkeypatch.setattr(loader, constant_name, "0" * 64)
         with pytest.raises(loader.RankLocalLoadError, match=f"{module_name}.py"):
             loader._verify_runtime_source()
         monkeypatch.setattr(loader, constant_name, expected[constant_name])
+
+    monkeypatch.setattr(loader, "MLX_LM_GENERATE_SHA256", "0" * 64)
+    with pytest.raises(loader.RankLocalLoadError, match="generate.py"):
+        loader._verify_runtime_source()
 
 
 @pytest.mark.parametrize("failure_rank", (0, 1))

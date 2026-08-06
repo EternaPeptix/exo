@@ -84,7 +84,14 @@ class KVCache:
         self.offset = 0
 
 
-def populated_cache():
+class KimiK3ProjectedKVCache(KVCache):
+    def __init__(self):
+        super().__init__()
+        self.projected_keys = None
+        self.projected_values = None
+
+
+def populated_cache(*, projected=False):
     result = []
     for layer in range(subject.EXPECTED_LAYER_COUNT):
         if layer < subject.EXPECTED_ARRAY_CACHE_COUNT:
@@ -94,7 +101,7 @@ def populated_cache():
                 FakeArray([layer + 2], shape=(1, 1), dtype="float32"),
             ]
         else:
-            cache = KVCache()
+            cache = KimiK3ProjectedKVCache() if projected else KVCache()
             # Capacity is deliberately larger than offset. The clone must
             # preserve the full backing shape, not only the logical prefix.
             cache.keys = FakeArray(
@@ -150,6 +157,104 @@ def test_clone_preserves_mixed_layout_capacity_offset_and_values():
         strict=True,
     ):
         assert original is not copied
+
+
+def test_projected_kv_subclass_is_logical_kv_and_clone_keeps_concrete_type():
+    source = populated_cache(projected=True)
+    for cache in source[subject.EXPECTED_ARRAY_CACHE_COUNT :]:
+        cache.projected_keys = FakeArray([1], shape=(1, 48, 1, 128), dtype="bfloat16")
+        cache.projected_values = FakeArray(
+            [2], shape=(1, 48, 1, 128), dtype="bfloat16"
+        )
+
+    layout = subject.cache_layout(source)
+    assert layout["class_counts"] == {"ArraysCache": 69, "KVCache": 24}
+    assert layout["physical_class_counts"] == {
+        "ArraysCache": 69,
+        "KimiK3ProjectedKVCache": 24,
+    }
+    assert layout["detail"][-1]["class"] == "KVCache"
+    assert layout["detail"][-1]["physical_class"] == "KimiK3ProjectedKVCache"
+
+    cloned = subject.clone_k3_cache(source, FakeMX)
+    assert all(
+        type(cache) is KimiK3ProjectedKVCache
+        for cache in cloned[subject.EXPECTED_ARRAY_CACHE_COUNT :]
+    )
+    assert all(
+        cache.projected_keys is None and cache.projected_values is None
+        for cache in cloned[subject.EXPECTED_ARRAY_CACHE_COUNT :]
+    )
+    subject.assert_cache_value_equivalent(source, cloned, FakeMX)
+
+
+def test_cache_family_rejects_name_only_kv_impostor():
+    class KimiK3ProjectedKVCache:
+        pass
+
+    with pytest.raises(subject.VerificationError, match="unsupported cache class"):
+        subject.cache_family_name(KimiK3ProjectedKVCache())
+
+
+def test_wide_target_cache_begins_and_always_cancels_transaction():
+    events = []
+    transaction = object()
+
+    class Model:
+        @staticmethod
+        def begin_speculative_cache(cache, width):
+            events.append(("begin", cache, width))
+            return transaction
+
+        @staticmethod
+        def cancel_speculative_cache(value):
+            events.append(("cancel", value))
+
+    cache = [object()]
+    with subject.speculative_target_cache(Model(), cache, 3):
+        events.append(("forward",))
+    assert events == [
+        ("begin", cache, 3),
+        ("forward",),
+        ("cancel", transaction),
+    ]
+
+
+def test_wide_target_cache_cancels_when_forward_raises():
+    events = []
+    transaction = object()
+
+    class Model:
+        @staticmethod
+        def begin_speculative_cache(cache, width):
+            events.append(("begin", cache, width))
+            return transaction
+
+        @staticmethod
+        def cancel_speculative_cache(value):
+            events.append(("cancel", value))
+
+    with pytest.raises(RuntimeError, match="synthetic forward failure"):
+        with subject.speculative_target_cache(Model(), [], 3):
+            raise RuntimeError("synthetic forward failure")
+    assert events == [
+        ("begin", [], 3),
+        ("cancel", transaction),
+    ]
+
+
+def test_single_token_target_does_not_open_transaction():
+    class Model:
+        @staticmethod
+        def begin_speculative_cache(_cache, _width):
+            raise AssertionError("single-token target opened a transaction")
+
+        @staticmethod
+        def cancel_speculative_cache(_transaction):
+            raise AssertionError("single-token target cancelled a transaction")
+
+    with subject.speculative_target_cache(Model(), [], 1):
+        pass
 
 
 def test_exact_cache_check_rejects_changed_state():

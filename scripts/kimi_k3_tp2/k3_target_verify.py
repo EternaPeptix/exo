@@ -119,23 +119,40 @@ def _clone_array(mx: Any, value: Any) -> Any:
     return copied
 
 
+def cache_family_name(layer_cache: Any) -> str:
+    """Return the supported logical cache family for a concrete cache.
+
+    Kimi K3 may use a request-local ``KVCache`` subclass that carries derived
+    projected K/V arrays.  Verification compares only the authoritative
+    latent cache state, so concrete ``KVCache`` subclasses belong to the same
+    logical family while retaining their concrete type in artifacts and
+    clones.
+    """
+
+    physical_class = type(layer_cache).__name__
+    mro_names = {cls.__name__ for cls in type(layer_cache).__mro__}
+    if "ArraysCache" in mro_names:
+        return "ArraysCache"
+    if "KVCache" in mro_names:
+        return "KVCache"
+    raise VerificationError(f"unsupported cache class {physical_class!r}")
+
+
 def _arrays_in_cache(cache: Sequence[Any]) -> list[Any]:
     arrays: list[Any] = []
     for layer_cache in cache:
-        class_name = type(layer_cache).__name__
-        if class_name == "ArraysCache":
+        family_name = cache_family_name(layer_cache)
+        if family_name == "ArraysCache":
             arrays.extend(value for value in layer_cache.cache if value is not None)
             if layer_cache.left_padding is not None:
                 arrays.append(layer_cache.left_padding)
             if layer_cache.lengths is not None:
                 arrays.append(layer_cache.lengths)
-        elif class_name == "KVCache":
+        else:
             if layer_cache.keys is not None:
                 arrays.append(layer_cache.keys)
             if layer_cache.values is not None:
                 arrays.append(layer_cache.values)
-        else:
-            raise VerificationError(f"unsupported cache class {class_name!r}")
     return arrays
 
 
@@ -149,17 +166,19 @@ def cache_layout(
             f"expected {EXPECTED_LAYER_COUNT} cache layers, got {len(cache)}"
         )
     counts = {"ArraysCache": 0, "KVCache": 0}
+    physical_counts: dict[str, int] = {}
     layers: list[dict[str, Any]] = []
     total_bytes = 0
     kv_offsets: list[int] = []
     for layer_index, layer_cache in enumerate(cache):
-        class_name = type(layer_cache).__name__
-        if class_name not in counts:
-            raise VerificationError(
-                f"layer {layer_index}: unsupported cache class {class_name!r}"
-            )
-        counts[class_name] += 1
-        if class_name == "ArraysCache":
+        physical_class = type(layer_cache).__name__
+        try:
+            family_name = cache_family_name(layer_cache)
+        except VerificationError as error:
+            raise VerificationError(f"layer {layer_index}: {error}") from error
+        counts[family_name] += 1
+        physical_counts[physical_class] = physical_counts.get(physical_class, 0) + 1
+        if family_name == "ArraysCache":
             values = list(layer_cache.cache)
             if len(values) != 2:
                 raise VerificationError(
@@ -183,7 +202,8 @@ def cache_layout(
             layers.append(
                 {
                     "layer": layer_index,
-                    "class": class_name,
+                    "class": family_name,
+                    "physical_class": physical_class,
                     "state": state,
                     "left_padding": layer_cache.left_padding is not None,
                     "lengths": layer_cache.lengths is not None,
@@ -203,7 +223,8 @@ def cache_layout(
             layers.append(
                 {
                     "layer": layer_index,
-                    "class": class_name,
+                    "class": family_name,
+                    "physical_class": physical_class,
                     "offset": offset,
                     "keys": (
                         None
@@ -238,6 +259,7 @@ def cache_layout(
     return {
         "layers": len(cache),
         "class_counts": counts,
+        "physical_class_counts": physical_counts,
         "total_nbytes": total_bytes,
         "total_gb_decimal": total_bytes / 1e9,
         "kv_offset": kv_offsets[0] if kv_offsets else None,
@@ -252,8 +274,8 @@ def clone_k3_cache(cache: Sequence[Any], mx: Any) -> list[Any]:
     cloned: list[Any] = []
     pending: list[Any] = []
     for layer_cache in cache:
-        class_name = type(layer_cache).__name__
-        if class_name == "ArraysCache":
+        family_name = cache_family_name(layer_cache)
+        if family_name == "ArraysCache":
             copied = type(layer_cache)(size=len(layer_cache.cache))
             copied.cache = [_clone_array(mx, value) for value in layer_cache.cache]
             copied.left_padding = _clone_array(mx, layer_cache.left_padding)
@@ -263,7 +285,7 @@ def clone_k3_cache(cache: Sequence[Any], mx: Any) -> list[Any]:
                 pending.append(copied.left_padding)
             if copied.lengths is not None:
                 pending.append(copied.lengths)
-        elif class_name == "KVCache":
+        else:
             copied = type(layer_cache)()
             copied.keys = _clone_array(mx, layer_cache.keys)
             copied.values = _clone_array(mx, layer_cache.values)
@@ -272,14 +294,39 @@ def clone_k3_cache(cache: Sequence[Any], mx: Any) -> list[Any]:
                 pending.append(copied.keys)
             if copied.values is not None:
                 pending.append(copied.values)
-        else:
-            raise VerificationError(f"unsupported cache class {class_name!r}")
         cloned.append(copied)
     if pending:
         mx.eval(*pending)
     if cache_layout(cloned) != cache_layout(cache):
         raise VerificationError("cloned cache layout differs from source")
     return cloned
+
+
+@contextlib.contextmanager
+def speculative_target_cache(
+    model: Any,
+    cache: Sequence[Any],
+    width: int,
+):
+    """Open and always cancel a disposable wide-target cache transaction."""
+
+    if width < 1:
+        raise VerificationError("target width must be positive")
+    if width == 1:
+        yield
+        return
+
+    begin = getattr(model, "begin_speculative_cache", None)
+    cancel = getattr(model, "cancel_speculative_cache", None)
+    if not callable(begin) or not callable(cancel):
+        raise VerificationError(
+            "wide target verification requires speculative cache hooks"
+        )
+    transaction = begin(cache, width)
+    try:
+        yield
+    finally:
+        cancel(transaction)
 
 
 def assert_cache_value_equivalent(
@@ -371,9 +418,10 @@ def _timed_target_forward(
     mx.reset_peak_memory()
     memory_before = _memory_bytes(mx)
     started = time.perf_counter()
-    logits = model(inputs, cache=snapshot)
-    mx.eval(logits)
-    mx.synchronize()
+    with speculative_target_cache(model, snapshot, len(token_ids)):
+        logits = model(inputs, cache=snapshot)
+        mx.eval(logits)
+        mx.synchronize()
     elapsed = time.perf_counter() - started
     memory_after = _memory_bytes(mx)
     rows = base.gather_floats(
@@ -450,12 +498,14 @@ def _forward_logits(
             mx.eval(logits)
             parts.append(logits)
         result = mx.concatenate(parts, axis=1)
+        mx.eval(result)
     else:
-        result = model(
-            mx.array([list(token_ids)], dtype=mx.uint32),
-            cache=snapshot,
-        )
-    mx.eval(result)
+        with speculative_target_cache(model, snapshot, len(token_ids)):
+            result = model(
+                mx.array([list(token_ids)], dtype=mx.uint32),
+                cache=snapshot,
+            )
+            mx.eval(result)
     del snapshot
     return result
 

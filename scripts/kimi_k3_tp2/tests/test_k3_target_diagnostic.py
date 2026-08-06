@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -148,6 +149,10 @@ class KVCache:
         self.values = object()
 
 
+class KimiK3ProjectedKVCache(KVCache):
+    pass
+
+
 def test_cache_component_identity_is_stable_and_explicit():
     components = diagnostic.cache_components([ArraysCache(), KVCache()])
     identities = [
@@ -159,6 +164,103 @@ def test_cache_component_identity_is_stable_and_explicit():
         ("layer.000.state.1", 0, "ArraysCache"),
         ("layer.001.keys", 1, "KVCache"),
         ("layer.001.values", 1, "KVCache"),
+    ]
+
+
+def test_cache_components_treat_projected_subclass_as_logical_kv():
+    components = diagnostic.cache_components(
+        [ArraysCache(), KimiK3ProjectedKVCache()]
+    )
+    identities = [
+        (name, layer, cache_class)
+        for name, layer, cache_class, _ in components
+    ]
+    assert identities == [
+        ("layer.000.state.0", 0, "ArraysCache"),
+        ("layer.000.state.1", 0, "ArraysCache"),
+        ("layer.001.keys", 1, "KVCache"),
+        ("layer.001.values", 1, "KVCache"),
+    ]
+
+
+def test_wide_capture_preserves_final_state_then_cancels(monkeypatch):
+    events = []
+
+    class CacheState:
+        def __init__(self, value):
+            self.value = value
+
+    class FakeMX:
+        uint32 = "uint32"
+
+        @staticmethod
+        def array(value, dtype=None):
+            return (value, dtype)
+
+        @staticmethod
+        def eval(*_values):
+            return None
+
+        @staticmethod
+        def synchronize():
+            return None
+
+    class Model:
+        capture = None
+
+        def begin_speculative_cache(self, cache, width):
+            events.append(("begin", cache[0].value, width))
+            return (cache, cache[0].value)
+
+        @staticmethod
+        def cancel_speculative_cache(transaction):
+            cache, initial = transaction
+            events.append(("cancel", cache[0].value))
+            cache[0].value = initial
+
+        def __call__(self, _inputs, *, cache):
+            events.append(("forward", cache[0].value))
+            cache[0].value += 3
+            self.capture.layer_outputs.append((0, object()))
+            self.capture.final_hidden_states.append(object())
+            return object()
+
+    model = Model()
+
+    def clone(cache, _mx):
+        events.append(("clone", cache[0].value))
+        return [CacheState(cache[0].value)]
+
+    @contextlib.contextmanager
+    def capture(_model):
+        value = diagnostic.ForwardCapture()
+        model.capture = value
+        yield value
+
+    monkeypatch.setattr(diagnostic.target, "clone_k3_cache", clone)
+    monkeypatch.setattr(diagnostic, "capture_k3_forward", capture)
+    monkeypatch.setattr(
+        diagnostic,
+        "_active_k3_parts",
+        lambda _model: (None, [object()]),
+    )
+    monkeypatch.setattr(diagnostic, "validate_capture", lambda *_args, **_kwargs: None)
+
+    _result, final_cache, _capture, _elapsed = diagnostic._forward_with_capture(
+        mx=FakeMX,
+        model=model,
+        base_cache=[CacheState(7)],
+        token_ids=[1, 2, 3],
+        sequential=False,
+    )
+
+    assert final_cache[0].value == 10
+    assert events == [
+        ("clone", 7),
+        ("begin", 7, 3),
+        ("forward", 7),
+        ("clone", 10),
+        ("cancel", 10),
     ]
 
 

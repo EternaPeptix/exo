@@ -29,11 +29,15 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = (
-    "d66b1ed5fdbf57585591226adc18816854784735+9521a9e655d2d9287be32755f949e02540a9b2d5"
-)
+RUNTIME_MLX_LM_COMMIT = "290e6aabdfc0b85961c2e1b21a1e8f43549ffacb"
 MLX_LM_KIMI_K3_SHA256 = (
-    "42ff290b82903982fe02cec4d6b2b1de06b61cec7089274b812618dc36375bdb"
+    "c4e4604bdfe520c69fa2a27458ab861099ba4838342ccf72a6e44413bbec9fd5"
+)
+MLX_LM_CACHE_SHA256 = (
+    "2011e972be37f5d22450cf5e0b3af0620337d1805d243d4de981430676ac68ca"
+)
+MLX_LM_GENERATE_SHA256 = (
+    "096f24553953a90f8e331cb7c7415a75636db4eec8a5bd159b6ad3e93cc4e369"
 )
 MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE_SHA256 = (
     "0f2d2440d89d327adeba369620aa206d1f641ff06954db6d364ae1785806e80a"
@@ -344,7 +348,9 @@ def _agree_metadata_contract(mx: Any, group: Any, digest: str) -> None:
 def _verify_runtime_source() -> None:
     """Fail closed if the pinned execution-time K3 source is not imported."""
 
+    from mlx_lm import generate
     from mlx_lm.models import (
+        cache,
         gated_delta,
         kimi_k3,
         kimi_k3_derived_bias,
@@ -360,7 +366,9 @@ def _verify_runtime_source() -> None:
     )
 
     pinned_sources = (
-        (kimi_k3, "kimi_k3.py", MLX_LM_KIMI_K3_SHA256),
+        (kimi_k3, "models/kimi_k3.py", MLX_LM_KIMI_K3_SHA256),
+        (cache, "models/cache.py", MLX_LM_CACHE_SHA256),
+        (generate, "generate.py", MLX_LM_GENERATE_SHA256),
         (
             kimi_k3_dspark,
             "kimi_k3_dspark.py",
@@ -414,7 +422,7 @@ def _verify_runtime_source() -> None:
         actual = _sha256_file(source)
         if actual != expected:
             raise RankLocalLoadError(
-                f"mlx_lm.models.{filename} does not match the execution runtime "
+                f"mlx_lm/{filename} does not match the execution runtime "
                 f"pin: expected {expected}, got {actual} at {source}. "
                 f"Stage mlx-lm runtime {RUNTIME_MLX_LM_COMMIT} or audit and "
                 "update the execution runtime pin."
