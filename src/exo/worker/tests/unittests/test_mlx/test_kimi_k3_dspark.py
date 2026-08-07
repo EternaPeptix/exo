@@ -55,6 +55,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     LoadedMlxDSparkDual,
     MlxDSparkFeatures,
     MlxDSparkRequestDraft,
+    MlxRankAgreement,
     OrdinaryDecodePlan,
     ReplaySSMTargetAdapter,
     TargetPosterior,
@@ -2121,6 +2122,133 @@ class _FakeMlxProposer:
             entry.length += consumed
             entry.keys = object()
             entry.values = object()
+
+
+@dataclass
+class _RankZeroBroadcastAgreement:
+    rank: int
+    authoritative_blocks: tuple[tuple[int, ...], ...]
+    size: int = 2
+    local_blocks: list[tuple[int, ...] | None] = field(default_factory=list)
+    acceptances: list[tuple[int | None, int | None]] = field(default_factory=list)
+
+    def agree_proposal_block(
+        self,
+        local_block: tuple[int, ...] | None,
+        expected_width: int,
+    ) -> tuple[int, ...] | None:
+        authoritative = self.authoritative_blocks[len(self.local_blocks)]
+        assert local_block is not None
+        assert len(local_block) == expected_width
+        assert len(authoritative) == expected_width
+        self.local_blocks.append(local_block)
+        return authoritative
+
+    def agree_acceptance(
+        self,
+        local_boundary: int | None,
+        local_next_token: int | None,
+        maximum_boundary: int,
+    ) -> tuple[int, int] | None:
+        assert local_boundary is not None
+        assert local_next_token is not None
+        assert 0 <= local_boundary <= maximum_boundary
+        self.acceptances.append((local_boundary, local_next_token))
+        return local_boundary, local_next_token
+
+    def agree_stage_success(self, local_success: bool) -> bool | None:
+        return local_success
+
+    def agree_token(self, local_token: int | None) -> int | None:
+        return local_token
+
+
+@dataclass
+class _OffsetTrackingTarget:
+    offset: int
+    proposal_blocks: list[tuple[int, ...]] = field(default_factory=list)
+    commit_widths: list[int] = field(default_factory=list)
+
+    def prepare_verification(
+        self,
+        proposal_block: tuple[int, ...],
+    ) -> _OffsetTrackingPreparedTarget:
+        self.proposal_blocks.append(proposal_block)
+        return _OffsetTrackingPreparedTarget(
+            owner=self,
+            proposal_block=proposal_block,
+            initial_offset=self.offset,
+        )
+
+    def preflight_ordinary(self, anchor_token: int) -> OrdinaryDecodePlan:
+        raise AssertionError(f"unexpected ordinary fallback for anchor {anchor_token}")
+
+    def prepare_ordinary(
+        self,
+        anchor_token: int,
+        plan: OrdinaryDecodePlan,
+    ) -> _FakePreparedOrdinary:
+        del plan
+        raise AssertionError(f"unexpected ordinary fallback for anchor {anchor_token}")
+
+
+@dataclass
+class _OffsetTrackingPreparedTarget:
+    owner: _OffsetTrackingTarget
+    proposal_block: tuple[int, ...]
+    initial_offset: int
+    mode_code: int = 0
+
+    def build(self) -> _OffsetTrackingBuiltTarget:
+        return _OffsetTrackingBuiltTarget(
+            self.owner,
+            self.proposal_block,
+            self.initial_offset,
+        )
+
+    def cancel(self) -> None:
+        return None
+
+
+@dataclass
+class _OffsetTrackingBuiltTarget:
+    owner: _OffsetTrackingTarget
+    proposal_block: tuple[int, ...]
+    initial_offset: int
+
+    def materialize(self) -> _OffsetTrackingTargetRound:
+        if self.proposal_block == (10, 11, 12):
+            posterior_tokens = (11, 99, 100)
+        elif self.proposal_block == (99, 31, 32):
+            posterior_tokens = (31, 32, 33)
+        else:
+            raise AssertionError(f"unexpected target block {self.proposal_block}")
+        hidden_states = tuple(
+            _FakeHidden((1, 3, 7168), f"tap-{index}") for index in range(5)
+        )
+        return _OffsetTrackingTargetRound(
+            self.owner,
+            TargetPosterior(posterior_tokens, hidden_states),
+            self.initial_offset,
+        )
+
+    def cancel(self) -> None:
+        return None
+
+
+@dataclass
+class _OffsetTrackingTargetRound:
+    owner: _OffsetTrackingTarget
+    posterior: TargetPosterior
+    initial_offset: int
+
+    def commit(self, consumed_input_tokens: int) -> None:
+        assert self.owner.offset == self.initial_offset
+        self.owner.offset += consumed_input_tokens
+        self.owner.commit_widths.append(consumed_input_tokens)
+
+    def cancel(self) -> None:
+        return None
 
 
 def _mock_mlx_features(
