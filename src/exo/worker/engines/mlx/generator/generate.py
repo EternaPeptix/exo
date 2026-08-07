@@ -237,6 +237,45 @@ def _strict_env_flag(name: str, value: str) -> bool:
     return value == "1"
 
 
+_DSPARK_ORDINARY_AFTER_CONTEXT_ENV = (
+    "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT"
+)
+_DSPARK_FORCE_ORDINARY_ENV = "EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY"
+_DSPARK_MAX_ORDINARY_AFTER_CONTEXT = 1_048_576
+
+
+def _dspark_ordinary_after_context() -> int:
+    """Parse the optional request-level ordinary-decode cutoff.
+
+    Unset is the default-off state.  Once explicitly configured, zero and all
+    non-positive/out-of-range values are rejected before any request state or
+    TP graph is built.
+    """
+
+    raw = os.environ.get(_DSPARK_ORDINARY_AFTER_CONTEXT_ENV)
+    if raw is None:
+        return 0
+    return _strict_env_int(
+        _DSPARK_ORDINARY_AFTER_CONTEXT_ENV,
+        raw,
+        minimum=1,
+        maximum=_DSPARK_MAX_ORDINARY_AFTER_CONTEXT,
+    )
+
+
+def _dspark_force_ordinary(prompt_tokens: int) -> bool:
+    """Select target-only decode at/after the opt-in prompt cutoff."""
+
+    if type(prompt_tokens) is not int or prompt_tokens < 0:
+        raise ValueError("Kimi K3 DSpark prompt token count must be non-negative")
+    forced = _strict_env_flag(
+        _DSPARK_FORCE_ORDINARY_ENV,
+        os.environ.get(_DSPARK_FORCE_ORDINARY_ENV, "0"),
+    )
+    cutoff = _dspark_ordinary_after_context()
+    return forced or (cutoff != 0 and prompt_tokens >= cutoff)
+
+
 def greedy_vocab_parallel_stream_kwargs(
     *,
     temperature: float,
@@ -1150,6 +1189,7 @@ def _dspark_setup_fingerprint(
     compact_greedy: bool,
     generation_progress: bool,
     force_ordinary: bool = False,
+    ordinary_after_context: int = 0,
     eos_token_ids: tuple[int, ...],
     banned_token_ids: tuple[int, ...],
     terminal_token_ids: tuple[int, ...],
@@ -1202,6 +1242,7 @@ def _dspark_setup_fingerprint(
     add_integer(int(compact_greedy), name="compact greedy flag")
     add_integer(int(generation_progress), name="generation progress flag")
     add_integer(int(force_ordinary), name="force ordinary flag")
+    add_integer(ordinary_after_context, name="ordinary-after-context threshold")
     add_tokens(eos_token_ids, name="EOS tokens")
     add_tokens(banned_token_ids, name="banned tokens")
     add_tokens(terminal_token_ids, name="terminal tokens")
@@ -1400,10 +1441,8 @@ def _prepare_dspark_request_setup(
             speculative=False,
         )
     )
-    force_ordinary = _strict_env_flag(
-        "EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY",
-        os.environ.get("EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY", "0"),
-    )
+    ordinary_after_context = _dspark_ordinary_after_context()
+    force_ordinary = _dspark_force_ordinary(len(all_prompt_tokens))
     prefill_step_size = _prefill_step_size(
         len(all_prompt_tokens) - 1,
         is_pipeline=False,
@@ -1443,6 +1482,7 @@ def _prepare_dspark_request_setup(
         compact_greedy=compact_greedy,
         generation_progress=generation_progress,
         force_ordinary=force_ordinary,
+        ordinary_after_context=ordinary_after_context,
         eos_token_ids=eos_token_ids,
         banned_token_ids=banned_token_ids,
         terminal_token_ids=terminal_token_ids,

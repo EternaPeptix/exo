@@ -118,6 +118,61 @@ def test_compact_greedy_rejects_malformed_opt_in() -> None:
         greedy_vocab_parallel_stream_kwargs(**_kwargs())  # type: ignore[arg-type]
 
 
+def test_dspark_ordinary_context_gate_is_default_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY", raising=False)
+    monkeypatch.delenv(
+        "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT",
+        raising=False,
+    )
+
+    assert not generate_module._dspark_force_ordinary(1_048_576)
+
+
+def test_dspark_ordinary_context_gate_is_below_at_and_above_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY", raising=False)
+    monkeypatch.setenv(
+        "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT",
+        "3072",
+    )
+
+    assert not generate_module._dspark_force_ordinary(3071)
+    assert generate_module._dspark_force_ordinary(3072)
+    assert generate_module._dspark_force_ordinary(3073)
+
+
+def test_dspark_manual_force_ordinary_dominates_disabled_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY", "1")
+    monkeypatch.delenv(
+        "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT",
+        raising=False,
+    )
+
+    assert generate_module._dspark_force_ordinary(1)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "1048577", "3k", "true"])
+def test_dspark_ordinary_context_gate_rejects_invalid_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+) -> None:
+    monkeypatch.delenv("EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY", raising=False)
+    monkeypatch.setenv("EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT", raw)
+
+    with pytest.raises(ValueError, match="must be an integer between 1 and 1048576"):
+        generate_module._dspark_force_ordinary(4096)
+
+
+def test_dspark_ordinary_context_gate_rejects_negative_prompt_tokens() -> None:
+    with pytest.raises(ValueError, match="prompt token count must be non-negative"):
+        generate_module._dspark_force_ordinary(-1)
+
+
 @pytest.mark.parametrize("verify_width", [3, 8])
 def test_dspark_warmup_requires_two_real_speculative_rounds(
     monkeypatch: pytest.MonkeyPatch,
@@ -1195,6 +1250,18 @@ def test_dspark_setup_fingerprint_binds_generation_callback_presence(
         **common,
         generation_progress=False,
         force_ordinary=True,
+    )
+
+    assert generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        force_ordinary=True,
+        ordinary_after_context=3072,
+    ) != generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        force_ordinary=True,
+        ordinary_after_context=4096,
     )
 
     assert generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
