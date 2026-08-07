@@ -657,6 +657,8 @@ def test_dual_rank_contracts_bind_both_identities_and_fixed_threshold(
     assert config_payload["mode"] == "dual"
     assert config_payload["threshold_tokens"] == 8_192
     assert config_payload["aux_only_prefill"] is False
+    assert config_payload["old"]["rank_zero_proposal_recovery"] is False
+    assert config_payload["yarn"]["rank_zero_proposal_recovery"] is False
     assert config_payload["old"]["revision"] == loaded.config.old.revision
     assert config_payload["yarn"]["revision"] == loaded.config.yarn.revision
     assert (
@@ -1456,7 +1458,10 @@ def _run_mlx_generate_dspark_scenario(
         verify_width=engine.verify_width,
         target_model=model,
         target_route_top_k=None,
-        config=SimpleNamespace(confidence_capture=None),
+        config=SimpleNamespace(
+            confidence_capture=None,
+            rank_zero_proposal_recovery=False,
+        ),
     )
     group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
     task = SimpleNamespace(
@@ -1534,7 +1539,7 @@ def _run_mlx_generate_dspark_scenario(
     monkeypatch.setattr(
         generate_module,
         "MlxRankAgreement",
-        lambda _group: setup_agreement or _LocalAgreement(),
+        lambda _group, **_kwargs: setup_agreement or _LocalAgreement(),
     )
     monkeypatch.setattr(generate_module, "eos_ids_from_tokenizer", lambda _tok: eos_ids)
     monkeypatch.setattr(

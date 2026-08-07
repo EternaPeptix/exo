@@ -29,6 +29,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSPARK_ENABLE_ENV,
     DSPARK_MODEL_NATIVE_VERIFY_WIDTH,
     DSPARK_PREFIX_CACHE_ENV,
+    DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV,
     DSPARK_TELEMETRY_ENV,
     DSPARK_VERIFY_WIDTH_ENV,
     DSPARK_YARN_CHECKPOINT_ENV,
@@ -166,6 +167,19 @@ def test_dspark_is_inert_by_default_and_rejects_orphan_companions(
             environ={DSPARK_CHECKPOINT_ENV: str(tmp_path)},
         )
 
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=(
+            f"{DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV} requires "
+            f"{DSPARK_ENABLE_ENV}=1"
+        ),
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ={DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV: "1"},
+        )
+
 
 def test_dual_proposer_is_default_off_and_preserves_single_config(
     tmp_path: Path,
@@ -187,6 +201,7 @@ def test_dual_proposer_is_default_off_and_preserves_single_config(
     assert type(config) is KimiK3DSparkConfig
     assert config.checkpoint_path == old_path
     assert config.revision == dspark_module.RADIXARK_KIMI_K3_DSPARK_REVISION
+    assert config.rank_zero_proposal_recovery is False
     assert calls == [old_path]
 
     with pytest.raises(
@@ -201,6 +216,23 @@ def test_dual_proposer_is_default_off_and_preserves_single_config(
             environ=environment,
             checkpoint_validator=validate,
         )
+
+
+def test_rank_zero_proposal_recovery_requires_explicit_selector(
+    tmp_path: Path,
+) -> None:
+    environment = _enabled_environment(tmp_path)
+    environment[DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV] = "1"
+
+    config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=environment,
+        checkpoint_validator=lambda _path: None,
+    )
+
+    assert type(config) is KimiK3DSparkConfig
+    assert config.rank_zero_proposal_recovery is True
 
 
 def test_dual_proposer_requires_exact_old_and_yarn_checkpoint_pair(
@@ -903,6 +935,7 @@ def _config(
     width: int,
     *,
     aux_only_prefill: bool = False,
+    rank_zero_proposal_recovery: bool = False,
 ) -> KimiK3DSparkConfig:
     assert width in (3, 8)
     return KimiK3DSparkConfig(
@@ -910,6 +943,7 @@ def _config(
         verify_width=width,
         round_telemetry=False,
         aux_only_prefill=aux_only_prefill,
+        rank_zero_proposal_recovery=rank_zero_proposal_recovery,
     )
 
 
@@ -1447,6 +1481,42 @@ def test_acceptance_matches_cumprod_prefix_semantics() -> None:
         )
         == 2
     )
+
+
+def test_rank_zero_valid_proposal_is_authoritative_when_peer_tokens_differ(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def gathered(_row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        return ((1, 10, 11, 12), (1, 10, 21, 22))
+
+    agreement = MlxRankAgreement(None, rank_zero_proposal_recovery=True)
+    monkeypatch.setattr(agreement, "_all_gather_rows", gathered)
+
+    assert agreement.agree_proposal_block((10, 21, 22), 3) == (10, 11, 12)
+
+
+def test_rank_zero_proposal_mismatch_is_rejected_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def gathered(_row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        return ((1, 10, 11, 12), (1, 10, 21, 22))
+
+    agreement = MlxRankAgreement(None)
+    monkeypatch.setattr(agreement, "_all_gather_rows", gathered)
+
+    assert agreement.agree_proposal_block((10, 21, 22), 3) is None
+
+
+def test_rank_zero_proposal_is_rejected_when_peer_has_no_draft_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def gathered(_row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        return ((1, 10, 11, 12), (0, -1, -1, -1))
+
+    agreement = MlxRankAgreement(None, rank_zero_proposal_recovery=True)
+    monkeypatch.setattr(agreement, "_all_gather_rows", gathered)
+
+    assert agreement.agree_proposal_block((10, 11, 12), 3) is None
 
 
 def test_proposal_disagreement_cancels_draft_and_falls_back_permanently(
@@ -2425,6 +2495,141 @@ def test_replicated_draft_flattens_proposals_and_appends_only_committed_context(
         round_state.commit(1, 99, TargetPosterior((11, 99, 100)))
 
 
+def test_round_engine_rejects_recovered_block_when_config_gate_is_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings: list[str] = []
+    monkeypatch.setattr(dspark_module, "_log_nonfatal_warning", warnings.append)
+    events: list[str] = []
+    draft = _FakeDraft((21, 22), 3, events)
+    target = _FakeTarget((11, 12, 13), events)
+    engine = KimiK3DSparkRoundEngine(
+        config=_config(tmp_path, 3),
+        draft=draft,
+        target=target,
+        collective=_RankZeroBroadcastAgreement(1, ((10, 11, 12),)),
+    )
+
+    result = engine.decode_round(10)
+
+    assert result.emitted_tokens == (999,)
+    assert result.telemetry.fallback is True
+    assert result.telemetry.error == "DSpark proposal recovery is disabled"
+    assert draft.rounds[0].cancelled is True
+    assert target.rounds == []
+    assert warnings == []
+
+
+def test_rank_zero_block_resynchronizes_draft_context_for_the_next_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+    recovered_mismatches: list[str] = []
+    monkeypatch.setattr(
+        dspark_module,
+        "_log_nonfatal_warning",
+        recovered_mismatches.append,
+    )
+    authoritative_blocks = ((10, 11, 12), (99, 31, 32))
+    proposer_calls: tuple[list[tuple[object, ...]], ...] = ([], [])
+    proposers = (
+        _FakeMlxProposer(3, proposer_calls[0], [[11, 12]]),
+        _FakeMlxProposer(3, proposer_calls[1], [[21, 22]]),
+    )
+    context_caches = tuple(
+        [
+            _FakeContextCache(length=5, keys=object(), values=object()),
+            _FakeContextCache(length=5, keys=object(), values=object()),
+        ]
+        for _rank in range(2)
+    )
+    agreements = tuple(
+        _RankZeroBroadcastAgreement(rank, authoritative_blocks) for rank in range(2)
+    )
+    targets = tuple(_OffsetTrackingTarget(offset=5) for _rank in range(2))
+    engines = tuple(
+        KimiK3DSparkRoundEngine(
+            config=_config(tmp_path, 3, rank_zero_proposal_recovery=True),
+            draft=MlxDSparkRequestDraft(
+                proposer=proposers[rank],
+                context_cache=context_caches[rank],
+                verify_width=3,
+                evaluate=lambda *_values: None,
+            ),
+            target=targets[rank],
+            collective=agreements[rank],
+        )
+        for rank in range(2)
+    )
+
+    first_results = tuple(engine.decode_round(10) for engine in engines)
+
+    assert agreements[0].local_blocks == [(10, 11, 12)]
+    assert agreements[1].local_blocks == [(10, 21, 22)]
+    assert [target.proposal_blocks for target in targets] == [
+        [(10, 11, 12)],
+        [(10, 11, 12)],
+    ]
+    assert [agreement.acceptances for agreement in agreements] == [
+        [(1, 99)],
+        [(1, 99)],
+    ]
+    assert [result.emitted_tokens for result in first_results] == [
+        (11, 99),
+        (11, 99),
+    ]
+    assert [target.offset for target in targets] == [7, 7]
+    assert [target.commit_widths for target in targets] == [[2], [2]]
+    assert [
+        [entry.length for entry in context_cache] for context_cache in context_caches
+    ] == [[7, 7], [7, 7]]
+    assert len(recovered_mismatches) == 1
+    recovery_log = recovered_mismatches[0]
+    assert "rank=1" in recovery_log
+    assert "context_offset=5" in recovery_log
+    assert "local_proposal_sha256=" in recovery_log
+    assert "authoritative_proposal_sha256=" in recovery_log
+    local_hash = recovery_log.split("local_proposal_sha256=", 1)[1].split(", ", 1)[0]
+    authoritative_hash = recovery_log.split(
+        "authoritative_proposal_sha256=", 1
+    )[1]
+    assert len(local_hash) == 64
+    assert len(authoritative_hash) == 64
+    int(local_hash, 16)
+    int(authoritative_hash, 16)
+    assert "(10, 21, 22)" not in recovery_log
+    assert "[21, 22]" not in recovery_log
+
+    for proposer in proposers:
+        proposer.proposal_rows = [[31, 32]]
+    second_results = tuple(engine.decode_round(99) for engine in engines)
+
+    assert [agreement.local_blocks[1] for agreement in agreements] == [
+        (99, 31, 32),
+        (99, 31, 32),
+    ]
+    assert [target.proposal_blocks[1] for target in targets] == [
+        (99, 31, 32),
+        (99, 31, 32),
+    ]
+    assert [agreement.acceptances[1] for agreement in agreements] == [
+        (2, 33),
+        (2, 33),
+    ]
+    assert [result.emitted_tokens for result in second_results] == [
+        (31, 32, 33),
+        (31, 32, 33),
+    ]
+    assert [target.offset for target in targets] == [10, 10]
+    assert [target.commit_widths for target in targets] == [[2, 3], [2, 3]]
+    assert [
+        [entry.length for entry in context_cache] for context_cache in context_caches
+    ] == [[10, 10], [10, 10]]
+    assert len(recovered_mismatches) == 1
+
+
 def test_conservative_capture_materializes_two_rank_zero_confidences_only(
     tmp_path: Path,
 ) -> None:
@@ -2584,6 +2789,7 @@ def test_replicated_draft_rejects_malformed_mlx_proposals(
     [
         (DSPARK_ENABLE_ENV, "true"),
         (DSPARK_DUAL_PROPOSER_ENV, "true"),
+        (DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV, "true"),
         (DSPARK_TELEMETRY_ENV, "true"),
         (DSPARK_TELEMETRY_ENV, "2"),
     ],

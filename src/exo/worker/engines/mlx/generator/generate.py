@@ -1651,7 +1651,10 @@ def mlx_generate(
             raise DSparkDistributedStateError(
                 "Kimi K3 DSpark setup requires a tensor-parallel group"
             )
-        agreement = MlxRankAgreement(group)
+        agreement = MlxRankAgreement(
+            group,
+            rank_zero_proposal_recovery=dspark.config.rank_zero_proposal_recovery,
+        )
         dspark_setup = _rank_agreed_dspark_setup(
             agreement,
             lambda: _prepare_dspark_request_setup(

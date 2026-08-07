@@ -44,6 +44,9 @@ DSPARK_CONFIDENCE_JSONL_ENV = "EXO_MLX_KIMI_K3_DSPARK_CONFIDENCE_JSONL"
 DSPARK_CONFIDENCE_SESSION_ENV = "EXO_MLX_KIMI_K3_DSPARK_CONFIDENCE_SESSION"
 DSPARK_DUAL_PROPOSER_ENV = "EXO_MLX_KIMI_K3_DSPARK_DUAL_PROPOSER"
 DSPARK_YARN_CHECKPOINT_ENV = "EXO_MLX_KIMI_K3_DSPARK_YARN_CHECKPOINT"
+DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV = (
+    "EXO_MLX_KIMI_K3_DSPARK_RANK_ZERO_PROPOSAL_RECOVERY"
+)
 
 # These controls live on separate experimental branches.  The first dual
 # proposer deliberately rejects them instead of silently composing untested
@@ -107,6 +110,7 @@ _EXO_COMPANION_ENVS = (
     DSPARK_CONFIDENCE_SESSION_ENV,
     DSPARK_DUAL_PROPOSER_ENV,
     DSPARK_YARN_CHECKPOINT_ENV,
+    DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV,
 )
 
 
@@ -176,6 +180,7 @@ class KimiK3DSparkConfig:
     target_layer_ids: tuple[int, ...] = RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS
     aux_only_prefill: bool = False
     confidence_capture: DSparkConfidenceCaptureConfig | None = None
+    rank_zero_proposal_recovery: bool = False
 
     @property
     def gamma(self) -> int:
@@ -230,6 +235,7 @@ class KimiK3DSparkDualConfig:
             "target_layer_ids",
             "aux_only_prefill",
             "confidence_capture",
+            "rank_zero_proposal_recovery",
         )
         if any(
             getattr(self.old, name) != getattr(self.yarn, name)
@@ -246,6 +252,10 @@ class KimiK3DSparkDualConfig:
     @property
     def verify_width(self) -> Literal[3, 8]:
         return self.old.verify_width
+
+    @property
+    def rank_zero_proposal_recovery(self) -> bool:
+        return self.old.rank_zero_proposal_recovery
 
 
 KimiK3DSparkDeploymentConfig = KimiK3DSparkConfig | KimiK3DSparkDualConfig
@@ -587,6 +597,10 @@ def kimi_k3_dspark_config(
         values,
         verify_width=verify_width,
     )
+    rank_zero_proposal_recovery = _strict_flag(
+        DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV,
+        values.get(DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV, "0"),
+    )
     revision = RADIXARK_KIMI_K3_DSPARK_REVISION
     config_sha256 = RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256
     model_bytes = RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES
@@ -606,6 +620,7 @@ def kimi_k3_dspark_config(
         model_sha256=model_sha256,
         aux_only_prefill=aux_only_prefill,
         confidence_capture=confidence_capture,
+        rank_zero_proposal_recovery=rank_zero_proposal_recovery,
     )
     if not dual_enabled:
         return primary_config
@@ -638,6 +653,7 @@ def kimi_k3_dspark_config(
         model_bytes=yarn_contract.model_bytes,
         model_sha256=yarn_contract.model_sha256,
         aux_only_prefill=aux_only_prefill,
+        rank_zero_proposal_recovery=rank_zero_proposal_recovery,
     )
     return KimiK3DSparkDualConfig(old=primary_config, yarn=yarn_config)
 
@@ -805,8 +821,14 @@ class RankAgreement(Protocol):
 class MlxRankAgreement:
     """Exact token/boundary agreement over an MLX distributed group."""
 
-    def __init__(self, group: mx.distributed.Group | None):
+    def __init__(
+        self,
+        group: mx.distributed.Group | None,
+        *,
+        rank_zero_proposal_recovery: bool = False,
+    ):
         self._group = group
+        self._rank_zero_proposal_recovery = rank_zero_proposal_recovery
 
     @property
     def rank(self) -> int:
@@ -843,10 +865,19 @@ class MlxRankAgreement:
             local_block if valid and local_block is not None else (-1,) * expected_width
         )
         rows = self._all_gather_rows((int(valid), *payload))
-        first = rows[0]
-        if first[0] != 1 or any(row != first for row in rows[1:]):
+        rank_zero = rows[0]
+        if not self._rank_zero_proposal_recovery:
+            if rank_zero[0] != 1 or any(row != rank_zero for row in rows[1:]):
+                return None
+            return rank_zero[1:]
+        # Proposal evaluation is non-mutating, and every draft commit later
+        # appends the target posterior rather than its rank-local proposal.
+        # Rank zero may therefore select the target verification block even
+        # when valid peer proposals differ.  Every peer must still own a valid
+        # materialized draft round so the post-target draft commit is safe.
+        if rank_zero[0] != 1 or any(row[0] != 1 for row in rows[1:]):
             return None
-        return first[1:]
+        return rank_zero[1:]
 
     def agree_acceptance(
         self,
@@ -1862,7 +1893,15 @@ class KimiK3DSparkRoundEngine:
             self.config.verify_width,
         )
         collective_ms += (self.clock() - proposal_agreement_started) * 1000.0
-        if agreed_block is None:
+        recovered_mismatch = (
+            local_block is not None
+            and agreed_block is not None
+            and local_block != agreed_block
+        )
+        recovery_disabled = (
+            recovered_mismatch and not self.config.rank_zero_proposal_recovery
+        )
+        if agreed_block is None or recovery_disabled:
             collective_ms += self._cancel_before_fallback(
                 draft_round=draft_round or prepared_draft,
                 target_round=None,
@@ -1876,7 +1915,23 @@ class KimiK3DSparkRoundEngine:
                 draft_commit_ms=0.0,
                 collective_ms=collective_ms,
                 proposed=0 if local_block is None else len(local_block) - 1,
-                error=local_error or "DSpark proposal tokens disagreed across ranks",
+                error=local_error
+                or (
+                    "DSpark proposal recovery is disabled"
+                    if recovery_disabled
+                    else "DSpark proposal tokens disagreed across ranks"
+                ),
+            )
+        if recovered_mismatch:
+            assert local_block is not None
+            _log_nonfatal_warning(
+                "Kimi K3 DSpark recovered rank-local proposal mismatch: "
+                f"rank={self.collective.rank}, "
+                f"context_offset={agreed_context_offset}, "
+                "local_proposal_sha256="
+                f"{_token_sequence_sha256(local_block[1:], domain=b'exo-k3-dspark-local-proposal/v1\0')}, "
+                "authoritative_proposal_sha256="
+                f"{_token_sequence_sha256(agreed_block[1:], domain=b'exo-k3-dspark-authoritative-proposal/v1\0')}"
             )
 
         target_start = self.clock()

@@ -50,6 +50,7 @@ def _dspark_checkpoint_contract(config: KimiK3DSparkConfig) -> dict[str, object]
         "checkpoint": str(config.checkpoint_path),
         "verify_width": config.verify_width,
         "round_telemetry": config.round_telemetry,
+        "rank_zero_proposal_recovery": config.rank_zero_proposal_recovery,
         "model_id": config.model_id,
         "revision": config.revision,
         "config_sha256": config.config_sha256,
