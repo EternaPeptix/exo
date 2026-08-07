@@ -2,6 +2,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import os
 import random
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
@@ -209,6 +210,52 @@ from exo.utils.task_group import TaskGroup
 
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
+_ADVERTISED_MODEL_IDS_ENV = "EXO_ADVERTISED_MODEL_IDS"
+
+
+def _parse_advertised_model_ids(raw: str | None) -> frozenset[ModelId] | None:
+    """Parse an optional, exact API model-catalog allowlist.
+
+    This filters only model-list responses. The full model-card cache remains
+    available to placement, loading, and an already-running instance.
+    """
+
+    if raw is None:
+        return None
+    values = raw.split(",")
+    if not values or any(not value or value != value.strip() for value in values):
+        raise ValueError(
+            f"{_ADVERTISED_MODEL_IDS_ENV} must be a comma-separated list of "
+            "non-empty model IDs without surrounding whitespace"
+        )
+    result = frozenset(ModelId(value) for value in values)
+    if len(result) != len(values):
+        raise ValueError(f"{_ADVERTISED_MODEL_IDS_ENV} contains duplicate model IDs")
+    return result
+
+
+_ADVERTISED_MODEL_IDS = _parse_advertised_model_ids(
+    os.environ.get(_ADVERTISED_MODEL_IDS_ENV)
+)
+
+
+def _filter_advertised_model_cards(
+    cards: Iterable[ModelCard],
+    advertised_model_ids: frozenset[ModelId] | None = _ADVERTISED_MODEL_IDS,
+) -> list[ModelCard]:
+    cards = list(cards)
+    if advertised_model_ids is None:
+        return cards
+
+    present = {card.model_id for card in cards}
+    missing = advertised_model_ids - present
+    if missing:
+        missing_text = ", ".join(sorted(str(model_id) for model_id in missing))
+        raise RuntimeError(
+            f"configured advertised model IDs are missing from the model-card "
+            f"cache: {missing_text}"
+        )
+    return [card for card in cards if card.model_id in advertised_model_ids]
 
 
 def _format_to_content_type(image_format: Literal["png", "jpeg", "webp"] | None) -> str:
@@ -1693,7 +1740,9 @@ class API:
 
         cards = [
             c
-            for c in await model_cards.card_cache.list_all()
+            for c in _filter_advertised_model_cards(
+                await model_cards.card_cache.list_all()
+            )
             if c.model_id in downloaded_model_ids
         ]
 
@@ -1787,7 +1836,9 @@ class API:
 
     async def get_models(self, status: str | None = Query(default=None)) -> ModelList:
         """Returns list of available models, optionally filtered by being downloaded."""
-        cards = await model_cards.card_cache.list_all()
+        cards = _filter_advertised_model_cards(
+            await model_cards.card_cache.list_all()
+        )
 
         if status == "downloaded":
             downloaded_model_ids: set[str] = set()
