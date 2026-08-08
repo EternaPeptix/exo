@@ -39,6 +39,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     KimiK3DSparkProposerSelection,
     LoadedMlxDSpark,
     LoadedMlxDSparkDual,
+    MlxRankAgreement,
 )
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import rank_agreed_local_stage
@@ -688,6 +689,86 @@ def test_dual_rank_contracts_bind_both_identities_and_fixed_threshold(
     assert "revision" not in single_load_payload
 
 
+def test_packed_selector_changes_load_contracts_and_off_keeps_legacy_json(
+    tmp_path: Path,
+) -> None:
+    legacy_config = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path / "draft",
+        verify_width=3,
+        round_telemetry=False,
+    )
+    explicit_off = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path / "draft",
+        verify_width=3,
+        round_telemetry=False,
+        packed_agreements=False,
+    )
+    packed_config = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path / "draft",
+        verify_width=3,
+        round_telemetry=False,
+        packed_agreements=True,
+    )
+    expected_legacy_config = json.dumps(
+        {
+            "checkpoint": str(legacy_config.checkpoint_path),
+            "config_sha256": legacy_config.config_sha256,
+            "model_bytes": legacy_config.model_bytes,
+            "model_id": legacy_config.model_id,
+            "model_sha256": legacy_config.model_sha256,
+            "rank_zero_proposal_recovery": False,
+            "revision": legacy_config.revision,
+            "round_telemetry": False,
+            "verify_width": 3,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    assert dspark_config_contract(legacy_config) == expected_legacy_config
+    assert dspark_config_contract(explicit_off) == expected_legacy_config
+    assert dspark_config_contract(packed_config) != expected_legacy_config
+    assert (
+        json.loads(dspark_config_contract(packed_config))["packed_agreements"] is True
+    )
+
+    target_model = object()
+
+    def loaded(config: KimiK3DSparkConfig) -> LoadedMlxDSpark:
+        return LoadedMlxDSpark(
+            config=config,
+            target_model=target_model,
+            drafter=object(),
+            proposer=object(),
+        )
+
+    expected_legacy_loaded = json.dumps(
+        {
+            "drafter_class": "builtins.object",
+            "placement": "replicated",
+            "proposer_class": "builtins.object",
+            "verify_width": 3,
+            "vision_processor_present": False,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert (
+        loaded_dspark_contract(loaded(legacy_config), vision_processor_present=False)
+        == expected_legacy_loaded
+    )
+    assert (
+        loaded_dspark_contract(loaded(explicit_off), vision_processor_present=False)
+        == expected_legacy_loaded
+    )
+    packed_loaded = loaded_dspark_contract(
+        loaded(packed_config),
+        vision_processor_present=False,
+    )
+    assert packed_loaded != expected_legacy_loaded
+    assert json.loads(packed_loaded)["packed_agreements"] is True
+
+
 def _sequential_for_callback_test(cancel_receiver: object) -> SequentialGenerator:
     return SequentialGenerator(
         model=cast(Model, object()),
@@ -1284,8 +1365,80 @@ def test_dspark_setup_fingerprint_binds_generation_callback_presence(
         target_route_top_k=8,
     )
 
+    legacy = generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+    )
+    assert legacy == generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        packed_agreements=False,
+    )
+    assert legacy != generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        packed_agreements=True,
+    )
 
-def test_dspark_setup_fingerprint_binds_dual_selection_without_changing_default() -> None:
+
+def test_packed_selector_activates_only_after_legacy_setup_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agreement = MlxRankAgreement(None)
+    rows: list[tuple[int, ...]] = []
+
+    def gathered(row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        rows.append(row)
+        return (row, row)
+
+    monkeypatch.setattr(agreement, "_all_gather_rows", gathered)
+    setup = SimpleNamespace(
+        fingerprint=(1, 2, 3, 4),
+        packed_agreements=True,
+    )
+
+    result = generate_module._rank_agreed_dspark_setup(  # type: ignore[arg-type]
+        agreement,
+        lambda: setup,
+    )
+
+    assert result is setup
+    assert [len(row) for row in rows] == [1, 2, 2, 2, 2, 2]
+    assert agreement.packed_agreements_enabled is True
+
+
+def test_asymmetric_packed_selector_fails_during_legacy_setup_without_shape_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agreement = MlxRankAgreement(None)
+    rows: list[tuple[int, ...]] = []
+
+    def gathered(row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        rows.append(row)
+        peer = list(row)
+        if len(rows) == 3:
+            peer[-1] += 1
+        return (row, tuple(peer))
+
+    monkeypatch.setattr(agreement, "_all_gather_rows", gathered)
+    setup = SimpleNamespace(
+        fingerprint=(1, 2, 3, 4),
+        packed_agreements=True,
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="request controls disagreed"):
+        generate_module._rank_agreed_dspark_setup(  # type: ignore[arg-type]
+            agreement,
+            lambda: setup,
+        )
+
+    assert [len(row) for row in rows] == [1, 2, 2, 2, 2, 2]
+    assert agreement.packed_agreements_enabled is False
+
+
+def test_dspark_setup_fingerprint_binds_dual_selection_without_changing_default() -> (
+    None
+):
     common = {
         "prompt_tokens": cast(object, _PromptTokens((1, 2, 3))),
         "max_tokens": 16,
@@ -1445,6 +1598,7 @@ def _run_mlx_generate_dspark_scenario(
             if capture_finalizations is not None
             else None
         ),
+        log_packed_agreement_attestation=lambda: None,
     )
 
     def create_runtime(*_args: object, **_kwargs: object) -> object:
@@ -1461,6 +1615,7 @@ def _run_mlx_generate_dspark_scenario(
         config=SimpleNamespace(
             confidence_capture=None,
             rank_zero_proposal_recovery=False,
+            packed_agreements=False,
         ),
     )
     group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)

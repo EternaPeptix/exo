@@ -144,6 +144,7 @@ class _DSparkRequestSetup:
     empty_logprobs: mx.array
     prefill_step_size: int
     force_ordinary: bool
+    packed_agreements: bool
     runtime: KimiK3DSparkRequestRuntime
     proposer_selection: KimiK3DSparkProposerSelection | None
     fingerprint: tuple[int, ...]
@@ -237,9 +238,7 @@ def _strict_env_flag(name: str, value: str) -> bool:
     return value == "1"
 
 
-_DSPARK_ORDINARY_AFTER_CONTEXT_ENV = (
-    "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT"
-)
+_DSPARK_ORDINARY_AFTER_CONTEXT_ENV = "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT"
 _DSPARK_FORCE_ORDINARY_ENV = "EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY"
 _DSPARK_MAX_ORDINARY_AFTER_CONTEXT = 1_048_576
 
@@ -1001,13 +1000,11 @@ def warmup_inference(
         _warmup_tokens,
         verify_width,
         force_ordinary,
-    ) = (
-        rank_agreed_local_stage(
-            "inference warmup setup",
-            group,
-            prepare_warmup,
-            warmup_contract,
-        )
+    ) = rank_agreed_local_stage(
+        "inference warmup setup",
+        group,
+        prepare_warmup,
+        warmup_contract,
     )
 
     tokens_generated = 0
@@ -1190,6 +1187,7 @@ def _dspark_setup_fingerprint(
     generation_progress: bool,
     force_ordinary: bool = False,
     ordinary_after_context: int = 0,
+    packed_agreements: bool = False,
     eos_token_ids: tuple[int, ...],
     banned_token_ids: tuple[int, ...],
     terminal_token_ids: tuple[int, ...],
@@ -1243,6 +1241,8 @@ def _dspark_setup_fingerprint(
     add_integer(int(generation_progress), name="generation progress flag")
     add_integer(int(force_ordinary), name="force ordinary flag")
     add_integer(ordinary_after_context, name="ordinary-after-context threshold")
+    if packed_agreements:
+        digest.update(b"exo-kimi-k3-dspark-packed-agreements/v1\0")
     add_tokens(eos_token_ids, name="EOS tokens")
     add_tokens(banned_token_ids, name="banned tokens")
     add_tokens(terminal_token_ids, name="terminal tokens")
@@ -1338,7 +1338,10 @@ def _rank_agreed_dspark_setup(
         raise DSparkDistributedStateError(
             f"Kimi K3 DSpark setup {detail}; no target TP graph was built"
         ) from None
-    return cast(_DSparkRequestSetup, result)
+    agreed_result = cast(_DSparkRequestSetup, result)
+    if agreed_result.packed_agreements:
+        agreement.activate_packed_agreements()
+    return agreed_result
 
 
 def _prepare_dspark_request_setup(
@@ -1483,6 +1486,7 @@ def _prepare_dspark_request_setup(
         generation_progress=generation_progress,
         force_ordinary=force_ordinary,
         ordinary_after_context=ordinary_after_context,
+        packed_agreements=request_dspark.config.packed_agreements,
         eos_token_ids=eos_token_ids,
         banned_token_ids=banned_token_ids,
         terminal_token_ids=terminal_token_ids,
@@ -1508,6 +1512,7 @@ def _prepare_dspark_request_setup(
         empty_logprobs=empty_logprobs,
         prefill_step_size=prefill_step_size,
         force_ordinary=force_ordinary,
+        packed_agreements=request_dspark.config.packed_agreements,
         runtime=runtime,
         proposer_selection=proposer_selection,
         fingerprint=fingerprint,
@@ -2215,6 +2220,9 @@ def mlx_generate(
                     "confidence capture finalization",
                     lambda: dspark_runtime.finalize_confidence_capture(complete=True),
                 )
+
+            if is_done and dspark_runtime is not None:
+                dspark_runtime.log_packed_agreement_attestation()
 
             yield response
 

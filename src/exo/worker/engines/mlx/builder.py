@@ -46,7 +46,7 @@ from .vision import VisionProcessor
 
 
 def _dspark_checkpoint_contract(config: KimiK3DSparkConfig) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "checkpoint": str(config.checkpoint_path),
         "verify_width": config.verify_width,
         "round_telemetry": config.round_telemetry,
@@ -57,6 +57,9 @@ def _dspark_checkpoint_contract(config: KimiK3DSparkConfig) -> dict[str, object]
         "model_bytes": config.model_bytes,
         "model_sha256": config.model_sha256,
     }
+    if config.packed_agreements:
+        payload["packed_agreements"] = True
+    return payload
 
 
 def dspark_config_contract(config: KimiK3DSparkDeploymentConfig | None) -> str:
@@ -118,6 +121,8 @@ def loaded_dspark_contract(
                 f"{type(loaded.proposer).__qualname__}"
             ),
         }
+        if loaded.config.packed_agreements:
+            payload["packed_agreements"] = True
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 

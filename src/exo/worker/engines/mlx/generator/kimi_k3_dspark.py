@@ -47,6 +47,7 @@ DSPARK_YARN_CHECKPOINT_ENV = "EXO_MLX_KIMI_K3_DSPARK_YARN_CHECKPOINT"
 DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV = (
     "EXO_MLX_KIMI_K3_DSPARK_RANK_ZERO_PROPOSAL_RECOVERY"
 )
+DSPARK_PACKED_AGREEMENTS_ENV = "EXO_MLX_KIMI_K3_DSPARK_PACKED_AGREEMENTS"
 
 # These controls live on separate experimental branches.  The first dual
 # proposer deliberately rejects them instead of silently composing untested
@@ -72,9 +73,7 @@ RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES = 4_498_585_858
 RADIXARK_KIMI_K3_DSPARK_MODEL_SHA256 = (
     "29df0e8eafb81909f785df55cb352b90d6a1500c609b1d60526c1a62b4d42495"
 )
-RADIXARK_KIMI_K3_DSPARK_YARN_REVISION = (
-    "9c4b2577dacb572ce88e8aad4357dffb4f6c9796"
-)
+RADIXARK_KIMI_K3_DSPARK_YARN_REVISION = "9c4b2577dacb572ce88e8aad4357dffb4f6c9796"
 RADIXARK_KIMI_K3_DSPARK_YARN_CONFIG_SHA256 = (
     "410dd228c75ff91b57af8a1581d44d2ea096d5604f0d37fbd400470e90d961d3"
 )
@@ -111,6 +110,7 @@ _EXO_COMPANION_ENVS = (
     DSPARK_DUAL_PROPOSER_ENV,
     DSPARK_YARN_CHECKPOINT_ENV,
     DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV,
+    DSPARK_PACKED_AGREEMENTS_ENV,
 )
 
 
@@ -181,6 +181,7 @@ class KimiK3DSparkConfig:
     aux_only_prefill: bool = False
     confidence_capture: DSparkConfidenceCaptureConfig | None = None
     rank_zero_proposal_recovery: bool = False
+    packed_agreements: bool = False
 
     @property
     def gamma(self) -> int:
@@ -236,6 +237,7 @@ class KimiK3DSparkDualConfig:
             "aux_only_prefill",
             "confidence_capture",
             "rank_zero_proposal_recovery",
+            "packed_agreements",
         )
         if any(
             getattr(self.old, name) != getattr(self.yarn, name)
@@ -256,6 +258,10 @@ class KimiK3DSparkDualConfig:
     @property
     def rank_zero_proposal_recovery(self) -> bool:
         return self.old.rank_zero_proposal_recovery
+
+    @property
+    def packed_agreements(self) -> bool:
+        return self.old.packed_agreements
 
 
 KimiK3DSparkDeploymentConfig = KimiK3DSparkConfig | KimiK3DSparkDualConfig
@@ -460,9 +466,7 @@ def validate_local_dspark_checkpoint(
         raise DSparkConfigurationError(
             "Kimi K3 DSpark config.json does not match the pinned config hash"
         )
-    checkpoint_contract = _DSPARK_CHECKPOINT_CONTRACTS_BY_CONFIG_SHA256.get(
-        actual_hash
-    )
+    checkpoint_contract = _DSPARK_CHECKPOINT_CONTRACTS_BY_CONFIG_SHA256.get(actual_hash)
     if expected_config_sha256 is None and checkpoint_contract is None:
         raise DSparkConfigurationError(
             "Kimi K3 DSpark config.json does not match an audited config hash"
@@ -601,6 +605,10 @@ def kimi_k3_dspark_config(
         DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV,
         values.get(DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV, "0"),
     )
+    packed_agreements = _strict_flag(
+        DSPARK_PACKED_AGREEMENTS_ENV,
+        values.get(DSPARK_PACKED_AGREEMENTS_ENV, "0"),
+    )
     revision = RADIXARK_KIMI_K3_DSPARK_REVISION
     config_sha256 = RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256
     model_bytes = RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES
@@ -621,6 +629,7 @@ def kimi_k3_dspark_config(
         aux_only_prefill=aux_only_prefill,
         confidence_capture=confidence_capture,
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
+        packed_agreements=packed_agreements,
     )
     if not dual_enabled:
         return primary_config
@@ -654,6 +663,7 @@ def kimi_k3_dspark_config(
         model_sha256=yarn_contract.model_sha256,
         aux_only_prefill=aux_only_prefill,
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
+        packed_agreements=packed_agreements,
     )
     return KimiK3DSparkDualConfig(old=primary_config, yarn=yarn_config)
 
@@ -816,6 +826,47 @@ class RankAgreement(Protocol):
 
     def agree_token(self, local_token: int | None) -> int | None: ...
 
+    def agree_packed(
+        self,
+        name: str,
+        *,
+        local_success: bool,
+        error_fingerprint: int,
+        payload: tuple[int, ...] = (),
+    ) -> "PackedRankAgreement": ...
+
+
+PACKED_AGREEMENT_PAYLOAD_WIDTH = 8
+PACKED_AGREEMENT_ROW_WIDTH = 4 + PACKED_AGREEMENT_PAYLOAD_WIDTH
+
+
+@dataclass(frozen=True)
+class PackedRankAgreement:
+    """One unanimous fixed-row agreement, or an all-``None`` mismatch."""
+
+    success: bool | None
+    error_fingerprint: int | None
+    payload: tuple[int, ...] | None
+
+
+@dataclass(frozen=True)
+class PackedAgreementAttestation:
+    """Request-local accounting for agreement rows and physical collectives."""
+
+    enabled: bool
+    row_calls: int
+    packed_row_calls: int
+    legacy_row_calls: int
+    physical_all_gathers: int
+
+
+def _packed_operation_tag(name: str) -> int:
+    if not name or len(name) > 256:
+        raise ValueError("packed agreement name must contain 1-256 characters")
+    digest = hashlib.sha256(b"exo-kimi-k3-packed-agreement/v1\0")
+    digest.update(name.encode("utf-8"))
+    return int.from_bytes(digest.digest()[:4], "big") & 0x7FFFFFFF
+
 
 @final
 class MlxRankAgreement:
@@ -829,6 +880,10 @@ class MlxRankAgreement:
     ):
         self._group = group
         self._rank_zero_proposal_recovery = rank_zero_proposal_recovery
+        self._packed_enabled = False
+        self._row_calls = 0
+        self._packed_row_calls = 0
+        self._physical_all_gathers = 0
 
     @property
     def rank(self) -> int:
@@ -837,6 +892,25 @@ class MlxRankAgreement:
     @property
     def size(self) -> int:
         return 1 if self._group is None else self._group.size()
+
+    @property
+    def packed_agreements_enabled(self) -> bool:
+        return self._packed_enabled
+
+    @property
+    def packed_agreement_attestation(self) -> PackedAgreementAttestation:
+        return PackedAgreementAttestation(
+            enabled=self._packed_enabled,
+            row_calls=self._row_calls,
+            packed_row_calls=self._packed_row_calls,
+            legacy_row_calls=self._row_calls - self._packed_row_calls,
+            physical_all_gathers=self._physical_all_gathers,
+        )
+
+    def activate_packed_agreements(self) -> None:
+        """Enable fixed-row packing only after legacy request setup agrees."""
+
+        self._packed_enabled = True
 
     def _all_gather_rows(self, row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
         if self._group is None:
@@ -853,6 +927,73 @@ class MlxRankAgreement:
             for offset in range(0, len(flat_values), row_width)
         )
 
+    def _gather_rows(self, row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        self._row_calls += 1
+        if self._group is not None:
+            self._physical_all_gathers += 1
+        return self._all_gather_rows(row)
+
+    def agree_packed(
+        self,
+        name: str,
+        *,
+        local_success: bool,
+        error_fingerprint: int,
+        payload: tuple[int, ...] = (),
+    ) -> PackedRankAgreement:
+        """Agree status, error, and payload in one universal int32 row."""
+
+        if not self._packed_enabled:
+            raise DSparkConfigurationError(
+                "Kimi K3 packed agreements were not rank-agreed during setup"
+            )
+        if type(local_success) is not bool:
+            raise TypeError("packed agreement success must be boolean")
+        if (
+            type(error_fingerprint) is not int
+            or not 0 <= error_fingerprint <= 0x7FFFFFFF
+        ):
+            raise ValueError("packed agreement error fingerprint must fit int32")
+        if len(payload) > PACKED_AGREEMENT_PAYLOAD_WIDTH:
+            raise ValueError("packed agreement payload exceeds the fixed row")
+        if any(
+            type(value) is not int or not -0x80000000 <= value <= 0x7FFFFFFF
+            for value in payload
+        ):
+            raise ValueError("packed agreement payload values must fit int32")
+
+        tag = _packed_operation_tag(name)
+        row = (
+            tag,
+            int(local_success),
+            error_fingerprint,
+            len(payload),
+            *payload,
+            *((0,) * (PACKED_AGREEMENT_PAYLOAD_WIDTH - len(payload))),
+        )
+        assert len(row) == PACKED_AGREEMENT_ROW_WIDTH
+        self._packed_row_calls += 1
+        rows = self._gather_rows(row)
+        first = rows[0]
+        if (
+            len(first) != PACKED_AGREEMENT_ROW_WIDTH
+            or first[0] != tag
+            or first[1] not in (0, 1)
+            or not 0 <= first[2] <= 0x7FFFFFFF
+            or not 0 <= first[3] <= PACKED_AGREEMENT_PAYLOAD_WIDTH
+            or any(len(peer) != PACKED_AGREEMENT_ROW_WIDTH for peer in rows[1:])
+            or any(peer != first for peer in rows[1:])
+        ):
+            return PackedRankAgreement(None, None, None)
+        payload_width = first[3]
+        if any(first[4 + payload_width :]):
+            return PackedRankAgreement(None, None, None)
+        return PackedRankAgreement(
+            success=first[1] == 1,
+            error_fingerprint=first[2],
+            payload=first[4 : 4 + payload_width],
+        )
+
     def agree_proposal_block(
         self,
         local_block: tuple[int, ...] | None,
@@ -864,7 +1005,7 @@ class MlxRankAgreement:
         payload = (
             local_block if valid and local_block is not None else (-1,) * expected_width
         )
-        rows = self._all_gather_rows((int(valid), *payload))
+        rows = self._gather_rows((int(valid), *payload))
         rank_zero = rows[0]
         if not self._rank_zero_proposal_recovery:
             if rank_zero[0] != 1 or any(row != rank_zero for row in rows[1:]):
@@ -896,7 +1037,7 @@ class MlxRankAgreement:
             local_boundary if valid and local_boundary is not None else -1,
             local_next_token if valid and local_next_token is not None else -1,
         )
-        rows = self._all_gather_rows(row)
+        rows = self._gather_rows(row)
         first = rows[0]
         if first[0] != 1 or any(peer != first for peer in rows[1:]):
             return None
@@ -905,7 +1046,7 @@ class MlxRankAgreement:
     def agree_stage_success(self, local_success: bool) -> bool | None:
         """Return a unanimous result, or ``None`` when rank outcomes differ."""
 
-        rows = self._all_gather_rows((int(local_success),))
+        rows = self._gather_rows((int(local_success),))
         first = rows[0][0]
         if any(row[0] != first for row in rows[1:]):
             return None
@@ -913,7 +1054,7 @@ class MlxRankAgreement:
 
     def agree_token(self, local_token: int | None) -> int | None:
         valid = type(local_token) is int and local_token >= 0
-        rows = self._all_gather_rows(
+        rows = self._gather_rows(
             (int(valid), local_token if valid and local_token is not None else -1)
         )
         first = rows[0]
@@ -1462,13 +1603,60 @@ class KimiK3DSparkRoundEngine:
 
     def _agree_stage(
         self,
+        name: str,
         local_success: bool,
         local_error: str | None,
     ) -> tuple[bool | None, int | None, float]:
+        stage, fingerprint, _payload, collective_ms = self._agree_stage_payload(
+            name,
+            local_success,
+            local_error,
+            (),
+        )
+        return stage, fingerprint, collective_ms
+
+    def _agree_stage_payload(
+        self,
+        name: str,
+        local_success: bool,
+        local_error: str | None,
+        payload: tuple[int | None, ...],
+    ) -> tuple[
+        bool | None,
+        int | None,
+        tuple[int | None, ...] | None,
+        float,
+    ]:
         started = self.clock()
+        if self.config.packed_agreements:
+            agreement = self.collective.agree_packed(
+                f"stage:{name}",
+                local_success=local_success,
+                error_fingerprint=_error_fingerprint(local_error),
+                payload=tuple(-1 if value is None else value for value in payload),
+            )
+            agreed_payload = (
+                None
+                if agreement.payload is None
+                else tuple(
+                    None if value == -1 else value for value in agreement.payload
+                )
+            )
+            return (
+                agreement.success,
+                agreement.error_fingerprint,
+                agreed_payload,
+                (self.clock() - started) * 1000.0,
+            )
         stage = self.collective.agree_stage_success(local_success)
         fingerprint = self.collective.agree_token(_error_fingerprint(local_error))
-        return stage, fingerprint, (self.clock() - started) * 1000.0
+        agreed_payload = tuple(self.collective.agree_token(value) for value in payload)
+        return (
+            stage,
+            fingerprint,
+            agreed_payload,
+            (self.clock() - started) * 1000.0,
+        )
 
     def _cancel_before_fallback(
         self,
@@ -1495,6 +1683,7 @@ class KimiK3DSparkRoundEngine:
 
         local_error = "; ".join(errors) if errors else None
         outcome, fingerprint, collective_ms = self._agree_stage(
+            "pre-commit cancellation",
             local_error is None,
             local_error,
         )
@@ -1521,6 +1710,7 @@ class KimiK3DSparkRoundEngine:
             except Exception as error:
                 local_error = f"draft cancel failed: {type(error).__name__}: {error}"
         _, _, collective_ms = self._agree_stage(
+            "fatal target-commit draft cancellation",
             local_error is None,
             local_error,
         )
@@ -1561,16 +1751,21 @@ class KimiK3DSparkRoundEngine:
                 f"{type(preflight_error).__name__}: {preflight_error}"
             )
 
-        preflight_outcome, preflight_fingerprint, agreement_ms = self._agree_stage(
+        (
+            preflight_outcome,
+            preflight_fingerprint,
+            agreed_preflight_payload,
+            agreement_ms,
+        ) = self._agree_stage_payload(
+            "ordinary target preflight",
             local_preflight_error is None,
             local_preflight_error,
+            (None if local_plan is None else local_plan.agreement_code,),
         )
         collective_ms += agreement_ms
-        plan_started = self.clock()
-        agreed_plan = self.collective.agree_token(
-            None if local_plan is None else local_plan.agreement_code
+        agreed_plan = (
+            None if agreed_preflight_payload is None else agreed_preflight_payload[0]
         )
-        collective_ms += (self.clock() - plan_started) * 1000.0
         if (
             preflight_outcome is not True
             or preflight_fingerprint != 0
@@ -1614,6 +1809,7 @@ class KimiK3DSparkRoundEngine:
             )
 
         build_outcome, build_fingerprint, agreement_ms = self._agree_stage(
+            "ordinary target graph build",
             local_build_error is None,
             local_build_error,
         )
@@ -1658,6 +1854,7 @@ class KimiK3DSparkRoundEngine:
             )
 
         decode_outcome, error_fingerprint, agreement_ms = self._agree_stage(
+            "ordinary target materialization",
             local_decode_error is None,
             local_decode_error,
         )
@@ -1791,14 +1988,21 @@ class KimiK3DSparkRoundEngine:
         except Exception as error:
             local_error = f"draft preflight failed: {type(error).__name__}: {error}"
 
-        preflight_outcome, preflight_fingerprint, agreement_ms = self._agree_stage(
+        (
+            preflight_outcome,
+            preflight_fingerprint,
+            agreed_preflight_payload,
+            agreement_ms,
+        ) = self._agree_stage_payload(
+            "draft preflight",
             local_error is None,
             local_error,
+            (local_context_offset,),
         )
         collective_ms += agreement_ms
-        offset_started = self.clock()
-        agreed_context_offset = self.collective.agree_token(local_context_offset)
-        collective_ms += (self.clock() - offset_started) * 1000.0
+        agreed_context_offset = (
+            None if agreed_preflight_payload is None else agreed_preflight_payload[0]
+        )
         if (
             preflight_outcome is not True
             or preflight_fingerprint != 0
@@ -1828,6 +2032,7 @@ class KimiK3DSparkRoundEngine:
             graph_error = f"draft graph build failed: {type(error).__name__}: {error}"
 
         graph_outcome, graph_fingerprint, agreement_ms = self._agree_stage(
+            "draft graph build",
             graph_error is None,
             graph_error,
         )
@@ -1946,19 +2151,27 @@ class KimiK3DSparkRoundEngine:
             )
             target_cancel_uncertain = isinstance(error, DSparkCancellationError)
 
-        prepare_outcome, prepare_fingerprint, agreement_ms = self._agree_stage(
+        (
+            prepare_outcome,
+            prepare_fingerprint,
+            agreed_prepare_payload,
+            agreement_ms,
+        ) = self._agree_stage_payload(
+            "target transaction prepare",
             target_error is None,
             target_error,
+            (
+                None if prepared_target is None else prepared_target.initial_offset,
+                None if prepared_target is None else prepared_target.mode_code,
+            ),
         )
         collective_ms += agreement_ms
-        offset_started = self.clock()
-        agreed_target_offset = self.collective.agree_token(
-            None if prepared_target is None else prepared_target.initial_offset
+        agreed_target_offset = (
+            None if agreed_prepare_payload is None else agreed_prepare_payload[0]
         )
-        agreed_target_mode = self.collective.agree_token(
-            None if prepared_target is None else prepared_target.mode_code
+        agreed_target_mode = (
+            None if agreed_prepare_payload is None else agreed_prepare_payload[1]
         )
-        collective_ms += (self.clock() - offset_started) * 1000.0
         if (
             prepare_outcome is not True
             or prepare_fingerprint != 0
@@ -1999,6 +2212,7 @@ class KimiK3DSparkRoundEngine:
             target_cancel_uncertain = isinstance(error, DSparkCancellationError)
 
         build_outcome, build_fingerprint, agreement_ms = self._agree_stage(
+            "target verification graph build",
             target_error is None,
             target_error,
         )
@@ -2131,6 +2345,7 @@ class KimiK3DSparkRoundEngine:
             target_commit_fingerprint,
             agreement_ms,
         ) = self._agree_stage(
+            "target commit",
             target_commit_error is None,
             target_commit_error,
         )
@@ -2167,6 +2382,7 @@ class KimiK3DSparkRoundEngine:
             draft_commit_fingerprint,
             agreement_ms,
         ) = self._agree_stage(
+            "draft commit",
             draft_commit_error is None,
             draft_commit_error,
         )
@@ -3987,8 +4203,17 @@ class KimiK3DSparkRequestRuntime:
         except Exception as error:
             local_error = f"{name} failed: {type(error).__name__}: {error}"
 
-        outcome = self.collective.agree_stage_success(local_error is None)
-        fingerprint = self.collective.agree_token(_error_fingerprint(local_error))
+        if self.loaded.config.packed_agreements:
+            agreement = self.collective.agree_packed(
+                f"value:{name}",
+                local_success=local_error is None,
+                error_fingerprint=_error_fingerprint(local_error),
+            )
+            outcome = agreement.success
+            fingerprint = agreement.error_fingerprint
+        else:
+            outcome = self.collective.agree_stage_success(local_error is None)
+            fingerprint = self.collective.agree_token(_error_fingerprint(local_error))
         if outcome is not True or fingerprint != 0:
             detail = (
                 "outcomes disagreed across ranks"
@@ -4016,9 +4241,18 @@ class KimiK3DSparkRequestRuntime:
             local_error = error
             error_text = f"{name} failed: {type(error).__name__}: {error}"
 
-        outcome = self.collective.agree_stage_success(local_error is None)
         local_fingerprint = _error_fingerprint(error_text)
-        agreed_fingerprint = self.collective.agree_token(local_fingerprint)
+        if self.loaded.config.packed_agreements:
+            agreement = self.collective.agree_packed(
+                f"side-effect:{name}",
+                local_success=local_error is None,
+                error_fingerprint=local_fingerprint,
+            )
+            outcome = agreement.success
+            agreed_fingerprint = agreement.error_fingerprint
+        else:
+            outcome = self.collective.agree_stage_success(local_error is None)
+            agreed_fingerprint = self.collective.agree_token(local_fingerprint)
         if outcome is True and agreed_fingerprint == 0:
             return
         if (
@@ -4042,6 +4276,38 @@ class KimiK3DSparkRequestRuntime:
         def render_and_fingerprint() -> tuple[str, tuple[int, ...]]:
             text = operation()
             return text, _token_contract_fingerprint(tuple(text.encode("utf-8")))
+
+        if self.loaded.config.packed_agreements:
+            text: str | None = None
+            fingerprint = (0, 0, 0, 0)
+            local_error: str | None = None
+            try:
+                text, fingerprint = render_and_fingerprint()
+            except Exception as error:
+                local_error = f"{name} failed: {type(error).__name__}: {error}"
+            agreement = self.collective.agree_packed(
+                f"text:{name}",
+                local_success=local_error is None,
+                error_fingerprint=_error_fingerprint(local_error),
+                payload=fingerprint,
+            )
+            if (
+                agreement.success is not True
+                or agreement.error_fingerprint != 0
+                or agreement.payload != fingerprint
+                or text is None
+            ):
+                detail = (
+                    "outcomes disagreed across ranks"
+                    if agreement.success is None
+                    or agreement.error_fingerprint is None
+                    or agreement.payload is None
+                    else "failed on every rank"
+                )
+                raise DSparkDistributedStateError(
+                    f"Kimi K3 DSpark {name} {detail}; request caches cannot continue"
+                ) from None
+            return text
 
         text, fingerprint = self._agreed_operation(name, render_and_fingerprint)
         for word in fingerprint:
@@ -4082,6 +4348,41 @@ class KimiK3DSparkRequestRuntime:
                 *text_fingerprint,
             )
             return result, control
+
+        if self.loaded.config.packed_agreements:
+            result: tuple[int, str | None, bool, str, str] | None = None
+            control = (0, 0, 0, 0, 0, 0, 0)
+            local_error: str | None = None
+            try:
+                result, control = resolve()
+            except Exception as error:
+                local_error = (
+                    f"response control failed: {type(error).__name__}: {error}"
+                )
+            agreement = self.collective.agree_packed(
+                "response-control",
+                local_success=local_error is None,
+                error_fingerprint=_error_fingerprint(local_error),
+                payload=control,
+            )
+            if (
+                agreement.success is not True
+                or agreement.error_fingerprint != 0
+                or agreement.payload != control
+                or result is None
+            ):
+                detail = (
+                    "outcomes disagreed across ranks"
+                    if agreement.success is None
+                    or agreement.error_fingerprint is None
+                    or agreement.payload is None
+                    else "failed on every rank"
+                )
+                raise DSparkDistributedStateError(
+                    "Kimi K3 DSpark response control "
+                    f"{detail}; request caches cannot continue"
+                ) from None
+            return result
 
         result, control = self._agreed_operation("response control", resolve)
         for value in control:
@@ -4244,14 +4545,17 @@ class KimiK3DSparkRequestRuntime:
             expected=len(prompt_prefix),
             name="Kimi K3 prompt prefix",
         )
+        feature_contract = (
+            int(self.compact_greedy),
+            int(self.loaded.config.aux_only_prefill),
+        )
+        if self.loaded.config.packed_agreements:
+            feature_contract = (*feature_contract, 1)
         token_fingerprint = _token_contract_fingerprint(
             tokens,
             self.banned_token_ids,
             self.terminal_token_ids,
-            (
-                int(self.compact_greedy),
-                int(self.loaded.config.aux_only_prefill),
-            ),
+            feature_contract,
         )
         request_fingerprint = _request_control_fingerprint(
             max_tokens=max_tokens,
@@ -4641,6 +4945,27 @@ class KimiK3DSparkRequestRuntime:
     def finalize_confidence_capture(self, *, complete: bool) -> None:
         if self._confidence_recorder is not None:
             self._confidence_recorder.finalize(complete=complete)
+
+    def log_packed_agreement_attestation(self) -> None:
+        """Publish cumulative request-local row counts without a collective."""
+
+        if not self.loaded.config.packed_agreements:
+            return
+        try:
+            attestation = cast(
+                MlxRankAgreement,
+                self.collective,
+            ).packed_agreement_attestation
+            logger.info(
+                "MLX Kimi K3 packed agreement attestation: "
+                f"rank={self.collective.rank}, "
+                f"row_calls={attestation.row_calls}, "
+                f"packed_row_calls={attestation.packed_row_calls}, "
+                f"legacy_row_calls={attestation.legacy_row_calls}, "
+                f"physical_all_gathers={attestation.physical_all_gathers}"
+            )
+        except Exception:
+            _log_nonfatal_warning("Kimi K3 packed agreement attestation logging failed")
 
 
 @dataclass(frozen=True)

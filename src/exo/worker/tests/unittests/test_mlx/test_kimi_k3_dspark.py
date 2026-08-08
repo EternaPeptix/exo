@@ -28,6 +28,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS,
     DSPARK_ENABLE_ENV,
     DSPARK_MODEL_NATIVE_VERIFY_WIDTH,
+    DSPARK_PACKED_AGREEMENTS_ENV,
     DSPARK_PREFIX_CACHE_ENV,
     DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV,
     DSPARK_TELEMETRY_ENV,
@@ -36,6 +37,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     MLX_DSPARK_PROPOSER_ENV,
     MLX_DSPARK_SEGMENTED_SDPA_ENV,
     MLX_REPLAYSSM_ENV,
+    PACKED_AGREEMENT_ROW_WIDTH,
     DSparkCancellationError,
     DSparkConfidenceCaptureConfig,
     DSparkConfidenceCaptureRequest,
@@ -57,6 +59,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     MlxDSparkRequestDraft,
     MlxRankAgreement,
     OrdinaryDecodePlan,
+    PackedRankAgreement,
     ReplaySSMTargetAdapter,
     TargetPosterior,
     TargetVerificationPlan,
@@ -171,14 +174,23 @@ def test_dspark_is_inert_by_default_and_rejects_orphan_companions(
     with pytest.raises(
         DSparkConfigurationError,
         match=(
-            f"{DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV} requires "
-            f"{DSPARK_ENABLE_ENV}=1"
+            f"{DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV} requires {DSPARK_ENABLE_ENV}=1"
         ),
     ):
         kimi_k3_dspark_config(
             is_pipeline=False,
             is_batch=False,
             environ={DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV: "1"},
+        )
+
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{DSPARK_PACKED_AGREEMENTS_ENV} requires {DSPARK_ENABLE_ENV}=1",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ={DSPARK_PACKED_AGREEMENTS_ENV: "1"},
         )
 
 
@@ -203,6 +215,7 @@ def test_dual_proposer_is_default_off_and_preserves_single_config(
     assert config.checkpoint_path == old_path
     assert config.revision == dspark_module.RADIXARK_KIMI_K3_DSPARK_REVISION
     assert config.rank_zero_proposal_recovery is False
+    assert config.packed_agreements is False
     assert calls == [old_path]
 
     with pytest.raises(
@@ -234,6 +247,32 @@ def test_rank_zero_proposal_recovery_requires_explicit_selector(
 
     assert type(config) is KimiK3DSparkConfig
     assert config.rank_zero_proposal_recovery is True
+
+
+def test_packed_agreements_require_strict_explicit_selector(tmp_path: Path) -> None:
+    environment = _enabled_environment(tmp_path)
+    environment[DSPARK_PACKED_AGREEMENTS_ENV] = "1"
+    config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=environment,
+        checkpoint_validator=lambda _path: None,
+    )
+
+    assert type(config) is KimiK3DSparkConfig
+    assert config.packed_agreements is True
+
+    environment[DSPARK_PACKED_AGREEMENTS_ENV] = "true"
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{DSPARK_PACKED_AGREEMENTS_ENV} must be 0 or 1",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
 
 
 def test_dual_proposer_requires_exact_old_and_yarn_checkpoint_pair(
@@ -891,7 +930,12 @@ class _FakeAgreement:
     stage_outcomes: list[bool | None] = field(default_factory=list)
     agreed_tokens: list[int | None] = field(default_factory=list)
     reject_token_call: int | None = None
+    reject_packed_call: int | None = None
     token_calls: int = field(default=0, init=False)
+    packed_calls: list[tuple[str, bool, int, tuple[int, ...]]] = field(
+        default_factory=list,
+        init=False,
+    )
 
     def agree_proposal_block(
         self,
@@ -930,6 +974,19 @@ class _FakeAgreement:
             return self.agreed_tokens.pop(0)
         return local_token
 
+    def agree_packed(
+        self,
+        name: str,
+        *,
+        local_success: bool,
+        error_fingerprint: int,
+        payload: tuple[int, ...] = (),
+    ) -> PackedRankAgreement:
+        self.packed_calls.append((name, local_success, error_fingerprint, payload))
+        if len(self.packed_calls) == self.reject_packed_call:
+            return PackedRankAgreement(None, None, None)
+        return PackedRankAgreement(local_success, error_fingerprint, payload)
+
 
 def _config(
     tmp_path: Path,
@@ -937,6 +994,7 @@ def _config(
     *,
     aux_only_prefill: bool = False,
     rank_zero_proposal_recovery: bool = False,
+    packed_agreements: bool = False,
 ) -> KimiK3DSparkConfig:
     assert width in (3, 8)
     return KimiK3DSparkConfig(
@@ -945,6 +1003,7 @@ def _config(
         round_telemetry=False,
         aux_only_prefill=aux_only_prefill,
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
+        packed_agreements=packed_agreements,
     )
 
 
@@ -955,6 +1014,7 @@ def _engine(
     posterior: Sequence[int],
     agreement: _FakeAgreement | None = None,
     terminal_token_ids: tuple[int, ...] = (),
+    packed_agreements: bool = False,
 ) -> tuple[
     KimiK3DSparkRoundEngine,
     _FakeDraft,
@@ -968,7 +1028,7 @@ def _engine(
     target = _FakeTarget(posterior, events)
     collective = agreement or _FakeAgreement(events)
     engine = KimiK3DSparkRoundEngine(
-        config=_config(tmp_path, width),
+        config=_config(tmp_path, width, packed_agreements=packed_agreements),
         draft=draft,
         target=target,
         collective=collective,
@@ -982,7 +1042,7 @@ def test_width_eight_accepts_seven_proposals_and_bonus_target_token(
 ) -> None:
     proposals = tuple(range(11, 18))
     posterior = (*proposals, 18)
-    engine, draft, target, _collective, events = _engine(
+    engine, draft, target, collective, events = _engine(
         tmp_path,
         proposals=proposals,
         posterior=posterior,
@@ -1015,6 +1075,78 @@ def test_width_eight_accepts_seven_proposals_and_bonus_target_token(
         "draft_commit",
         "agree_stage_1",
     ]
+    assert collective.token_calls == 10
+    assert len([event for event in events if event.startswith("agree_stage_")]) == 6
+    assert collective.packed_calls == []
+
+
+def test_packed_width_three_round_uses_nine_agreement_rows(tmp_path: Path) -> None:
+    agreement = _FakeAgreement([])
+    engine, _draft, _target, _collective, events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+        packed_agreements=True,
+    )
+
+    result = engine.decode_round(10)
+
+    assert result.emitted_tokens == (11, 12, 13)
+    assert agreement.token_calls == 1
+    assert len(agreement.packed_calls) == 6
+    assert [call[0] for call in agreement.packed_calls] == [
+        "stage:draft preflight",
+        "stage:draft graph build",
+        "stage:target transaction prepare",
+        "stage:target verification graph build",
+        "stage:target commit",
+        "stage:draft commit",
+    ]
+    assert events.count("agree_proposal") == 1
+    assert events.count("agree_acceptance") == 1
+    assert agreement.token_calls + len(agreement.packed_calls) + 2 == 9
+
+
+def test_packed_ordinary_tail_uses_five_agreement_rows(tmp_path: Path) -> None:
+    agreement = _FakeAgreement([])
+    engine, _draft, _target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+        packed_agreements=True,
+    )
+
+    result = engine.decode_ordinary_tail(10)
+
+    assert result.emitted_tokens == (999,)
+    assert agreement.token_calls == 2
+    assert [call[0] for call in agreement.packed_calls] == [
+        "stage:ordinary target preflight",
+        "stage:ordinary target graph build",
+        "stage:ordinary target materialization",
+    ]
+    assert agreement.token_calls + len(agreement.packed_calls) == 5
+
+
+def test_packed_ordinary_preflight_mismatch_prevents_graph_build(
+    tmp_path: Path,
+) -> None:
+    agreement = _FakeAgreement([], reject_packed_call=1)
+    engine, _draft, _target, _collective, events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+        packed_agreements=True,
+    )
+
+    with pytest.raises(DSparkDistributedStateError, match="readiness disagreed"):
+        engine.decode_ordinary_tail(10)
+
+    assert "ordinary_build" not in events
+    assert "ordinary_decode" not in events
 
 
 def test_width_three_override_commits_anchor_plus_accepted_prefix(
@@ -1482,6 +1614,66 @@ def test_acceptance_matches_cumprod_prefix_semantics() -> None:
         )
         == 2
     )
+
+
+def test_packed_agreement_uses_one_universal_row_and_attests_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)
+    agreement = MlxRankAgreement(cast(object, group))  # type: ignore[arg-type]
+    rows: list[tuple[int, ...]] = []
+
+    def gathered(row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        rows.append(row)
+        return (row, row)
+
+    monkeypatch.setattr(agreement, "_all_gather_rows", gathered)
+    agreement.activate_packed_agreements()
+
+    assert agreement.agree_packed(
+        "stage:a",
+        local_success=True,
+        error_fingerprint=0,
+    ) == PackedRankAgreement(True, 0, ())
+    assert agreement.agree_packed(
+        "response-control",
+        local_success=True,
+        error_fingerprint=0,
+        payload=(11, 0, 0, 1, 2, 3, 4),
+    ) == PackedRankAgreement(True, 0, (11, 0, 0, 1, 2, 3, 4))
+
+    assert [len(row) for row in rows] == [
+        PACKED_AGREEMENT_ROW_WIDTH,
+        PACKED_AGREEMENT_ROW_WIDTH,
+    ]
+    attestation = agreement.packed_agreement_attestation
+    assert attestation.row_calls == 2
+    assert attestation.packed_row_calls == 2
+    assert attestation.legacy_row_calls == 0
+    assert attestation.physical_all_gathers == 2
+
+
+@pytest.mark.parametrize("field", [0, 1, 2, 3, 4])
+def test_packed_agreement_rejects_peer_tag_status_error_or_payload_mismatch(
+    field: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agreement = MlxRankAgreement(None)
+    agreement.activate_packed_agreements()
+
+    def gathered(row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        peer = list(row)
+        peer[field] = peer[field] + 1
+        return (row, tuple(peer))
+
+    monkeypatch.setattr(agreement, "_all_gather_rows", gathered)
+
+    assert agreement.agree_packed(
+        "ordered-op",
+        local_success=True,
+        error_fingerprint=0,
+        payload=(7,),
+    ) == PackedRankAgreement(None, None, None)
 
 
 def test_rank_zero_valid_proposal_is_authoritative_when_peer_tokens_differ(
@@ -2720,9 +2912,7 @@ def test_rank_zero_block_resynchronizes_draft_context_for_the_next_round(
     assert "local_proposal_sha256=" in recovery_log
     assert "authoritative_proposal_sha256=" in recovery_log
     local_hash = recovery_log.split("local_proposal_sha256=", 1)[1].split(", ", 1)[0]
-    authoritative_hash = recovery_log.split(
-        "authoritative_proposal_sha256=", 1
-    )[1]
+    authoritative_hash = recovery_log.split("authoritative_proposal_sha256=", 1)[1]
     assert len(local_hash) == 64
     assert len(authoritative_hash) == 64
     int(local_hash, 16)
@@ -3360,6 +3550,8 @@ class _FakeAuxPrefillRuntimeTarget(_FakeRuntimeTarget):
 def _prompt_runtime(
     tmp_path: Path,
     agreement: _FakeAgreement,
+    *,
+    packed_agreements: bool = False,
 ) -> tuple[KimiK3DSparkRequestRuntime, list[object]]:
     target_model = _FakeRuntimeTarget()
     target_cache: list[object] = [_FakeTargetCache(), _FakeKDATargetCache()]
@@ -3373,7 +3565,11 @@ def _prompt_runtime(
     return (
         KimiK3DSparkRequestRuntime(
             loaded=LoadedMlxDSpark(
-                config=_config(tmp_path, 3),
+                config=_config(
+                    tmp_path,
+                    3,
+                    packed_agreements=packed_agreements,
+                ),
                 target_model=target_model,
                 drafter=object(),
                 proposer=proposer,
@@ -4033,6 +4229,97 @@ def test_unanimous_progress_cancellation_preserves_original_exception(
 
     with pytest.raises(ExpectedCancellationError, match="cancelled on every rank"):
         runtime.agree_local_side_effect("distributed progress", cancel)
+
+
+def test_packed_callback_unanimous_failure_preserves_original_exception(
+    tmp_path: Path,
+) -> None:
+    class ExpectedCancellationError(Exception):
+        pass
+
+    agreement = _FakeAgreement([])
+    runtime, _target_cache = _prompt_runtime(
+        tmp_path,
+        agreement,
+        packed_agreements=True,
+    )
+
+    def cancel() -> None:
+        raise ExpectedCancellationError("cancelled on every rank")
+
+    with pytest.raises(ExpectedCancellationError, match="cancelled on every rank"):
+        runtime.agree_local_side_effect("distributed progress", cancel)
+
+    assert len(agreement.packed_calls) == 1
+    assert agreement.packed_calls[0][0] == "side-effect:distributed progress"
+
+
+def test_response_agreement_sequence_collapses_from_twenty_one_to_five_rows(
+    tmp_path: Path,
+) -> None:
+    legacy_agreement = _FakeAgreement([])
+    legacy, _target_cache = _prompt_runtime(tmp_path, legacy_agreement)
+    packed_agreement = _FakeAgreement([])
+    packed, _target_cache = _prompt_runtime(
+        tmp_path,
+        packed_agreement,
+        packed_agreements=True,
+    )
+
+    def run(runtime: KimiK3DSparkRequestRuntime) -> None:
+        assert runtime.agree_text("detokenizer output", lambda: "piece") == "piece"
+        assert runtime.agree_local_value("response construction", lambda: 1) == 1
+        assert runtime.agree_response_control(
+            lambda: (11, None, False, "tail", "piece")
+        ) == (11, None, False, "tail", "piece")
+        assert runtime.agree_local_value("public response construction", lambda: 2) == 2
+        runtime.agree_local_side_effect("generation progress callback", lambda: None)
+
+    run(legacy)
+    run(packed)
+
+    legacy_stage_calls = len(
+        [event for event in legacy_agreement.events if event.startswith("agree_stage_")]
+    )
+    assert legacy_stage_calls == 5
+    assert legacy_agreement.token_calls == 16
+    assert legacy_stage_calls + legacy_agreement.token_calls == 21
+    assert packed_agreement.token_calls == 0
+    assert len(packed_agreement.packed_calls) == 5
+    assert [call[0] for call in packed_agreement.packed_calls] == [
+        "text:detokenizer output",
+        "value:response construction",
+        "response-control",
+        "value:public response construction",
+        "side-effect:generation progress callback",
+    ]
+
+
+def test_packed_text_and_control_mismatch_fail_before_next_side_effect(
+    tmp_path: Path,
+) -> None:
+    text_agreement = _FakeAgreement([], reject_packed_call=1)
+    text_runtime, _target_cache = _prompt_runtime(
+        tmp_path,
+        text_agreement,
+        packed_agreements=True,
+    )
+    with pytest.raises(DSparkDistributedStateError, match="detokenizer output"):
+        text_runtime.agree_text("detokenizer output", lambda: "rank-local text")
+
+    control_agreement = _FakeAgreement([], reject_packed_call=1)
+    control_runtime, _target_cache = _prompt_runtime(
+        tmp_path,
+        control_agreement,
+        packed_agreements=True,
+    )
+    callbacks: list[None] = []
+    with pytest.raises(DSparkDistributedStateError, match="response control"):
+        control_runtime.agree_response_control(
+            lambda: (11, None, False, "tail", "piece")
+        )
+
+    assert callbacks == []
 
 
 def test_asymmetric_detokenizer_text_is_rejected_before_stop_control(
