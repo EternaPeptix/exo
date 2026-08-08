@@ -245,10 +245,10 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
     assert result["rank_data_bytes"] == 32
 
 
-def test_execution_runtime_pin_matches_top8_sequential_q3_candidate():
-    assert loader.RUNTIME_MLX_LM_COMMIT == ("2fcf8e1e94941b755f3eb27c4f99731f747ba84c")
+def test_execution_runtime_pin_matches_batched_replayssm_candidate():
+    assert loader.RUNTIME_MLX_LM_COMMIT == ("7216b0d2c71b09f21e9e55c642c24467cb4fc15e")
     assert loader.MLX_LM_KIMI_K3_SHA256 == (
-        "26414ea04f082474d882da36bf823557a9f93af0f736cccd532b881ea2913ab9"
+        "e4d362439a048d463c5aa61a18494a3652fc8e2c435c3d2716fc54ecb656a78f"
     )
     assert loader.MLX_LM_KIMI_K3_FUSED_ROUTER_SHA256 == (
         "14a7cb54eb3585c992504c109db8bed45eb6ec521ae37e680eb601c419ed8ed1"
@@ -257,7 +257,7 @@ def test_execution_runtime_pin_matches_top8_sequential_q3_candidate():
         "beaadba191fb762d70c2fe2d9d41f53f06984b857db02b8b7fefcd93ee15a925"
     )
     assert loader.MLX_LM_CACHE_SHA256 == (
-        "2011e972be37f5d22450cf5e0b3af0620337d1805d243d4de981430676ac68ca"
+        "a83a454942864d6430b0d8f28c716593be4d9286c2a683083b6708df97e04e78"
     )
     assert loader.MLX_LM_GENERATE_SHA256 == (
         "096f24553953a90f8e331cb7c7415a75636db4eec8a5bd159b6ad3e93cc4e369"
