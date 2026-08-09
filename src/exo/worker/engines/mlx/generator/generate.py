@@ -1517,6 +1517,7 @@ def _prepare_dspark_request_setup(
     vision_processor: VisionProcessor | None,
     agreement: MlxRankAgreement,
     generation_progress: bool,
+    activate_prefix_failure_cleanup: Callable[[], None] | None = None,
 ) -> _DSparkRequestSetup:
     """Build all failure-prone local request state without entering TP graphs."""
 
@@ -1637,6 +1638,8 @@ def _prepare_dspark_request_setup(
         requested=task.use_prefix_cache,
         force_ordinary=force_ordinary,
     )
+    if active_prefix_cache is not None and activate_prefix_failure_cleanup is not None:
+        activate_prefix_failure_cleanup()
 
     def setup_fingerprint(
         hit_kind: DSparkPrefixHitKind,
@@ -1671,7 +1674,7 @@ def _prepare_dspark_request_setup(
         )
 
     caches: KVCacheType
-    if dspark_prefix_cache is None:
+    if active_prefix_cache is None:
         caches = make_kv_cache(model=model)
     else:
         prefix_model_binding = kimi_k3_dspark_prefix_model_binding(
@@ -1681,21 +1684,21 @@ def _prepare_dspark_request_setup(
         )
         inspection, inspection_fingerprint = _rank_agreed_dspark_prefix_inspection(
             agreement,
-            lambda: dspark_prefix_cache.inspect(
+            lambda: active_prefix_cache.inspect(
                 logical_prompt_tokens,
                 model_binding=prefix_model_binding,
-                enabled=active_prefix_cache is not None,
+                enabled=True,
             ),
             lambda inspected: setup_fingerprint(
                 inspected.hit_kind,
                 inspected.restored_offset,
                 inspected.model_binding,
             ),
-            dspark_prefix_cache.clear,
+            active_prefix_cache.clear,
         )
         lookup = _rank_agreed_dspark_prefix_restore(
             agreement,
-            lambda: dspark_prefix_cache.restore(
+            lambda: active_prefix_cache.restore(
                 inspection,
                 evaluate=request_dspark.evaluate,
             ),
@@ -1706,7 +1709,7 @@ def _prepare_dspark_request_setup(
                 restored.restored_offset,
                 restored.model_binding,
             ),
-            dspark_prefix_cache.clear,
+            active_prefix_cache.clear,
         )
         prefix_hit_kind = lookup.hit_kind
         prefix_hit_length = lookup.restored_offset
@@ -1902,6 +1905,16 @@ def mlx_generate(
             raise DSparkDistributedStateError(
                 "Kimi K3 DSpark setup requires a tensor-parallel group"
             )
+        prefix_failure_cleanup_active = False
+
+        def activate_prefix_failure_cleanup() -> None:
+            nonlocal prefix_failure_cleanup_active
+            prefix_failure_cleanup_active = True
+
+        def clear_active_prefix_cache() -> None:
+            if prefix_failure_cleanup_active and dspark_prefix_cache is not None:
+                dspark_prefix_cache.clear()
+
         agreement = MlxRankAgreement(
             group,
             rank_zero_proposal_recovery=dspark.config.rank_zero_proposal_recovery,
@@ -1920,10 +1933,9 @@ def mlx_generate(
                 vision_processor=vision_processor,
                 agreement=agreement,
                 generation_progress=on_generation_token is not None,
+                activate_prefix_failure_cleanup=activate_prefix_failure_cleanup,
             ),
-            failure_cleanup=(
-                dspark_prefix_cache.clear if dspark_prefix_cache is not None else None
-            ),
+            failure_cleanup=clear_active_prefix_cache,
         )
         selection = dspark_setup.proposer_selection
         if selection is not None:

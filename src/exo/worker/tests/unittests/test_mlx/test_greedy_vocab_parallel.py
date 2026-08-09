@@ -747,6 +747,7 @@ def test_packed_selector_changes_load_contracts_and_off_keeps_legacy_json(
             "model_bytes": legacy_config.model_bytes,
             "model_id": legacy_config.model_id,
             "model_sha256": legacy_config.model_sha256,
+            "prefix_cache": False,
             "rank_zero_proposal_recovery": False,
             "revision": legacy_config.revision,
             "round_telemetry": False,
@@ -1411,6 +1412,7 @@ def test_dspark_setup_fingerprint_binds_generation_callback_presence(
         packed_agreements=True,
     )
 
+
 def test_packed_selector_activates_only_after_legacy_setup_sequence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1724,6 +1726,8 @@ def _run_mlx_generate_dspark_scenario(
     lifecycle_events: list[str] | None = None,
     capture_finalizations: list[bool] | None = None,
     prompt_tokens: tuple[int, ...] = (1, 2, 10),
+    use_prefix_cache: bool = False,
+    dspark_prefix_cache: KimiK3DSparkPrefixCache | None = None,
 ) -> list[object]:
     model = object()
     tokenizer = SimpleNamespace(detokenizer=_Detokenizer(pieces))
@@ -1786,6 +1790,7 @@ def _run_mlx_generate_dspark_scenario(
             confidence_capture=None,
             rank_zero_proposal_recovery=False,
             packed_agreements=False,
+            prefix_cache=dspark_prefix_cache is not None,
         ),
     )
     group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
@@ -1793,7 +1798,7 @@ def _run_mlx_generate_dspark_scenario(
         model=ModelId("kernelpool/Kimi-K3-2bit-UVMAX"),
         seed=42,
         bench=False,
-        use_prefix_cache=False,
+        use_prefix_cache=use_prefix_cache,
         repetition_penalty=None,
         repetition_context_size=None,
         presence_penalty=None,
@@ -1897,6 +1902,7 @@ def _run_mlx_generate_dspark_scenario(
                 kv_prefix_cache=None,
                 group=cast(object, group),
                 dspark=cast(LoadedMlxDSpark, cast(object, dspark)),
+                dspark_prefix_cache=dspark_prefix_cache,
                 on_generation_token=generation_callback,
             )
         )
@@ -1952,6 +1958,77 @@ def test_dspark_ordinary_cutoff_still_seeds_and_commits_paired_prefix_first(
     assert lifecycle.index("prefix_commit") < lifecycle.index(
         "agree:round engine construction"
     )
+
+
+def test_short_speculative_request_leaves_retained_ordinary_prefix_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix_events: list[str] = []
+    retained_cache = cast(
+        KimiK3DSparkPrefixCache,
+        SimpleNamespace(
+            inspect=lambda *_args, **_kwargs: prefix_events.append("inspect"),
+            restore=lambda *_args, **_kwargs: prefix_events.append("restore"),
+            clear=lambda: prefix_events.append("clear"),
+        ),
+    )
+    monkeypatch.setattr(
+        generate_module,
+        "kimi_k3_dspark_prefix_model_binding",
+        lambda *_args, **_kwargs: prefix_events.append("bind"),
+    )
+
+    _run_mlx_generate_dspark_scenario(
+        monkeypatch,
+        engine=_ScenarioRoundEngine(
+            [_round((11, 12, 13), proposed=2, accepted=2)],
+        ),
+        pieces={11: "one", 12: "two", 13: "done"},
+        eos_ids=(),
+        stop=None,
+        max_tokens=3,
+        use_prefix_cache=True,
+        dspark_prefix_cache=retained_cache,
+    )
+
+    assert prefix_events == []
+
+
+def test_short_speculative_setup_failure_leaves_retained_ordinary_prefix_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix_events: list[str] = []
+    retained_cache = cast(
+        KimiK3DSparkPrefixCache,
+        SimpleNamespace(
+            inspect=lambda *_args, **_kwargs: prefix_events.append("inspect"),
+            restore=lambda *_args, **_kwargs: prefix_events.append("restore"),
+            clear=lambda: prefix_events.append("clear"),
+        ),
+    )
+    monkeypatch.setattr(
+        generate_module,
+        "kimi_k3_dspark_prefix_model_binding",
+        lambda *_args, **_kwargs: prefix_events.append("bind"),
+    )
+
+    with pytest.raises(
+        DSparkDistributedStateError,
+        match="setup outcomes or request controls disagreed",
+    ):
+        _run_mlx_generate_dspark_scenario(
+            monkeypatch,
+            engine=_ScenarioRoundEngine([]),
+            pieces={},
+            eos_ids=(),
+            stop=None,
+            max_tokens=3,
+            setup_agreement=_LocalAgreement(stage_outcome=None),
+            use_prefix_cache=True,
+            dspark_prefix_cache=retained_cache,
+        )
+
+    assert prefix_events == []
 
 
 @pytest.mark.parametrize(

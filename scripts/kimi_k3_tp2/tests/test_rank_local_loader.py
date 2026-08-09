@@ -268,6 +268,14 @@ def test_execution_runtime_pin_matches_batched_replayssm_candidate():
     )
 
 
+def test_execution_runtime_pin_matches_exo_prefix_binding() -> None:
+    from exo.worker.engines.mlx.rank_local_checkpoint import (
+        SUPPORTED_RUNTIME_MLX_LM_COMMIT,
+    )
+
+    assert loader.RUNTIME_MLX_LM_COMMIT == SUPPORTED_RUNTIME_MLX_LM_COMMIT
+
+
 def test_manifest_always_hashes_tokenizer_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
