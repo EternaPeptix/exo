@@ -284,6 +284,25 @@ def _dspark_force_ordinary(prompt_tokens: int) -> bool:
     return forced or (cutoff != 0 and prompt_tokens >= cutoff)
 
 
+def _dspark_request_prefix_cache(
+    prefix_cache: KimiK3DSparkPrefixCache | None,
+    *,
+    requested: bool,
+    force_ordinary: bool,
+) -> KimiK3DSparkPrefixCache | None:
+    """Reuse paired target/draft state only on target-only decode requests.
+
+    The live parity canary proved exact target-only output at the ordinary
+    context gate.  Short speculative requests remain intentionally uncached:
+    changing their restored draft state can change the acceptance schedule,
+    and speculative generation is not a bit-exact correctness boundary.
+    """
+
+    if requested and force_ordinary:
+        return prefix_cache
+    return None
+
+
 def greedy_vocab_parallel_stream_kwargs(
     *,
     temperature: float,
@@ -1613,7 +1632,11 @@ def _prepare_dspark_request_setup(
     prefix_hit_kind: DSparkPrefixHitKind = "disabled"
     prefix_hit_length = 0
     draft_context_cache: object | None = None
-    active_prefix_cache = dspark_prefix_cache if task.use_prefix_cache else None
+    active_prefix_cache = _dspark_request_prefix_cache(
+        dspark_prefix_cache,
+        requested=task.use_prefix_cache,
+        force_ordinary=force_ordinary,
+    )
 
     def setup_fingerprint(
         hit_kind: DSparkPrefixHitKind,
@@ -1661,7 +1684,7 @@ def _prepare_dspark_request_setup(
             lambda: dspark_prefix_cache.inspect(
                 logical_prompt_tokens,
                 model_binding=prefix_model_binding,
-                enabled=task.use_prefix_cache,
+                enabled=active_prefix_cache is not None,
             ),
             lambda inspected: setup_fingerprint(
                 inspected.hit_kind,

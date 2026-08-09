@@ -36,6 +36,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSparkRoundTelemetry,
     KimiK3DSparkConfig,
     KimiK3DSparkDualConfig,
+    KimiK3DSparkPrefixCache,
     KimiK3DSparkProposerSelection,
     LoadedMlxDSpark,
     LoadedMlxDSparkDual,
@@ -172,6 +173,31 @@ def test_dspark_ordinary_context_gate_rejects_invalid_threshold(
 def test_dspark_ordinary_context_gate_rejects_negative_prompt_tokens() -> None:
     with pytest.raises(ValueError, match="prompt token count must be non-negative"):
         generate_module._dspark_force_ordinary(-1)
+
+
+@pytest.mark.parametrize(
+    ("requested", "force_ordinary", "enabled"),
+    [
+        pytest.param(False, False, False, id="unrequested-speculative"),
+        pytest.param(False, True, False, id="unrequested-ordinary"),
+        pytest.param(True, False, False, id="requested-speculative"),
+        pytest.param(True, True, True, id="requested-ordinary"),
+    ],
+)
+def test_dspark_paired_prefix_cache_is_limited_to_target_only_decode(
+    requested: bool,
+    force_ordinary: bool,
+    enabled: bool,
+) -> None:
+    cache = KimiK3DSparkPrefixCache()
+
+    selected = generate_module._dspark_request_prefix_cache(
+        cache,
+        requested=requested,
+        force_ordinary=force_ordinary,
+    )
+
+    assert (selected is cache) is enabled
 
 
 @pytest.mark.parametrize("verify_width", [3, 8])
