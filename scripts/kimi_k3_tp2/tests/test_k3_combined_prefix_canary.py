@@ -263,7 +263,7 @@ def _prefix_row(
 
 
 def _prefix_rows() -> list[dict[str, Any]]:
-    return [
+    rows = [
         _prefix_row("retention_seed_29494", 29_494, True, "none", 0, 155.0, "seed"),
         _prefix_row(
             "cold_retention_append_32768",
@@ -314,6 +314,14 @@ def _prefix_rows() -> list[dict[str, Any]]:
             "append",
         ),
     ]
+    rows[0]["generation_stats"].update(
+        {
+            "speculative_rounds": 6,
+            "speculative_drafted_tokens": 10,
+            "speculative_accepted_tokens": 8,
+        }
+    )
+    return rows
 
 
 def test_prefix_analysis_reports_ttft_speedups_and_parity() -> None:
@@ -351,6 +359,11 @@ def test_prefix_analysis_fails_closed_on_ttft_or_completion_regression() -> None
         canary.MAX_PEAK_MEMORY_BYTES + 1
     )
     with pytest.raises(RuntimeError, match="peak memory"):
+        canary.analyze_prefix(rows)
+
+    rows = _prefix_rows()
+    rows[0]["generation_stats"]["speculative_drafted_tokens"] = 0
+    with pytest.raises(RuntimeError, match="clean speculative decode"):
         canary.analyze_prefix(rows)
 
 

@@ -656,13 +656,31 @@ def analyze_prefix(rows: Sequence[dict[str, object]]) -> dict[str, object]:
             or usage.get("completion_tokens") != PREFIX_OUTPUT_TOKENS
             or stats.get("prefix_cache_hit") != hit
             or stats.get("generation_tokens") != PREFIX_OUTPUT_TOKENS
-            or stats.get("speculative_drafted_tokens") != 0
-            or stats.get("speculative_accepted_tokens") != 0
             or stats.get("speculative_committed_tokens") != PREFIX_OUTPUT_TOKENS
             or stats.get("speculative_error_rounds") != 0
             or stats.get("speculative_fallback_rounds") != 0
         ):
             raise RuntimeError(f"{label} ordinary-prefix contract drifted")
+        if label == "retention_seed_29494":
+            drafted = stats.get("speculative_drafted_tokens")
+            accepted = stats.get("speculative_accepted_tokens")
+            rounds = stats.get("speculative_rounds")
+            if (
+                type(drafted) is not int
+                or drafted <= 0
+                or type(accepted) is not int
+                or not 0 <= accepted <= drafted
+                or type(rounds) is not int
+                or rounds <= 0
+            ):
+                raise RuntimeError(
+                    "retention seed did not use clean speculative decode"
+                )
+        elif (
+            stats.get("speculative_drafted_tokens") != 0
+            or stats.get("speculative_accepted_tokens") != 0
+        ):
+            raise RuntimeError(f"{label} unexpectedly used speculative decode")
         ttft[label] = _finite_positive(row.get("ttft_seconds"), f"{label} TTFT")
         peak_memory[label] = _peak_memory_bytes(row, label)
     parity_groups = (
