@@ -272,7 +272,14 @@ def _strict_append_to_target(
     base_tokens = render_tokens(tokenizer, base)
     if target <= len(base_tokens):
         raise RuntimeError("strict append target must exceed the base length")
-    repeated = (source_text + "\n\n") * max(10, target // 256)
+    source_ids = tokenizer.encode(source_text, add_special_tokens=False)
+    if not isinstance(source_ids, list) or not source_ids:
+        raise RuntimeError("strict append source did not produce tokens")
+    repetitions = max(
+        2,
+        math.ceil(2 * (target - len(base_tokens)) / len(source_ids)) + 2,
+    )
+    repeated = (source_text + "\n\n") * repetitions
     for boundary in ("\n", "\n\n", " ", " x", ".", "!"):
         combined = tokenizer.encode(
             base_text + boundary + repeated,
