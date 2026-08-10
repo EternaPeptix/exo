@@ -53,6 +53,26 @@ def _fixture(
                 {"role": "user", "content": "b" * canary.BASE_PROMPT_TOKENS},
                 {"role": "assistant", "content": "\n"},
             ],
+            "retention_seed_29494": [
+                {
+                    "role": "user",
+                    "content": "r" * canary.RETENTION_SEED_PROMPT_TOKENS,
+                }
+            ],
+            "retention_append_32768": [
+                {
+                    "role": "user",
+                    "content": "r" * canary.RETENTION_SEED_PROMPT_TOKENS,
+                },
+                {
+                    "role": "assistant",
+                    "content": "a"
+                    * (
+                        canary.RETENTION_APPEND_PROMPT_TOKENS
+                        - canary.RETENTION_SEED_PROMPT_TOKENS
+                    ),
+                },
+            ],
         },
     }
     return tokenizer, fixture
@@ -68,6 +88,8 @@ def test_fixture_validates_exact_lengths_and_one_token_append(
     assert len(prompts["decode_4294"]["tokens"]) == 4_294
     assert len(prompts["base_32768"]["tokens"]) == 32_768
     assert len(prompts["append_32769"]["tokens"]) == 32_769
+    assert len(prompts["retention_seed_29494"]["tokens"]) == 29_494
+    assert len(prompts["retention_append_32768"]["tokens"]) == 32_768
 
 
 def test_fixture_attests_raw_sealed_prompt_not_rendered_template(
@@ -106,6 +128,10 @@ def test_fixture_builder_uses_reviewed_prompt_and_constructs_strict_append(
 
     assert len(prompts["base_32768"]["tokens"]) == 32_768
     assert prompts["append_32769"]["tokens"][:-1] == prompts["base_32768"]["tokens"]
+    assert (
+        prompts["retention_append_32768"]["tokens"][:29_494]
+        == prompts["retention_seed_29494"]["tokens"]
+    )
 
 
 def test_fixture_rejects_non_prefix_append(
@@ -144,6 +170,7 @@ def _decode_row(
             **canary.SEALED_SCHEDULE,
             "prefix_cache_hit": "none",
             "effective_generation_tps": tps,
+            "peak_memory_usage": {"in_bytes": 410_000_000_000},
         },
     }
 
@@ -154,6 +181,11 @@ def _decode_rows(tps: float = 21.1) -> list[dict[str, Any]]:
         *[_decode_row(f"decode_rep_{index}", tps) for index in range(1, 6)],
         _decode_row(
             canary.DECODE_PREFIX_SMOKE_LABEL,
+            1.0,
+            use_prefix_cache=True,
+        ),
+        _decode_row(
+            canary.DECODE_POST_PREFIX_SMOKE_LABEL,
             1.0,
             use_prefix_cache=True,
         ),
@@ -169,6 +201,8 @@ def test_decode_analysis_requires_sealed_schedule_hash_and_five_sample_median() 
     assert report["repetitions"] == 5
     assert report["measured_use_prefix_cache"] is False
     assert report["prefix_requested_smoke"]["sealed_hash_and_schedule_match"] is True
+    assert report["post_prefix_smoke"]["sealed_hash_and_schedule_match"] is True
+    assert report["peak_memory_usage_bytes"]["maximum"] == 410_000_000_000
 
 
 def test_decode_analysis_fails_below_21_or_on_schedule_drift() -> None:
@@ -183,6 +217,13 @@ def test_decode_analysis_fails_below_21_or_on_schedule_drift() -> None:
     rows = _decode_rows()
     rows[-1]["use_prefix_cache"] = False
     with pytest.raises(RuntimeError, match="schedule or hash drifted"):
+        canary.analyze_decode(rows)
+
+    rows = _decode_rows()
+    rows[-1]["generation_stats"]["peak_memory_usage"]["in_bytes"] = (
+        canary.MAX_PEAK_MEMORY_BYTES + 1
+    )
+    with pytest.raises(RuntimeError, match="peak memory"):
         canary.analyze_decode(rows)
 
 
@@ -216,12 +257,41 @@ def _prefix_row(
             "speculative_committed_tokens": canary.PREFIX_OUTPUT_TOKENS,
             "speculative_error_rounds": 0,
             "speculative_fallback_rounds": 0,
+            "peak_memory_usage": {"in_bytes": 420_000_000_000},
         },
     }
 
 
 def _prefix_rows() -> list[dict[str, Any]]:
     return [
+        _prefix_row("retention_seed_29494", 29_494, True, "none", 0, 155.0, "seed"),
+        _prefix_row(
+            "cold_retention_append_32768",
+            32_768,
+            False,
+            "none",
+            0,
+            170.0,
+            "retention-append",
+        ),
+        _prefix_row(
+            "cached_retention_append_32768",
+            32_768,
+            True,
+            "partial",
+            canary.RETENTION_CACHED_TOKENS,
+            20.0,
+            "retention-append",
+        ),
+        _prefix_row(
+            "exact_retention_append_32768",
+            32_768,
+            True,
+            "exact",
+            32_767,
+            0.5,
+            "retention-append",
+        ),
         _prefix_row("cold_base_32768", 32_768, True, "none", 0, 12.0, "base"),
         _prefix_row("exact_base_32768", 32_768, True, "exact", 32_767, 1.0, "base"),
         _prefix_row("cold_append_32769", 32_769, False, "none", 0, 8.0, "append"),
@@ -249,6 +319,11 @@ def _prefix_rows() -> list[dict[str, Any]]:
 def test_prefix_analysis_reports_ttft_speedups_and_parity() -> None:
     report = canary.analyze_prefix(_prefix_rows())
 
+    assert report["ttft_speedup"]["retention_append_32768"] == pytest.approx(8.5)
+    assert report["retention"]["fraction"] >= 0.90
+    assert report["retention"]["effective_full_prompt_tps"]["cached"] == pytest.approx(
+        32_768 / 20.0
+    )
     assert report["ttft_speedup"]["exact_32768"] == pytest.approx(12.0)
     assert report["ttft_speedup"]["partial_append_32769"] == pytest.approx(8 / 3)
     assert report["exact_32768_parity"] is True
@@ -257,13 +332,25 @@ def test_prefix_analysis_reports_ttft_speedups_and_parity() -> None:
 
 def test_prefix_analysis_fails_closed_on_ttft_or_completion_regression() -> None:
     rows = _prefix_rows()
-    rows[1]["ttft_seconds"] = 1.21
+    rows[5]["ttft_seconds"] = 1.21
     with pytest.raises(RuntimeError, match="below 10x"):
         canary.analyze_prefix(rows)
 
     rows = _prefix_rows()
-    rows[3]["completion_sha256"] = "different"
+    rows[7]["completion_sha256"] = "different"
     with pytest.raises(RuntimeError, match="parity failed"):
+        canary.analyze_prefix(rows)
+
+    rows = _prefix_rows()
+    rows[2]["ttft_seconds"] = 40.0
+    with pytest.raises(RuntimeError, match="below 5x"):
+        canary.analyze_prefix(rows)
+
+    rows = _prefix_rows()
+    rows[2]["generation_stats"]["peak_memory_usage"]["in_bytes"] = (
+        canary.MAX_PEAK_MEMORY_BYTES + 1
+    )
+    with pytest.raises(RuntimeError, match="peak memory"):
         canary.analyze_prefix(rows)
 
 

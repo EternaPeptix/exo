@@ -249,6 +249,9 @@ def _strict_env_flag(name: str, value: str) -> bool:
 
 _DSPARK_ORDINARY_AFTER_CONTEXT_ENV = "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT"
 _DSPARK_FORCE_ORDINARY_ENV = "EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY"
+_DSPARK_PREFIX_CACHE_SEED_MIN_CONTEXT_ENV = (
+    "EXO_MLX_KIMI_K3_DSPARK_PREFIX_CACHE_SEED_MIN_CONTEXT"
+)
 _DSPARK_MAX_ORDINARY_AFTER_CONTEXT = 1_048_576
 
 
@@ -284,21 +287,48 @@ def _dspark_force_ordinary(prompt_tokens: int) -> bool:
     return forced or (cutoff != 0 and prompt_tokens >= cutoff)
 
 
+def _dspark_prefix_cache_seed_min_context() -> int:
+    """Parse the opt-in lower bound for cold, speculative cache seeding.
+
+    This does not authorize restoring a cache into speculative decode.  It
+    only lets a cache-requested near-gate miss retain its completed prefill so
+    a later target-only request can reuse that prefix.
+    """
+
+    raw = os.environ.get(_DSPARK_PREFIX_CACHE_SEED_MIN_CONTEXT_ENV)
+    if raw is None:
+        return 0
+    return _strict_env_int(
+        _DSPARK_PREFIX_CACHE_SEED_MIN_CONTEXT_ENV,
+        raw,
+        minimum=2,
+        maximum=_DSPARK_MAX_ORDINARY_AFTER_CONTEXT,
+    )
+
+
 def _dspark_request_prefix_cache(
     prefix_cache: KimiK3DSparkPrefixCache | None,
     *,
     requested: bool,
     force_ordinary: bool,
+    prompt_tokens: int,
 ) -> KimiK3DSparkPrefixCache | None:
-    """Reuse paired target/draft state only on target-only decode requests.
+    """Select paired cache state for target-only reuse or seed-only prefill.
 
     The live parity canary proved exact target-only output at the ordinary
-    context gate.  Short speculative requests remain intentionally uncached:
-    changing their restored draft state can change the acceptance schedule,
-    and speculative generation is not a bit-exact correctness boundary.
+    context gate.  Speculative requests never restore retained state because
+    that can change their acceptance schedule.  An explicit near-gate seed
+    threshold may nevertheless retain a cold speculative prefill for a later
+    ordinary append; the inspection path below is disabled for that request,
+    which makes the operation seed-only.
     """
 
-    if requested and force_ordinary:
+    if type(prompt_tokens) is not int or prompt_tokens < 0:
+        raise ValueError("Kimi K3 DSpark prompt token count must be non-negative")
+    seed_min_context = _dspark_prefix_cache_seed_min_context()
+    if requested and (
+        force_ordinary or (seed_min_context != 0 and prompt_tokens >= seed_min_context)
+    ):
         return prefix_cache
     return None
 
@@ -1637,6 +1667,7 @@ def _prepare_dspark_request_setup(
         dspark_prefix_cache,
         requested=task.use_prefix_cache,
         force_ordinary=force_ordinary,
+        prompt_tokens=len(all_prompt_tokens),
     )
     if active_prefix_cache is not None and activate_prefix_failure_cleanup is not None:
         activate_prefix_failure_cleanup()
@@ -1687,7 +1718,9 @@ def _prepare_dspark_request_setup(
             lambda: active_prefix_cache.inspect(
                 logical_prompt_tokens,
                 model_binding=prefix_model_binding,
-                enabled=True,
+                # A below-gate request may seed the cache, but it must never
+                # restore retained state into speculative decode.
+                enabled=force_ordinary,
             ),
             lambda inspected: setup_fingerprint(
                 inspected.hit_kind,

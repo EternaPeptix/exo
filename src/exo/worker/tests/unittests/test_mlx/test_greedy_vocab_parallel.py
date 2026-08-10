@@ -185,19 +185,82 @@ def test_dspark_ordinary_context_gate_rejects_negative_prompt_tokens() -> None:
     ],
 )
 def test_dspark_paired_prefix_cache_is_limited_to_target_only_decode(
+    monkeypatch: pytest.MonkeyPatch,
     requested: bool,
     force_ordinary: bool,
     enabled: bool,
 ) -> None:
+    monkeypatch.delenv(
+        "EXO_MLX_KIMI_K3_DSPARK_PREFIX_CACHE_SEED_MIN_CONTEXT",
+        raising=False,
+    )
     cache = KimiK3DSparkPrefixCache()
 
     selected = generate_module._dspark_request_prefix_cache(
         cache,
         requested=requested,
         force_ordinary=force_ordinary,
+        prompt_tokens=4_294,
     )
 
     assert (selected is cache) is enabled
+
+
+def test_dspark_near_gate_prefix_request_selects_seed_only_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = KimiK3DSparkPrefixCache()
+    monkeypatch.setenv(
+        "EXO_MLX_KIMI_K3_DSPARK_PREFIX_CACHE_SEED_MIN_CONTEXT",
+        "29494",
+    )
+
+    assert (
+        generate_module._dspark_request_prefix_cache(
+            cache,
+            requested=True,
+            force_ordinary=False,
+            prompt_tokens=29_493,
+        )
+        is None
+    )
+    assert (
+        generate_module._dspark_request_prefix_cache(
+            cache,
+            requested=True,
+            force_ordinary=False,
+            prompt_tokens=29_494,
+        )
+        is cache
+    )
+    assert (
+        generate_module._dspark_request_prefix_cache(
+            cache,
+            requested=False,
+            force_ordinary=False,
+            prompt_tokens=32_767,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("raw", ["0", "1", "-1", "1048577", "29k", "true"])
+def test_dspark_prefix_seed_context_rejects_invalid_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+) -> None:
+    monkeypatch.setenv(
+        "EXO_MLX_KIMI_K3_DSPARK_PREFIX_CACHE_SEED_MIN_CONTEXT",
+        raw,
+    )
+
+    with pytest.raises(ValueError, match="must be an integer between 2 and 1048576"):
+        generate_module._dspark_request_prefix_cache(
+            KimiK3DSparkPrefixCache(),
+            requested=True,
+            force_ordinary=False,
+            prompt_tokens=29_494,
+        )
 
 
 @pytest.mark.parametrize("verify_width", [3, 8])
