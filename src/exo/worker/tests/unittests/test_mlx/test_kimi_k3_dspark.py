@@ -27,6 +27,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSPARK_DUAL_PROPOSER_ENV,
     DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS,
     DSPARK_ENABLE_ENV,
+    DSPARK_INTERMEDIATE_VERIFY_WIDTH,
     DSPARK_MODEL_NATIVE_VERIFY_WIDTH,
     DSPARK_PACKED_AGREEMENTS_ENV,
     DSPARK_PREFIX_CACHE_ENV,
@@ -129,7 +130,7 @@ def _dual_environment(old: Path, yarn: Path) -> dict[str, str]:
 def _dual_config(
     tmp_path: Path,
     *,
-    width: Literal[3, 8] = 8,
+    width: Literal[3, 4, 8] = 8,
 ) -> KimiK3DSparkDualConfig:
     old_path = tmp_path / "old"
     yarn_path = tmp_path / "yarn"
@@ -483,10 +484,12 @@ def test_conservative_confidence_capture_requires_complete_strict_metadata(
         )
 
 
-def test_confidence_capture_rejects_width_eight_and_unsafe_paths(
+@pytest.mark.parametrize("width", ["4", "8"])
+def test_confidence_capture_rejects_nonconservative_widths_and_unsafe_paths(
     tmp_path: Path,
+    width: str,
 ) -> None:
-    environment = _enabled_environment(tmp_path, width="8")
+    environment = _enabled_environment(tmp_path, width=width)
     environment.update(
         {
             DSPARK_CONFIDENCE_JSONL_ENV: str(tmp_path / "rounds.jsonl"),
@@ -553,34 +556,46 @@ def test_aux_only_prefill_flag_is_strict_and_default_off(
     assert config.aux_only_prefill
 
 
-def test_width_three_requires_explicit_override_and_warns(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("width", "gamma"),
+    [
+        (DSPARK_CONSERVATIVE_VERIFY_WIDTH, 2),
+        (DSPARK_INTERMEDIATE_VERIFY_WIDTH, 3),
+    ],
+)
+def test_non_native_width_requires_explicit_override_and_warns(
+    tmp_path: Path,
+    width: int,
+    gamma: int,
+) -> None:
     warnings: list[str] = []
     config = kimi_k3_dspark_config(
         is_pipeline=False,
         is_batch=False,
         environ=_enabled_environment(
             tmp_path,
-            width=str(DSPARK_CONSERVATIVE_VERIFY_WIDTH),
+            width=str(width),
         ),
         warning=warnings.append,
         checkpoint_validator=lambda _path: None,
     )
 
     assert config is not None
-    assert config.verify_width == 3
-    assert config.gamma == 2
+    assert config.verify_width == width
+    assert config.gamma == gamma
     assert len(warnings) == 1
+    assert f"verify width {width} (gamma={gamma})" in warnings[0]
     assert "overrides the model-native width 8" in warnings[0]
 
 
-@pytest.mark.parametrize("width", ["2", "4", "7", "9", " 8", "eight"])
+@pytest.mark.parametrize("width", ["2", "5", "6", "7", "9", " 8", "eight"])
 def test_dspark_rejects_unversioned_or_malformed_widths(
     tmp_path: Path,
     width: str,
 ) -> None:
     with pytest.raises(
         DSparkConfigurationError,
-        match=f"{DSPARK_VERIFY_WIDTH_ENV} must be 3 or 8",
+        match=f"{DSPARK_VERIFY_WIDTH_ENV} must be 3, 4, or 8",
     ):
         kimi_k3_dspark_config(
             is_pipeline=False,
@@ -996,7 +1011,7 @@ def _config(
     rank_zero_proposal_recovery: bool = False,
     packed_agreements: bool = False,
 ) -> KimiK3DSparkConfig:
-    assert width in (3, 8)
+    assert width in (3, 4, 8)
     return KimiK3DSparkConfig(
         checkpoint_path=tmp_path,
         verify_width=width,
@@ -2564,6 +2579,7 @@ def test_target_route_top_k_attestation_rejects_mixed_sparse_layers() -> None:
     ("width", "screening_override", "proposal_rows"),
     [
         (8, False, [[11, 12, 13, 14, 15, 16, 17]]),
+        (4, True, [[11, 12, 13]]),
         (3, True, [[11, 12]]),
     ],
 )

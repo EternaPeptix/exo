@@ -95,10 +95,14 @@ DSPARK_MODEL_NATIVE_VERIFY_WIDTH = DSPARK_MODEL_NATIVE_GAMMA + 1
 # MLX-LM's initial rollout uses a deliberately conservative two proposals.
 DSPARK_CONSERVATIVE_GAMMA = 2
 DSPARK_CONSERVATIVE_VERIFY_WIDTH = DSPARK_CONSERVATIVE_GAMMA + 1
+DSPARK_INTERMEDIATE_GAMMA = 3
+DSPARK_INTERMEDIATE_VERIFY_WIDTH = DSPARK_INTERMEDIATE_GAMMA + 1
 DSPARK_ALLOWED_VERIFY_WIDTHS = (
     DSPARK_CONSERVATIVE_VERIFY_WIDTH,
+    DSPARK_INTERMEDIATE_VERIFY_WIDTH,
     DSPARK_MODEL_NATIVE_VERIFY_WIDTH,
 )
+KimiK3DSparkVerifyWidth = Literal[3, 4, 8]
 
 _EXO_COMPANION_ENVS = (
     DSPARK_CHECKPOINT_ENV,
@@ -169,7 +173,7 @@ class KimiK3DSparkConfig:
     """Validated local checkpoint and replicated placement contract."""
 
     checkpoint_path: Path
-    verify_width: Literal[3, 8]
+    verify_width: KimiK3DSparkVerifyWidth
     round_telemetry: bool
     placement: Literal["replicated"] = "replicated"
     model_id: str = RADIXARK_KIMI_K3_DSPARK_MODEL
@@ -252,7 +256,7 @@ class KimiK3DSparkDualConfig:
             )
 
     @property
-    def verify_width(self) -> Literal[3, 8]:
+    def verify_width(self) -> KimiK3DSparkVerifyWidth:
         return self.old.verify_width
 
     @property
@@ -273,13 +277,13 @@ def _strict_flag(name: str, raw: str) -> bool:
     return raw == "1"
 
 
-def _strict_verify_width(raw: str) -> Literal[3, 8]:
+def _strict_verify_width(raw: str) -> KimiK3DSparkVerifyWidth:
     if not raw.isascii() or not raw.isdecimal():
-        raise DSparkConfigurationError(f"{DSPARK_VERIFY_WIDTH_ENV} must be 3 or 8")
+        raise DSparkConfigurationError(f"{DSPARK_VERIFY_WIDTH_ENV} must be 3, 4, or 8")
     parsed = int(raw)
     if parsed not in DSPARK_ALLOWED_VERIFY_WIDTHS:
-        raise DSparkConfigurationError(f"{DSPARK_VERIFY_WIDTH_ENV} must be 3 or 8")
-    return parsed
+        raise DSparkConfigurationError(f"{DSPARK_VERIFY_WIDTH_ENV} must be 3, 4, or 8")
+    return cast(KimiK3DSparkVerifyWidth, parsed)
 
 
 def _strict_capture_label(name: str, raw: str) -> str:
@@ -421,7 +425,7 @@ def dspark_context_capacity_hint(
     if type(max_tokens) is not int or max_tokens <= 0:
         raise ValueError("Kimi K3 DSpark max tokens must be positive")
     if verify_width not in DSPARK_ALLOWED_VERIFY_WIDTHS:
-        raise ValueError("Kimi K3 DSpark verify width must be 3 or 8")
+        raise ValueError("Kimi K3 DSpark verify width must be 3, 4, or 8")
     capacity_hint = prompt_tokens - 1 + max_tokens
     if capacity_hint > KIMI_K3_MAX_CONTEXT_LENGTH:
         raise ValueError(
@@ -583,10 +587,11 @@ def kimi_k3_dspark_config(
             str(DSPARK_MODEL_NATIVE_VERIFY_WIDTH),
         )
     )
-    if verify_width == DSPARK_CONSERVATIVE_VERIFY_WIDTH:
+    if verify_width != DSPARK_MODEL_NATIVE_VERIFY_WIDTH:
         warning(
-            "Kimi K3 DSpark verify width 3 (gamma=2) overrides the "
-            "model-native width 8 (gamma=7); use only for conservative rollout"
+            f"Kimi K3 DSpark verify width {verify_width} "
+            f"(gamma={verify_width - 1}) overrides the model-native width 8 "
+            "(gamma=7); use only for an explicitly screened rollout"
         )
 
     round_telemetry = _strict_flag(
@@ -3508,7 +3513,7 @@ def load_replicated_mlx_dspark(
     proposer = detected.proposer_type(
         drafter,
         verify_width=config.verify_width,
-        screening_override=(config.verify_width == DSPARK_CONSERVATIVE_VERIFY_WIDTH),
+        screening_override=(config.verify_width != DSPARK_MODEL_NATIVE_VERIFY_WIDTH),
     )
     required_methods = (
         "propose",
