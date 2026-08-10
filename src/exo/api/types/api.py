@@ -262,10 +262,14 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     user: str | None = None
+    # EXO extension for Kimi K3's paired target/draft prefix cache. It is
+    # deliberately opt-in; other model backends retain their existing cache
+    # policy.
+    use_prefix_cache: bool = False
 
 
 class BenchChatCompletionRequest(ChatCompletionRequest):
-    use_prefix_cache: bool = False
+    pass
 
 
 class AddCustomModelParams(BaseModel):

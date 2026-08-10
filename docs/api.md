@@ -262,6 +262,21 @@ Executes a chat completion request using an OpenAI-compatible schema. Supports s
 * `tools`: array (optional) - Tool definitions for function calling
 * `logprobs`: boolean (optional) - Return log probabilities
 * `top_logprobs`: integer (optional) - Number of top log probabilities to return
+* `use_prefix_cache`: boolean (default: false) - EXO extension for a Kimi K3
+  service launched with its paired target/draft prefix cache enabled. `false`
+  keeps Kimi K3 on a fresh target-cache prefill; `true` permits reuse only for
+  an exact or strict-append rendered-token prefix. A cache miss safely performs
+  fresh prefill and then may seed the paired cache. Sending `true` to a Kimi K3
+  service that was not launched with this capability fails closed. This field
+  does not alter the existing cache policy of other model backends.
+
+For a cache-aware EXO client, add this extension field to the JSON body:
+
+```json
+{
+  "use_prefix_cache": true
+}
+```
 
 **Response:**
 OpenAI-compatible chat completion response.

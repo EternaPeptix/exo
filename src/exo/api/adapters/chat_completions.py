@@ -174,6 +174,7 @@ async def chat_request_to_text_generation(
         repetition_context_size=request.repetition_context_size,
         presence_penalty=request.presence_penalty,
         frequency_penalty=request.frequency_penalty,
+        use_prefix_cache=request.use_prefix_cache,
         images=images,
     )
 
