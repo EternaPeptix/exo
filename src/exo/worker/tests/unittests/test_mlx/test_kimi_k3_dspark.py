@@ -24,6 +24,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSPARK_CONFIDENCE_JSONL_ENV,
     DSPARK_CONFIDENCE_SESSION_ENV,
     DSPARK_CONSERVATIVE_VERIFY_WIDTH,
+    DSPARK_DEFERRED_ASYNC_WIDTH3_ENV,
     DSPARK_DUAL_PROPOSER_ENV,
     DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS,
     DSPARK_ENABLE_ENV,
@@ -35,6 +36,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSPARK_TELEMETRY_ENV,
     DSPARK_VERIFY_WIDTH_ENV,
     DSPARK_YARN_CHECKPOINT_ENV,
+    MLX_ASYNC_DECODE_WIDTH3_ENV,
     MLX_DSPARK_PROPOSER_ENV,
     MLX_DSPARK_SEGMENTED_SDPA_ENV,
     MLX_REPLAYSSM_ENV,
@@ -194,6 +196,16 @@ def test_dspark_is_inert_by_default_and_rejects_orphan_companions(
             environ={DSPARK_PACKED_AGREEMENTS_ENV: "1"},
         )
 
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{DSPARK_DEFERRED_ASYNC_WIDTH3_ENV} requires {DSPARK_ENABLE_ENV}=1",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ={DSPARK_DEFERRED_ASYNC_WIDTH3_ENV: "1"},
+        )
+
 
 def test_dual_proposer_is_default_off_and_preserves_single_config(
     tmp_path: Path,
@@ -217,6 +229,7 @@ def test_dual_proposer_is_default_off_and_preserves_single_config(
     assert config.revision == dspark_module.RADIXARK_KIMI_K3_DSPARK_REVISION
     assert config.rank_zero_proposal_recovery is False
     assert config.packed_agreements is False
+    assert config.deferred_async_width3 is False
     assert calls == [old_path]
 
     with pytest.raises(
@@ -273,6 +286,92 @@ def test_packed_agreements_require_strict_explicit_selector(tmp_path: Path) -> N
             is_batch=False,
             environ=environment,
             checkpoint_validator=lambda _path: None,
+        )
+
+
+def test_deferred_async_width_three_requires_paired_strict_flags(
+    tmp_path: Path,
+) -> None:
+    environment = _enabled_environment(tmp_path, width="3")
+    environment[DSPARK_DEFERRED_ASYNC_WIDTH3_ENV] = "1"
+    with pytest.raises(DSparkConfigurationError, match="must both be 1"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+    environment[MLX_ASYNC_DECODE_WIDTH3_ENV] = "1"
+    config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=environment,
+        checkpoint_validator=lambda _path: None,
+    )
+    assert type(config) is KimiK3DSparkConfig
+    assert config.deferred_async_width3 is True
+
+    environment[DSPARK_VERIFY_WIDTH_ENV] = "8"
+    with pytest.raises(DSparkConfigurationError, match="requires.*=3"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+    environment = _enabled_environment(tmp_path, width="3")
+    environment[MLX_ASYNC_DECODE_WIDTH3_ENV] = "1"
+    with pytest.raises(DSparkConfigurationError, match="must both be 1"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+    environment = _enabled_environment(tmp_path, width="3")
+    environment[DSPARK_DEFERRED_ASYNC_WIDTH3_ENV] = "true"
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{DSPARK_DEFERRED_ASYNC_WIDTH3_ENV} must be 0 or 1",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+
+def test_width_four_receipt_contract_rejects_deferred_width_three(
+    tmp_path: Path,
+) -> None:
+    environment = _enabled_environment(tmp_path, width="4")
+    environment[DSPARK_DEFERRED_ASYNC_WIDTH3_ENV] = "1"
+    environment[MLX_ASYNC_DECODE_WIDTH3_ENV] = "1"
+
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{DSPARK_DEFERRED_ASYNC_WIDTH3_ENV}=1 requires .*?=3",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+    with pytest.raises(
+        DSparkConfigurationError,
+        match="requires verify width three",
+    ):
+        KimiK3DSparkConfig(
+            checkpoint_path=tmp_path,
+            verify_width=4,
+            round_telemetry=False,
+            deferred_async_width3=True,
         )
 
 
@@ -844,6 +943,7 @@ class _FakeTarget:
     fail_ordinary_materialize: bool = False
     ordinary_mode: Literal["full", "compact"] = "full"
     verification_mode_code: int = 0
+    deferred_async_decode_states: tuple[object, ...] = ()
 
     def prepare_verification(
         self,
@@ -905,6 +1005,8 @@ class _FakeBuiltTarget:
     cancelled: bool = False
 
     def materialize(self) -> _FakeTargetRound:
+        for index, _root in enumerate(self.owner.deferred_async_decode_states):
+            self.owner.events.append(f"deferred_submit_{index}")
         self.owner.events.append("target_verify")
         if self.owner.fail_verify:
             raise RuntimeError("injected target verification failure")
@@ -1010,6 +1112,7 @@ def _config(
     aux_only_prefill: bool = False,
     rank_zero_proposal_recovery: bool = False,
     packed_agreements: bool = False,
+    deferred_async_width3: bool = False,
 ) -> KimiK3DSparkConfig:
     assert width in (3, 4, 8)
     return KimiK3DSparkConfig(
@@ -1019,6 +1122,7 @@ def _config(
         aux_only_prefill=aux_only_prefill,
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
         packed_agreements=packed_agreements,
+        deferred_async_width3=deferred_async_width3,
     )
 
 
@@ -2251,6 +2355,18 @@ class _FakeTokenArray:
 
 
 @dataclass(frozen=True)
+class _FakeFailingTokenArray:
+    width: int
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (1, self.width)
+
+    def tolist(self) -> object:
+        raise RuntimeError("injected posterior token materialization failure")
+
+
+@dataclass(frozen=True)
 class _FakeConfidenceArray:
     rows: list[list[float]]
 
@@ -2692,6 +2808,38 @@ def test_dual_loader_attests_each_checkpoint_once_and_selects_exact_boundary(
 
     with pytest.raises(FrozenInstanceError):
         old_selection.role = "yarn"
+
+
+def test_dual_loaded_proposers_share_materialization_poison(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    target_model = object()
+    loaded = load_replicated_mlx_dspark_dual(
+        _dual_config(tmp_path),
+        target_model,
+        features=_mock_mlx_features(calls, [[11, 12, 13, 14, 15, 16, 17]]),
+        evaluate=lambda *_values: None,
+    )
+    assert loaded.old is not None
+    assert loaded.yarn is not None
+    assert loaded.old.materialization_poison is loaded.yarn.materialization_poison
+    calls_before_poison = tuple(calls)
+
+    loaded.old.materialization_poison.poison("injected shared uncertainty")
+    loaded.yarn.materialization_poison.poison("later reason must not replace first")
+
+    for operation in (
+        loaded.assert_healthy,
+        lambda: loaded.select(DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS),
+        lambda: loaded.yarn.new_request(capacity_hint=32),
+    ):
+        with pytest.raises(
+            DSparkDistributedStateError,
+            match="injected shared uncertainty.*restart is required",
+        ):
+            operation()
+    assert tuple(calls) == calls_before_poison
 
 
 def test_dual_selection_allocates_only_the_selected_request_cache(
@@ -4066,6 +4214,52 @@ def test_aux_only_prefill_flag_is_bound_into_rank_prompt_contract(
     assert control_fingerprint != candidate_fingerprint
 
 
+def test_deferred_async_flag_is_bound_into_plan_and_prompt_contract(
+    tmp_path: Path,
+) -> None:
+    assert TargetVerificationPlan("full").agreement_code == 0
+    assert TargetVerificationPlan("compact").agreement_code == 1
+    assert (
+        TargetVerificationPlan("full", deferred_async_width3=True).agreement_code == 2
+    )
+    assert (
+        TargetVerificationPlan(
+            "compact",
+            deferred_async_width3=True,
+        ).agreement_code
+        == 3
+    )
+
+    control_runtime, _target, _cache, _context = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+    )
+    candidate_runtime, _target, _cache, _context = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        deferred_async_width3=True,
+    )
+    prompt = cast(mx.array, cast(object, _FakePromptArray((1, 2))))
+
+    control_tokens, control_fingerprint = control_runtime._prompt_contract(
+        prompt,
+        max_tokens=16,
+        prefill_step_size=2,
+        stop_sequences=(),
+        distributed_progress=False,
+    )
+    candidate_tokens, candidate_fingerprint = candidate_runtime._prompt_contract(
+        prompt,
+        max_tokens=16,
+        prefill_step_size=2,
+        stop_sequences=(),
+        distributed_progress=False,
+    )
+
+    assert control_tokens == candidate_tokens == (1, 2)
+    assert control_fingerprint != candidate_fingerprint
+
+
 @pytest.mark.parametrize(
     ("reject_token_call", "control"),
     ((3, "prefill step"), (4, "max tokens"), (9, "stop sequence digest")),
@@ -4569,6 +4763,11 @@ class _FaithfulReplayTarget:
     events: list[tuple[str, int]] = field(default_factory=list)
     ordinary_token: int = 77
     compact_verifier_banned: list[tuple[int, ...]] = field(default_factory=list)
+    deferred_async_decode_states: tuple[object, ...] = ()
+    deferred_requests: list[bool] = field(default_factory=list)
+    emit_deferred_without_request: bool = False
+    fail_cancel: bool = False
+    fail_deferred_posterior_materialization: bool = False
 
     def _ordinary_cache_step(self, cache: object, event: str) -> None:
         entries = cast(list[object], cache)
@@ -4616,6 +4815,8 @@ class _FaithfulReplayTarget:
         inputs: _FaithfulVerifyInput,
         cache: object,
         layer_ids: tuple[int, ...],
+        *,
+        defer_async_decode_boundaries: bool = False,
     ) -> object:
         entries = cast(list[object], cache)
         mla = cast(_FakeTargetCache, entries[0])
@@ -4627,11 +4828,17 @@ class _FaithfulReplayTarget:
         mla.offset += width
         kda.cache = [f"wide-{width}-conv", f"wide-{width}-ssm"]
         kda.speculative_ready = True
+        self.deferred_requests.append(defer_async_decode_boundaries)
         self.events.append(("forward", width))
         return SimpleNamespace(
             logits=_FakeTargetLogits(_FakeTokenLogits((width, 128))),
             aux_hidden_states=tuple(
                 _FakeHidden((1, width, 7168), f"tap-{index}") for index in range(5)
+            ),
+            deferred_async_decode_states=(
+                self.deferred_async_decode_states
+                if defer_async_decode_boundaries or self.emit_deferred_without_request
+                else ()
             ),
         )
 
@@ -4641,6 +4848,8 @@ class _FaithfulReplayTarget:
         cache: object,
         layer_ids: tuple[int, ...],
         banned_token_ids: tuple[int, ...] = (),
+        *,
+        defer_async_decode_boundaries: bool = False,
     ) -> object:
         entries = cast(list[object], cache)
         mla = cast(_FakeTargetCache, entries[0])
@@ -4652,12 +4861,22 @@ class _FaithfulReplayTarget:
         mla.offset += width
         kda.cache = [f"compact-wide-{width}-conv", f"compact-wide-{width}-ssm"]
         kda.speculative_ready = True
+        self.deferred_requests.append(defer_async_decode_boundaries)
         self.compact_verifier_banned.append(banned_token_ids)
         self.events.append(("compact_verify", width))
         return SimpleNamespace(
-            tokens=_FakeTokenArray([list(self.posterior_tokens)]),
+            tokens=(
+                _FakeFailingTokenArray(width)
+                if self.fail_deferred_posterior_materialization
+                else _FakeTokenArray([list(self.posterior_tokens)])
+            ),
             aux_hidden_states=tuple(
                 _FakeHidden((1, width, 7168), f"tap-{index}") for index in range(5)
+            ),
+            deferred_async_decode_states=(
+                self.deferred_async_decode_states
+                if defer_async_decode_boundaries or self.emit_deferred_without_request
+                else ()
             ),
         )
 
@@ -4684,6 +4903,8 @@ class _FaithfulReplayTarget:
         assert isinstance(transaction, _FaithfulTransaction)
         if not transaction.active:
             return
+        if self.fail_cancel:
+            raise RuntimeError("injected target transaction cancellation failure")
         mla = self._active_cache[0]
         kda = self._active_cache[1]
         mla.offset = transaction.initial_offset
@@ -4711,6 +4932,8 @@ def _faithful_request_runtime(
     *,
     compact_greedy: bool = False,
     banned_token_ids: tuple[int, ...] = (),
+    deferred_async_width3: bool = False,
+    async_evaluate: Callable[..., None] = lambda *_values: None,
 ) -> tuple[
     KimiK3DSparkRequestRuntime,
     _FaithfulReplayTarget,
@@ -4733,7 +4956,11 @@ def _faithful_request_runtime(
         evaluate=lambda *_values: None,
     )
     loaded = LoadedMlxDSpark(
-        config=_config(tmp_path, 3),
+        config=_config(
+            tmp_path,
+            3,
+            deferred_async_width3=deferred_async_width3,
+        ),
         target_model=target,
         drafter=object(),
         proposer=proposer,
@@ -4748,6 +4975,7 @@ def _faithful_request_runtime(
         banned_token_ids=banned_token_ids,
         compact_greedy=compact_greedy,
         evaluate=lambda *_values: None,
+        async_evaluate=async_evaluate,
     )
     target_cache[0].offset = 5
     target_cache[1].cache = ["initial-conv", "initial-ssm"]
@@ -4773,6 +5001,16 @@ def _patch_faithful_verification_mlx(
         dspark_module,
         "_build_greedy_dspark_posterior_tokens",
         lambda _logits, **_kwargs: _FakeGreedyTokens(target.posterior_tokens),
+    )
+
+
+def _fake_deferred_async_roots(
+    *,
+    count: int = 12,
+    width: int = 3,
+) -> tuple[_FakeHidden, ...]:
+    return tuple(
+        _FakeHidden((1, width, 7168), f"boundary-{index}") for index in range(count)
     )
 
 
@@ -4830,6 +5068,359 @@ def test_request_runtime_uses_compact_verifier_with_exact_banned_mask(
     ]
     assert target.compact_verifier_banned == [(2, 7)]
     assert target_cache[0].offset == 8
+
+
+@pytest.mark.parametrize("compact_greedy", [False, True])
+def test_deferred_async_roots_submit_in_order_only_after_build_agreement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compact_greedy: bool,
+) -> None:
+    trace: list[object] = []
+    submitted: list[str] = []
+
+    def async_evaluate(root: object) -> None:
+        assert isinstance(root, _FakeHidden)
+        submitted.append(root.name)
+        trace.append(f"async:{root.name}")
+
+    runtime, target, _target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=compact_greedy,
+        deferred_async_width3=True,
+        async_evaluate=async_evaluate,
+    )
+    target.deferred_async_decode_states = _fake_deferred_async_roots()
+    target.events = cast(list[tuple[str, int]], trace)
+    runtime.collective = _FakeAgreement(cast(list[str], trace))
+    runtime.evaluate = lambda *_values: trace.append("target_eval")
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+
+    result = runtime.make_round_engine().decode_round(10)
+
+    assert result.emitted_tokens == (11, 12, 13)
+    assert target.deferred_requests == [True]
+    assert submitted == [f"boundary-{index}" for index in range(12)]
+    build_event = ("compact_verify", 3) if compact_greedy else ("forward", 3)
+    build_index = trace.index(build_event)
+    build_agreement_index = next(
+        index
+        for index, event in enumerate(trace)
+        if index > build_index and event == "agree_stage_1"
+    )
+    async_indices = [
+        index
+        for index, event in enumerate(trace)
+        if isinstance(event, str) and event.startswith("async:boundary-")
+    ]
+    assert len(async_indices) == 12
+    assert min(async_indices) > build_agreement_index
+    assert max(async_indices) < trace.index("target_eval")
+    attestation = runtime.deferred_async_width3_attestation
+    assert attestation.enabled is True
+    assert attestation.validated_rounds == 1
+    assert attestation.materialized_rounds == 1
+    assert attestation.validated_roots == 12
+    assert attestation.submitted_roots == 12
+    assert attestation.first_initial_offset == 5
+    assert attestation.last_initial_offset == 5
+    assert attestation.last_final_offset == 8
+
+
+def test_peer_build_failure_submits_no_deferred_roots_and_cancels_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace: list[object] = []
+    submitted: list[object] = []
+    runtime, target, target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=True,
+        deferred_async_width3=True,
+        async_evaluate=lambda root: submitted.append(root),
+    )
+    target.deferred_async_decode_states = _fake_deferred_async_roots()
+    target.events = cast(list[tuple[str, int]], trace)
+    runtime.collective = _FakeAgreement(
+        cast(list[str], trace),
+        stage_outcomes=[True, True, True, None, True],
+    )
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+
+    result = runtime.make_round_engine().decode_round(10)
+
+    assert result.emitted_tokens == (77,)
+    assert submitted == []
+    assert target.deferred_requests == [True]
+    assert trace.index(("cancel", 0)) < trace.index(("compact", 1))
+    assert target_cache[0].offset == 6
+    assert target_cache[1].speculative_width == 0
+    assert target_cache[1].speculative_ready is False
+    attestation = runtime.deferred_async_width3_attestation
+    assert attestation.validated_rounds == 1
+    assert attestation.materialized_rounds == 0
+    assert attestation.validated_roots == 12
+    assert attestation.submitted_roots == 0
+
+
+@pytest.mark.parametrize("compact_greedy", [False, True])
+def test_deferred_async_materialize_failure_cancels_before_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compact_greedy: bool,
+) -> None:
+    attempts: list[str] = []
+
+    def fail_third(root: object) -> None:
+        assert isinstance(root, _FakeHidden)
+        attempts.append(root.name)
+        if len(attempts) == 3:
+            raise RuntimeError("injected deferred async submission failure")
+
+    runtime, target, target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=compact_greedy,
+        deferred_async_width3=True,
+        async_evaluate=fail_third,
+    )
+    target.deferred_async_decode_states = _fake_deferred_async_roots()
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+
+    engine = runtime.make_round_engine()
+    second_engine = runtime.make_round_engine()
+    with pytest.raises(
+        DSparkDistributedStateError, match="fail-stop before acceptance"
+    ):
+        engine.decode_round(10)
+
+    assert attempts == ["boundary-0", "boundary-1", "boundary-2"]
+    assert ("cancel", 0) in target.events
+    assert ("full", 1) not in target.events
+    assert ("compact", 1) not in target.events
+    assert "agree_acceptance" not in cast(_FakeAgreement, runtime.collective).events
+    assert target_cache[0].offset == 5
+    assert target_cache[1].speculative_width == 0
+    assert target_cache[1].speculative_ready is False
+    post_failure_events = tuple(target.events)
+    for operation in (
+        lambda: engine.decode_round(10),
+        lambda: engine.decode_ordinary_tail(10),
+        lambda: second_engine.decode_round(10),
+        runtime.make_round_engine,
+        lambda: runtime.loaded.new_request(capacity_hint=16),
+    ):
+        with pytest.raises(DSparkDistributedStateError, match="restart is required"):
+            operation()
+    assert tuple(target.events) == post_failure_events
+
+
+@pytest.mark.parametrize("compact_greedy", [False, True])
+def test_deferred_async_final_evaluate_failure_is_fail_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compact_greedy: bool,
+) -> None:
+    submitted: list[object] = []
+    runtime, target, target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=compact_greedy,
+        deferred_async_width3=True,
+        async_evaluate=lambda root: submitted.append(root),
+    )
+    target.deferred_async_decode_states = _fake_deferred_async_roots()
+    runtime.evaluate = lambda *_values: (_ for _ in ()).throw(
+        RuntimeError("injected final target evaluation failure")
+    )
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+
+    with pytest.raises(
+        DSparkDistributedStateError, match="fail-stop before acceptance"
+    ):
+        runtime.make_round_engine().decode_round(10)
+
+    assert submitted == list(target.deferred_async_decode_states)
+    assert ("cancel", 0) in target.events
+    assert ("full", 1) not in target.events
+    assert ("compact", 1) not in target.events
+    assert "agree_acceptance" not in cast(_FakeAgreement, runtime.collective).events
+    assert target_cache[0].offset == 5
+    assert target_cache[1].speculative_width == 0
+    assert target_cache[1].speculative_ready is False
+
+
+def test_deferred_async_posterior_token_materialization_is_fail_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted: list[object] = []
+    runtime, target, target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=True,
+        deferred_async_width3=True,
+        async_evaluate=lambda root: submitted.append(root),
+    )
+    target.deferred_async_decode_states = _fake_deferred_async_roots()
+    target.fail_deferred_posterior_materialization = True
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+
+    with pytest.raises(
+        DSparkDistributedStateError, match="fail-stop before acceptance"
+    ):
+        runtime.make_round_engine().decode_round(10)
+
+    assert submitted == list(target.deferred_async_decode_states)
+    assert ("cancel", 0) in target.events
+    assert "agree_acceptance" not in cast(_FakeAgreement, runtime.collective).events
+    assert target_cache[0].offset == 5
+    assert target_cache[1].speculative_width == 0
+    assert target_cache[1].speculative_ready is False
+
+
+def test_deferred_async_failure_with_target_cancel_error_has_no_later_collective(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace: list[object] = []
+    attempts: list[object] = []
+
+    def fail_first(root: object) -> None:
+        attempts.append(root)
+        raise RuntimeError("injected first deferred submission failure")
+
+    runtime, target, _target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=True,
+        deferred_async_width3=True,
+        async_evaluate=fail_first,
+    )
+    target.deferred_async_decode_states = _fake_deferred_async_roots()
+    target.fail_cancel = True
+    target.events = cast(list[tuple[str, int]], trace)
+    runtime.collective = _FakeAgreement(cast(list[str], trace))
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+
+    engine = runtime.make_round_engine()
+    second_engine = runtime.make_round_engine()
+    with pytest.raises(
+        DSparkDistributedStateError, match="fail-stop before acceptance"
+    ):
+        engine.decode_round(10)
+
+    assert attempts == [target.deferred_async_decode_states[0]]
+    build_index = trace.index(("compact_verify", 3))
+    build_agreement_index = next(
+        index
+        for index, event in enumerate(trace)
+        if index > build_index and event == "agree_stage_1"
+    )
+    assert trace[build_agreement_index + 1 :] == []
+    post_failure_trace = tuple(trace)
+    callbacks: list[str] = []
+    for operation in (
+        lambda: engine.decode_round(10),
+        lambda: engine.decode_ordinary_tail(10),
+        lambda: second_engine.decode_round(10),
+        runtime.make_round_engine,
+        lambda: runtime.loaded.new_request(capacity_hint=16),
+        lambda: runtime.agree_local_value(
+            "poisoned value",
+            lambda: callbacks.append("value"),
+        ),
+        lambda: runtime.agree_local_side_effect(
+            "poisoned side effect",
+            lambda: callbacks.append("side-effect"),
+        ),
+        lambda: runtime.agree_text(
+            "poisoned text",
+            lambda: callbacks.append("text") or "text",
+        ),
+        lambda: runtime.agree_response_control(
+            lambda: callbacks.append("response") or (1, None, False, "", "")
+        ),
+    ):
+        with pytest.raises(DSparkDistributedStateError, match="restart is required"):
+            operation()
+    assert callbacks == []
+    assert tuple(trace) == post_failure_trace
+
+
+@pytest.mark.parametrize(
+    ("enabled", "roots", "emit_without_request", "error_fragment"),
+    [
+        (True, (), False, "returned no boundary roots"),
+        (True, _fake_deferred_async_roots(count=11), False, "exactly 12"),
+        (True, _fake_deferred_async_roots(width=2), False, "must have shape"),
+        (False, _fake_deferred_async_roots(), True, "while EXO_MLX"),
+    ],
+)
+def test_deferred_async_root_contract_fails_closed_before_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    roots: tuple[_FakeHidden, ...],
+    emit_without_request: bool,
+    error_fragment: str,
+) -> None:
+    submitted: list[object] = []
+    runtime, target, target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=True,
+        deferred_async_width3=enabled,
+        async_evaluate=lambda root: submitted.append(root),
+    )
+    target.deferred_async_decode_states = roots
+    target.emit_deferred_without_request = emit_without_request
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+
+    result = runtime.make_round_engine().decode_round(10)
+
+    assert result.emitted_tokens == (77,)
+    assert result.telemetry.fallback is True
+    assert error_fragment in cast(str, result.telemetry.error)
+    assert submitted == []
+    assert target_cache[1].speculative_width == 0
+    assert target_cache[1].speculative_ready is False
+    runtime.loaded.assert_healthy()
+
+
+def test_deferred_async_source_off_attestation_is_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, target, _target_cache, _context_cache = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        compact_greedy=True,
+    )
+    _patch_faithful_verification_mlx(monkeypatch, target)
+    monkeypatch.setenv(MLX_DSPARK_PROPOSER_ENV, "1")
+
+    result = runtime.make_round_engine().decode_round(10)
+
+    assert result.emitted_tokens == (11, 12, 13)
+    attestation = runtime.deferred_async_width3_attestation
+    assert attestation.enabled is False
+    assert attestation.validated_rounds == 0
+    assert attestation.materialized_rounds == 0
+    assert attestation.validated_roots == 0
+    assert attestation.submitted_roots == 0
+    assert attestation.first_initial_offset is None
+    assert attestation.last_initial_offset is None
+    assert attestation.last_final_offset is None
 
 
 def test_requested_compact_verifier_missing_capability_never_opens_transaction(
@@ -4890,18 +5481,21 @@ def test_request_runtime_cancel_restores_clean_target_cache(
         (True, (2,), "full"),
     ],
 )
+@pytest.mark.parametrize("deferred_async_width3", [False, True])
 def test_target_only_fallback_compact_greedy_matches_full_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     compact_greedy: bool,
     banned_token_ids: tuple[int, ...],
     expected_path: str,
+    deferred_async_width3: bool,
 ) -> None:
     runtime, target, target_cache, _context_cache = _faithful_request_runtime(
         tmp_path,
         (11, 12, 13),
         compact_greedy=compact_greedy,
         banned_token_ids=banned_token_ids,
+        deferred_async_width3=deferred_async_width3,
     )
     _patch_faithful_verification_mlx(monkeypatch, target)
     monkeypatch.setattr(
@@ -4914,6 +5508,7 @@ def test_target_only_fallback_compact_greedy_matches_full_path(
 
     assert result.emitted_tokens == (77,)
     assert target.events == [(expected_path, 1)]
+    assert target.deferred_requests == []
     assert target_cache[0].offset == 6
     assert target_cache[1].speculative_width == 0
     assert target_cache[1].speculative_ready is False

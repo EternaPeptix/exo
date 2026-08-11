@@ -24,6 +24,7 @@ import json
 import math
 import os
 import stat
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -52,6 +53,7 @@ DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV = (
 )
 DSPARK_PACKED_AGREEMENTS_ENV = "EXO_MLX_KIMI_K3_DSPARK_PACKED_AGREEMENTS"
 DSPARK_TAIL_OVERLAP_ENV = "EXO_MLX_KIMI_K3_DSPARK_TAIL_OVERLAP"
+DSPARK_DEFERRED_ASYNC_WIDTH3_ENV = "EXO_MLX_KIMI_K3_DEFERRED_ASYNC_WIDTH3"
 
 # These controls live on separate experimental branches.  The first dual
 # proposer deliberately rejects them instead of silently composing untested
@@ -66,6 +68,7 @@ DSPARK_ADAPTIVE_GATE_POLICY_SHA256_ENV = (
 MLX_DSPARK_PROPOSER_ENV = "MLX_LM_KIMI_K3_DSPARK_PROPOSER"
 MLX_REPLAYSSM_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
 MLX_DSPARK_SEGMENTED_SDPA_ENV = "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"
+MLX_ASYNC_DECODE_WIDTH3_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_WIDTH3"
 EXO_VOCAB_PARALLEL_GREEDY_ENV = "EXO_MLX_K3_VOCAB_PARALLEL_GREEDY"
 
 RADIXARK_KIMI_K3_DSPARK_MODEL = "RadixArk/Kimi-K3-DSpark"
@@ -88,6 +91,7 @@ RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS = (7, 23, 51, 67, 83)
 RADIXARK_KIMI_K3_DSPARK_BLOCK_SIZE = 7
 KIMI_K3_TARGET_HIDDEN_SIZE = 7168
 KIMI_K3_TARGET_TAP_COUNT = len(RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS)
+KIMI_K3_DEFERRED_ASYNC_WIDTH3_BOUNDARY_COUNT = 12
 KIMI_K3_MAX_CONTEXT_LENGTH = 1_048_576
 DSPARK_DUAL_PROPOSER_THRESHOLD_TOKENS = 8_192
 
@@ -120,6 +124,7 @@ _EXO_COMPANION_ENVS = (
     DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV,
     DSPARK_PACKED_AGREEMENTS_ENV,
     DSPARK_TAIL_OVERLAP_ENV,
+    DSPARK_DEFERRED_ASYNC_WIDTH3_ENV,
 )
 
 
@@ -146,6 +151,43 @@ class DSparkCollectivePoisonError(DSparkDistributedStateError):
 
 class DSparkCancellationError(RuntimeError):
     """A speculative transaction could not be cancelled safely."""
+
+
+class DSparkDeferredMaterializationError(DSparkCancellationError):
+    """Deferred target work may remain queued, so no later collective is safe."""
+
+
+@dataclass
+class _DSparkMaterializationPoison:
+    """Process-local poison shared by every request using one target/JACCL group."""
+
+    _reason: str | None = field(default=None, init=False, repr=False)
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+
+    @property
+    def reason(self) -> str | None:
+        with self._lock:
+            return self._reason
+
+    def poison(self, reason: str) -> None:
+        """Record the first uncertainty without running cleanup or collectives."""
+
+        with self._lock:
+            if self._reason is None:
+                self._reason = reason or "unknown target materialization failure"
+
+    def raise_if_poisoned(self) -> None:
+        reason = self.reason
+        if reason is not None:
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark target/JACCL state is poisoned after an "
+                f"uncertain materialization: {reason}; runner/group restart is "
+                "required before any later request"
+            ) from None
 
 
 @dataclass(frozen=True)
@@ -201,6 +243,16 @@ class KimiK3DSparkConfig:
     rank_zero_proposal_recovery: bool = False
     packed_agreements: bool = False
     tail_overlap: bool = False
+    deferred_async_width3: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.deferred_async_width3
+            and self.verify_width != DSPARK_CONSERVATIVE_VERIFY_WIDTH
+        ):
+            raise DSparkConfigurationError(
+                "Kimi K3 deferred async decode requires verify width three"
+            )
 
     @property
     def gamma(self) -> int:
@@ -258,6 +310,7 @@ class KimiK3DSparkDualConfig:
             "rank_zero_proposal_recovery",
             "packed_agreements",
             "tail_overlap",
+            "deferred_async_width3",
         )
         if any(
             getattr(self.old, name) != getattr(self.yarn, name)
@@ -282,6 +335,10 @@ class KimiK3DSparkDualConfig:
     @property
     def packed_agreements(self) -> bool:
         return self.old.packed_agreements
+
+    @property
+    def deferred_async_width3(self) -> bool:
+        return self.old.deferred_async_width3
 
 
 KimiK3DSparkDeploymentConfig = KimiK3DSparkConfig | KimiK3DSparkDualConfig
@@ -634,6 +691,23 @@ def kimi_k3_dspark_config(
         DSPARK_TAIL_OVERLAP_ENV,
         values.get(DSPARK_TAIL_OVERLAP_ENV, "0"),
     )
+    deferred_async_width3 = _strict_flag(
+        DSPARK_DEFERRED_ASYNC_WIDTH3_ENV,
+        values.get(DSPARK_DEFERRED_ASYNC_WIDTH3_ENV, "0"),
+    )
+    mlx_async_width3 = _strict_flag(
+        MLX_ASYNC_DECODE_WIDTH3_ENV,
+        values.get(MLX_ASYNC_DECODE_WIDTH3_ENV, "0"),
+    )
+    if deferred_async_width3 != mlx_async_width3:
+        raise DSparkConfigurationError(
+            f"{DSPARK_DEFERRED_ASYNC_WIDTH3_ENV} and "
+            f"{MLX_ASYNC_DECODE_WIDTH3_ENV} must both be 1 or both be 0"
+        )
+    if deferred_async_width3 and verify_width != DSPARK_CONSERVATIVE_VERIFY_WIDTH:
+        raise DSparkConfigurationError(
+            f"{DSPARK_DEFERRED_ASYNC_WIDTH3_ENV}=1 requires {DSPARK_VERIFY_WIDTH_ENV}=3"
+        )
     revision = RADIXARK_KIMI_K3_DSPARK_REVISION
     config_sha256 = RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256
     model_bytes = RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES
@@ -656,6 +730,7 @@ def kimi_k3_dspark_config(
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
         packed_agreements=packed_agreements,
         tail_overlap=tail_overlap,
+        deferred_async_width3=deferred_async_width3,
     )
     if not dual_enabled:
         return primary_config
@@ -691,6 +766,7 @@ def kimi_k3_dspark_config(
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
         packed_agreements=packed_agreements,
         tail_overlap=tail_overlap,
+        deferred_async_width3=deferred_async_width3,
     )
     return KimiK3DSparkDualConfig(old=primary_config, yarn=yarn_config)
 
@@ -805,10 +881,11 @@ class TargetVerificationPlan:
     """Feature-detected target verifier payload agreed before graph build."""
 
     mode: Literal["full", "compact"]
+    deferred_async_width3: bool = False
 
     @property
     def agreement_code(self) -> int:
-        return int(self.mode == "compact")
+        return int(self.mode == "compact") + 2 * int(self.deferred_async_width3)
 
 
 @dataclass(frozen=True)
@@ -904,6 +981,20 @@ class PackedAgreementAttestation:
     packed_row_calls: int
     legacy_row_calls: int
     physical_all_gathers: int
+
+
+@dataclass(frozen=True)
+class DeferredAsyncWidth3Attestation:
+    """Request-local proof of validated and materialized width-three roots."""
+
+    enabled: bool
+    validated_rounds: int
+    materialized_rounds: int
+    validated_roots: int
+    submitted_roots: int
+    first_initial_offset: int | None
+    last_initial_offset: int | None
+    last_final_offset: int | None
 
 
 def _packed_operation_tag(name: str) -> int:
@@ -1612,6 +1703,10 @@ class KimiK3DSparkRoundEngine:
     telemetry_sink: Callable[[DSparkRoundTelemetry], None] | None = None
     confidence_recorder: DSparkConfidenceRecorder | None = None
     clock: Callable[[], float] = time.perf_counter
+    _materialization_poison: _DSparkMaterializationPoison = field(
+        default_factory=_DSparkMaterializationPoison,
+        repr=False,
+    )
     _round_index: int = field(default=0, init=False)
     _disabled_reason: str | None = field(default=None, init=False)
     _confidence_observation: DSparkConfidenceObservation | None = field(
@@ -1795,12 +1890,21 @@ class KimiK3DSparkRoundEngine:
         post-submit agreement on the same group cannot repair that asymmetry:
         it would be ordered behind proposal collectives on the successful rank
         but become the next collective on the failed rank. Record a permanent
-        request-local poison state, perform local-only cancellation, and raise
-        before target commit or any agreement. Normal successful ordering and
-        collective count remain unchanged.
+        loaded-target/JACCL poison state, perform local-only cancellation, and
+        raise before target commit or any agreement. Normal successful ordering
+        and collective count remain unchanged.
         """
 
         reason = f"{type(error).__name__}: {error}"
+        # Tail overlap and deferred target roots share one target/JACCL
+        # stream.  A rank-local tail submission failure is therefore the same
+        # unrecoverable materialization uncertainty as a deferred root failure:
+        # latch it on the loaded object before any later request can enter a
+        # collective.  Keep the engine-local reason as well so the current
+        # request reports the specialized tail poison error.
+        self._materialization_poison.poison(
+            f"tail-overlap async submission uncertainty: {reason}"
+        )
         self._collective_poison_reason = reason
         for state, name in (
             (prepared, "prelaunched draft graph"),
@@ -2267,6 +2371,7 @@ class KimiK3DSparkRoundEngine:
         if type(anchor_token) is not int or anchor_token < 0:
             raise ValueError("anchor_token must be a non-negative integer")
         self._raise_if_collective_poisoned()
+        self._materialization_poison.raise_if_poisoned()
         self._begin_capture_round()
         return self._ordinary_fallback(
             anchor_token,
@@ -2291,6 +2396,7 @@ class KimiK3DSparkRoundEngine:
         if type(anchor_token) is not int or anchor_token < 0:
             raise ValueError("anchor_token must be a non-negative integer")
         self._raise_if_collective_poisoned()
+        self._materialization_poison.raise_if_poisoned()
         self._begin_capture_round()
         if self._disabled_reason is not None:
             return self._ordinary_fallback(
@@ -2626,6 +2732,39 @@ class KimiK3DSparkRoundEngine:
                     # the first visible EOS token.
                     local_boundary = terminal_index
             local_next_token = posterior_tokens[local_boundary]
+        except DSparkCancellationError as error:
+            target_error = f"target verify failed: {type(error).__name__}: {error}"
+            # Poison the shared loaded target before cleanup: either a deferred
+            # boundary or a masked transaction-cancel failure may have left
+            # stream/collective state in flight. No later request may reuse it.
+            self._materialization_poison.poison(target_error)
+            cleanup_errors: list[str] = []
+            try:
+                built_target.cancel()
+            except Exception as cancel_error:
+                cleanup_errors.append(
+                    "target cancel failed: "
+                    f"{type(cancel_error).__name__}: {cancel_error}"
+                )
+            if draft_round is not None:
+                try:
+                    draft_round.cancel()
+                except Exception as cancel_error:
+                    cleanup_errors.append(
+                        "draft cancel failed: "
+                        f"{type(cancel_error).__name__}: {cancel_error}"
+                    )
+            cleanup = (
+                "; local cleanup: " + "; ".join(cleanup_errors)
+                if cleanup_errors
+                else ""
+            )
+            raise DSparkDistributedStateError(
+                "Kimi K3 target materialization or cancellation is uncertain; "
+                "fail-stop before acceptance agreement or ordinary fallback; "
+                "runner/group restart is required"
+                f"{cleanup}"
+            ) from error
         except Exception as error:
             target_error = f"target verify failed: {type(error).__name__}: {error}"
             target_cancel_uncertain = isinstance(error, DSparkCancellationError)
@@ -3784,10 +3923,26 @@ class LoadedMlxDSpark:
     target_route_top_k: int | None = None
     evaluate: Callable[..., None] = mx.eval
     placement: Literal["replicated"] = "replicated"
+    _materialization_poison: _DSparkMaterializationPoison = field(
+        default_factory=_DSparkMaterializationPoison,
+        compare=False,
+        repr=False,
+    )
 
     @property
     def verify_width(self) -> int:
         return self.config.verify_width
+
+    def assert_healthy(self) -> None:
+        """Reject reuse after a target submission left the shared stream uncertain."""
+
+        self._materialization_poison.raise_if_poisoned()
+
+    @property
+    def materialization_poison(self) -> _DSparkMaterializationPoison:
+        """Return the runtime-only latch shared by this target/JACCL group."""
+
+        return self._materialization_poison
 
     def new_request(
         self,
@@ -3795,6 +3950,7 @@ class LoadedMlxDSpark:
         capacity_hint: int,
         capture_confidence: bool = False,
     ) -> MlxDSparkRequestDraft:
+        self.assert_healthy()
         if type(capacity_hint) is not int or capacity_hint <= 0:
             raise ValueError("Kimi K3 DSpark context capacity hint must be positive")
         if capture_confidence and self.config.confidence_capture is None:
@@ -3882,6 +4038,14 @@ class LoadedMlxDSparkDual:
             raise DSparkConfigurationError(
                 "Kimi K3 dual DSpark loaded proposer widths disagree"
             )
+        # Both proposer checkpoints share the same target and JACCL stream.
+        # Keep their immutable public identity while binding one mutable,
+        # runtime-only poison latch to both objects.
+        shared_poison = self.old.materialization_poison
+        yarn_poison_reason = self.yarn.materialization_poison.reason
+        if yarn_poison_reason is not None:
+            shared_poison.poison(yarn_poison_reason)
+        object.__setattr__(self.yarn, "_materialization_poison", shared_poison)
 
     @property
     def verify_width(self) -> int:
@@ -3891,6 +4055,11 @@ class LoadedMlxDSparkDual:
     def target_model(self) -> object:
         old = self._require_loaded(self.old)
         return old.target_model
+
+    def assert_healthy(self) -> None:
+        """Reject either dual checkpoint after their shared stream is poisoned."""
+
+        self._require_loaded(self.old).assert_healthy()
 
     @staticmethod
     def _require_loaded(loaded: LoadedMlxDSpark | None) -> LoadedMlxDSpark:
@@ -3902,6 +4071,7 @@ class LoadedMlxDSparkDual:
         self,
         initial_prompt_tokens: int,
     ) -> tuple[LoadedMlxDSpark, KimiK3DSparkProposerSelection]:
+        self.assert_healthy()
         if type(initial_prompt_tokens) is not int or initial_prompt_tokens < 2:
             raise ValueError(
                 "Kimi K3 dual DSpark initial prompt must contain at least two tokens"
@@ -3943,6 +4113,7 @@ def select_loaded_mlx_dspark(
 ) -> tuple[LoadedMlxDSpark, KimiK3DSparkProposerSelection | None]:
     """Select once; the returned ordinary loaded object owns the only request cache."""
 
+    loaded.assert_healthy()
     if isinstance(loaded, LoadedMlxDSparkDual):
         return loaded.select(initial_prompt_tokens)
     return loaded, None
@@ -4058,6 +4229,7 @@ def load_replicated_mlx_dspark_dual(
 class _TargetForwardResult(Protocol):
     logits: object
     aux_hidden_states: Sequence[object]
+    deferred_async_decode_states: Sequence[object]
 
 
 class _AuxPrefillResult(Protocol):
@@ -4068,6 +4240,7 @@ class _AuxPrefillResult(Protocol):
 class _CompactTargetForwardResult(Protocol):
     tokens: object
     aux_hidden_states: Sequence[object]
+    deferred_async_decode_states: Sequence[object]
 
 
 class _TargetCacheEntry(Protocol):
@@ -4081,6 +4254,8 @@ class _TargetWithAuxForward(Protocol):
         inputs: mx.array,
         cache: object,
         layer_ids: tuple[int, ...],
+        *,
+        defer_async_decode_boundaries: bool = False,
     ) -> object: ...
 
 
@@ -4091,6 +4266,8 @@ class _TargetWithAuxGreedyForward(Protocol):
         cache: object,
         layer_ids: tuple[int, ...],
         banned_token_ids: tuple[int, ...] = (),
+        *,
+        defer_async_decode_boundaries: bool = False,
     ) -> object: ...
 
 
@@ -4247,6 +4424,65 @@ def _validate_target_final_hidden_state(
         )
 
 
+def _validated_deferred_async_decode_states(
+    forward: object,
+    *,
+    expected_width: int,
+    enabled: bool,
+) -> tuple[object, ...]:
+    """Validate immutable width-three roots without evaluating their graphs."""
+
+    raw_value: object = getattr(forward, "deferred_async_decode_states", ())
+    if not isinstance(raw_value, Sequence) or isinstance(raw_value, (str, bytes)):
+        raise TypeError(
+            "Kimi K3 deferred async decode states must be an immutable sequence"
+        )
+    raw_sequence = cast(Sequence[object], raw_value)
+    if len(raw_sequence) == 0:
+        if enabled:
+            raise DSparkFeatureUnavailableError(
+                "Kimi K3 deferred width-three async decode was enabled but "
+                "MLX-LM returned no boundary roots"
+            )
+        return ()
+    if type(cast(object, raw_value)) is not tuple:
+        raise TypeError("Kimi K3 deferred async decode states must be a tuple")
+    raw = cast(tuple[object, ...], raw_value)
+    if not enabled:
+        raise DSparkConfigurationError(
+            "Kimi K3 target returned deferred async boundary roots while "
+            f"{DSPARK_DEFERRED_ASYNC_WIDTH3_ENV}=0"
+        )
+    if expected_width != DSPARK_CONSERVATIVE_VERIFY_WIDTH:
+        raise ValueError("Kimi K3 deferred async decode requires width three")
+    if len(raw) != KIMI_K3_DEFERRED_ASYNC_WIDTH3_BOUNDARY_COUNT:
+        raise ValueError(
+            "Kimi K3 deferred async decode requires exactly "
+            f"{KIMI_K3_DEFERRED_ASYNC_WIDTH3_BOUNDARY_COUNT} boundary roots"
+        )
+
+    expected_shape = (1, expected_width, KIMI_K3_TARGET_HIDDEN_SIZE)
+    roots: list[object] = []
+    for index, root in enumerate(raw):
+        if _shape_tuple(getattr(root, "shape", None)) != expected_shape:
+            raise ValueError(
+                f"Kimi K3 deferred async boundary {index} must have shape "
+                f"[1, {expected_width}, {KIMI_K3_TARGET_HIDDEN_SIZE}]"
+            )
+        roots.append(root)
+    return tuple(roots)
+
+
+def _submit_deferred_async_decode_states(
+    roots: tuple[object, ...],
+    async_evaluate: Callable[..., None],
+) -> None:
+    """Submit one post-agreement boundary root per asynchronous evaluation."""
+
+    for root in roots:
+        async_evaluate(root)
+
+
 def _validate_target_logits(logits: object, *, expected_width: int) -> None:
     shape: object = getattr(logits, "shape", None)
     if not isinstance(shape, Sequence):
@@ -4371,6 +4607,9 @@ class _BuiltKimiK3TargetForward:
         width: int,
         speculative_width: int | None,
         evaluate: Callable[..., None],
+        deferred_async_decode_states: tuple[object, ...] = (),
+        async_evaluate: Callable[..., None] = mx.async_eval,
+        on_deferred_materialized: Callable[[int, int, int], None] | None = None,
     ):
         self.forward = forward
         self.validated_aux_hidden_states = validated_aux_hidden_states
@@ -4379,27 +4618,62 @@ class _BuiltKimiK3TargetForward:
         self._width = width
         self._speculative_width = speculative_width
         self._evaluate = evaluate
+        self._deferred_async_decode_states = deferred_async_decode_states
+        self._async_evaluate = async_evaluate
+        self._on_deferred_materialized = on_deferred_materialized
         self._materialized = False
+
+    @property
+    def deferred_async_decode_enabled(self) -> bool:
+        """Whether this graph owns roots that were submitted asynchronously."""
+
+        return bool(self._deferred_async_decode_states)
 
     def materialize(self, *extra_values: object) -> _TargetForwardResult:
         if self._materialized:
             raise RuntimeError("Kimi K3 target graph was already materialized")
-        self._evaluate(
-            self.forward.logits,
-            self.validated_aux_hidden_states,
-            _target_cache_states(self._target_cache),
-            *extra_values,
-        )
-        _validate_target_cache(
-            self._target_cache,
-            expected_offset=self._initial_offset + self._width,
-            require_kda_state=True,
-            speculative_phase=(
-                "staged" if self._speculative_width is not None else "closed"
-            ),
-            speculative_width=self._speculative_width,
-        )
+        try:
+            _submit_deferred_async_decode_states(
+                self._deferred_async_decode_states,
+                self._async_evaluate,
+            )
+            self._evaluate(
+                self.forward.logits,
+                self.validated_aux_hidden_states,
+                _target_cache_states(self._target_cache),
+                *extra_values,
+            )
+            _validate_target_cache(
+                self._target_cache,
+                expected_offset=self._initial_offset + self._width,
+                require_kda_state=True,
+                speculative_phase=(
+                    "staged" if self._speculative_width is not None else "closed"
+                ),
+                speculative_width=self._speculative_width,
+            )
+        except BaseException as error:
+            if self._deferred_async_decode_states:
+                raise DSparkDeferredMaterializationError(
+                    "Kimi K3 deferred async target materialization failed after "
+                    "boundary submission began; ordinary fallback is unsafe"
+                ) from error
+            raise
         self._materialized = True
+        if (
+            self._deferred_async_decode_states
+            and self._on_deferred_materialized is not None
+        ):
+            try:
+                self._on_deferred_materialized(
+                    self._initial_offset,
+                    self._initial_offset + self._width,
+                    len(self._deferred_async_decode_states),
+                )
+            except Exception:
+                _log_nonfatal_warning(
+                    "Kimi K3 deferred async attestation recording failed"
+                )
         return self.forward
 
 
@@ -4461,11 +4735,27 @@ class _BuiltKimiK3TargetPosterior:
         self._expected_width = expected_width
 
     def materialize(self) -> TargetPosterior:
-        self._forward.materialize(self._tokens)
-        tokens = _materialize_greedy_dspark_posterior_tokens(
-            self._tokens,
-            expected_width=self._expected_width,
-        )
+        try:
+            self._forward.materialize(self._tokens)
+            tokens = _materialize_greedy_dspark_posterior_tokens(
+                self._tokens,
+                expected_width=self._expected_width,
+            )
+        except DSparkDeferredMaterializationError:
+            raise
+        except BaseException as error:
+            # The forward materializer has already submitted the deferred
+            # roots whenever this feature is enabled.  A failure while
+            # materializing posterior tokens is therefore still a deferred
+            # target-materialization failure, not a recoverable ordinary
+            # fallback.  Let the outer ReplaySSM wrapper poison the loaded
+            # target/JACCL group before any acceptance agreement.
+            if self._forward.deferred_async_decode_enabled:
+                raise DSparkDeferredMaterializationError(
+                    "Kimi K3 deferred async posterior materialization failed; "
+                    "ordinary fallback is unsafe"
+                ) from error
+            raise
         return TargetPosterior(
             tokens,
             tuple(self._forward.validated_aux_hidden_states),
@@ -4485,6 +4775,9 @@ class _BuiltKimiK3CompactTargetPosterior:
         initial_offset: int,
         width: int,
         evaluate: Callable[..., None],
+        deferred_async_decode_states: tuple[object, ...] = (),
+        async_evaluate: Callable[..., None] = mx.async_eval,
+        on_deferred_materialized: Callable[[int, int, int], None] | None = None,
     ):
         self._tokens = tokens
         self._aux_hidden_states = aux_hidden_states
@@ -4492,6 +4785,9 @@ class _BuiltKimiK3CompactTargetPosterior:
         self._initial_offset = initial_offset
         self._width = width
         self._evaluate = evaluate
+        self._deferred_async_decode_states = deferred_async_decode_states
+        self._async_evaluate = async_evaluate
+        self._on_deferred_materialized = on_deferred_materialized
         self._materialized = False
 
     def materialize(self) -> TargetPosterior:
@@ -4499,24 +4795,51 @@ class _BuiltKimiK3CompactTargetPosterior:
             raise RuntimeError(
                 "Kimi K3 compact verifier graph was already materialized"
             )
-        self._evaluate(
-            self._tokens,
-            self._aux_hidden_states,
-            _target_cache_states(self._target_cache),
-        )
-        _validate_target_cache(
-            self._target_cache,
-            expected_offset=self._initial_offset + self._width,
-            require_kda_state=True,
-            speculative_phase="staged",
-            speculative_width=self._width,
-        )
-        self._materialized = True
-        return TargetPosterior(
-            _materialize_batched_greedy_tokens(
+        try:
+            _submit_deferred_async_decode_states(
+                self._deferred_async_decode_states,
+                self._async_evaluate,
+            )
+            self._evaluate(
+                self._tokens,
+                self._aux_hidden_states,
+                _target_cache_states(self._target_cache),
+            )
+            _validate_target_cache(
+                self._target_cache,
+                expected_offset=self._initial_offset + self._width,
+                require_kda_state=True,
+                speculative_phase="staged",
+                speculative_width=self._width,
+            )
+            materialized_tokens = _materialize_batched_greedy_tokens(
                 self._tokens,
                 expected_width=self._width,
-            ),
+            )
+        except BaseException as error:
+            if self._deferred_async_decode_states:
+                raise DSparkDeferredMaterializationError(
+                    "Kimi K3 deferred async target materialization failed after "
+                    "boundary submission began; ordinary fallback is unsafe"
+                ) from error
+            raise
+        self._materialized = True
+        if (
+            self._deferred_async_decode_states
+            and self._on_deferred_materialized is not None
+        ):
+            try:
+                self._on_deferred_materialized(
+                    self._initial_offset,
+                    self._initial_offset + self._width,
+                    len(self._deferred_async_decode_states),
+                )
+            except Exception:
+                _log_nonfatal_warning(
+                    "Kimi K3 deferred async attestation recording failed"
+                )
+        return TargetPosterior(
+            materialized_tokens,
             self._aux_hidden_states,
         )
 
@@ -4579,13 +4902,22 @@ class KimiK3DSparkRequestRuntime:
     compact_greedy: bool = False
     confidence_request: DSparkConfidenceCaptureRequest | None = None
     evaluate: Callable[..., None] = mx.eval
+    async_evaluate: Callable[..., None] = mx.async_eval
     clock: Callable[[], float] = time.perf_counter
     _confidence_recorder: DSparkConfidenceRecorder | None = field(
         default=None,
         init=False,
     )
+    _deferred_validated_rounds: int = field(default=0, init=False)
+    _deferred_materialized_rounds: int = field(default=0, init=False)
+    _deferred_validated_roots: int = field(default=0, init=False)
+    _deferred_submitted_roots: int = field(default=0, init=False)
+    _deferred_first_initial_offset: int | None = field(default=None, init=False)
+    _deferred_last_initial_offset: int | None = field(default=None, init=False)
+    _deferred_last_final_offset: int | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
+        self.loaded.assert_healthy()
         self.clock = _nonthrowing_telemetry_clock(self.clock)
         if self.target_model is not self.loaded.target_model:
             raise DSparkConfigurationError(
@@ -4657,7 +4989,9 @@ class KimiK3DSparkRequestRuntime:
         compact_greedy: bool = False,
         confidence_request: DSparkConfidenceCaptureRequest | None = None,
         evaluate: Callable[..., None] = mx.eval,
+        async_evaluate: Callable[..., None] = mx.async_eval,
     ) -> "KimiK3DSparkRequestRuntime":
+        loaded.assert_healthy()
         draft = loaded.new_request(
             capacity_hint=capacity_hint,
             capture_confidence=(
@@ -4675,9 +5009,50 @@ class KimiK3DSparkRequestRuntime:
             compact_greedy=compact_greedy,
             confidence_request=confidence_request,
             evaluate=evaluate,
+            async_evaluate=async_evaluate,
+        )
+
+    def _record_deferred_async_build(
+        self,
+        root_count: int,
+    ) -> None:
+        """Record one locally validated graph without evaluating its roots."""
+
+        if root_count == 0:
+            return
+        self._deferred_validated_rounds += 1
+        self._deferred_validated_roots += root_count
+
+    def _record_deferred_async_materialized(
+        self,
+        initial_offset: int,
+        final_offset: int,
+        root_count: int,
+    ) -> None:
+        """Record one fully synchronized root batch; this callback never communicates."""
+
+        self._deferred_materialized_rounds += 1
+        self._deferred_submitted_roots += root_count
+        if self._deferred_first_initial_offset is None:
+            self._deferred_first_initial_offset = initial_offset
+        self._deferred_last_initial_offset = initial_offset
+        self._deferred_last_final_offset = final_offset
+
+    @property
+    def deferred_async_width3_attestation(self) -> DeferredAsyncWidth3Attestation:
+        return DeferredAsyncWidth3Attestation(
+            enabled=self.loaded.config.deferred_async_width3,
+            validated_rounds=self._deferred_validated_rounds,
+            materialized_rounds=self._deferred_materialized_rounds,
+            validated_roots=self._deferred_validated_roots,
+            submitted_roots=self._deferred_submitted_roots,
+            first_initial_offset=self._deferred_first_initial_offset,
+            last_initial_offset=self._deferred_last_initial_offset,
+            last_final_offset=self._deferred_last_final_offset,
         )
 
     def _agreed_operation[T](self, name: str, operation: Callable[[], T]) -> T:
+        self.loaded.assert_healthy()
         result: T | None = None
         local_error: str | None = None
         try:
@@ -4715,6 +5090,7 @@ class KimiK3DSparkRequestRuntime:
     def agree_local_side_effect(self, name: str, operation: Callable[[], None]) -> None:
         """Agree a callback, preserving only a unanimous callback exception."""
 
+        self.loaded.assert_healthy()
         local_error: Exception | None = None
         error_text: str | None = None
         try:
@@ -4756,6 +5132,8 @@ class KimiK3DSparkRequestRuntime:
         preserve_unanimous_error: bool = False,
     ) -> str:
         """Agree successful local text production and its exact UTF-8 digest."""
+
+        self.loaded.assert_healthy()
 
         def render_and_fingerprint() -> tuple[str, tuple[int, ...]]:
             text = operation()
@@ -4823,6 +5201,8 @@ class KimiK3DSparkRequestRuntime:
         operation: Callable[[], tuple[int, str | None, bool, str, str]],
     ) -> tuple[int, str | None, bool, str, str]:
         """Agree text-derived stop control before callbacks or another round."""
+
+        self.loaded.assert_healthy()
 
         def resolve() -> tuple[
             tuple[int, str | None, bool, str, str],
@@ -4937,6 +5317,7 @@ class KimiK3DSparkRequestRuntime:
         *,
         initial_offset: int,
         speculative_width: int | None = None,
+        defer_async_decode_boundaries: bool = False,
     ) -> _BuiltKimiK3TargetForward:
         if inputs.ndim != 2 or inputs.shape[0] != 1 or inputs.shape[1] <= 0:
             raise ValueError("Kimi K3 DSpark target input must be non-empty batch one")
@@ -4945,16 +5326,33 @@ class KimiK3DSparkRequestRuntime:
             raise ValueError(
                 "Kimi K3 target verification width does not match its input"
             )
+        if defer_async_decode_boundaries and (
+            speculative_width != DSPARK_CONSERVATIVE_VERIFY_WIDTH
+            or width != DSPARK_CONSERVATIVE_VERIFY_WIDTH
+        ):
+            raise ValueError(
+                "Kimi K3 deferred async decode requires a speculative width-three "
+                "verification"
+            )
         if _target_cache_offset(self.target_cache) != initial_offset:
             raise ValueError("Kimi K3 target cache moved after its readiness gate")
-        forward = cast(
+        forward_method = cast(
             _TargetWithAuxForward,
             self.target_model,
-        ).forward_with_aux_hidden_states(
-            inputs,
-            self.target_cache,
-            self.loaded.config.target_hidden_state_indices,
-        )
+        ).forward_with_aux_hidden_states
+        if defer_async_decode_boundaries:
+            forward = forward_method(
+                inputs,
+                self.target_cache,
+                self.loaded.config.target_hidden_state_indices,
+                defer_async_decode_boundaries=True,
+            )
+        else:
+            forward = forward_method(
+                inputs,
+                self.target_cache,
+                self.loaded.config.target_hidden_state_indices,
+            )
         logits = getattr(forward, "logits", None)
         aux_hidden_states = getattr(forward, "aux_hidden_states", None)
         if not isinstance(aux_hidden_states, Sequence) or isinstance(
@@ -4965,7 +5363,15 @@ class KimiK3DSparkRequestRuntime:
             cast(Sequence[object], aux_hidden_states),
             expected_width=width,
         )
+        deferred_async_decode_states = _validated_deferred_async_decode_states(
+            forward,
+            expected_width=width,
+            enabled=defer_async_decode_boundaries,
+        )
         _validate_target_logits(logits, expected_width=width)
+        self._record_deferred_async_build(
+            len(deferred_async_decode_states),
+        )
         return _BuiltKimiK3TargetForward(
             forward=cast(_TargetForwardResult, forward),
             validated_aux_hidden_states=validated,
@@ -4974,6 +5380,9 @@ class KimiK3DSparkRequestRuntime:
             width=width,
             speculative_width=speculative_width,
             evaluate=self.evaluate,
+            deferred_async_decode_states=deferred_async_decode_states,
+            async_evaluate=self.async_evaluate,
+            on_deferred_materialized=self._record_deferred_async_materialized,
         )
 
     def _build_aux_prefill_with_taps(
@@ -5048,6 +5457,7 @@ class KimiK3DSparkRequestRuntime:
         feature_contract = (
             int(self.compact_greedy),
             int(self.loaded.config.aux_only_prefill),
+            int(self.loaded.config.deferred_async_width3),
         )
         if self.loaded.config.packed_agreements:
             feature_contract = (*feature_contract, 1)
@@ -5075,6 +5485,7 @@ class KimiK3DSparkRequestRuntime:
         progress_callback: Callable[[int, int], None],
         distributed_progress_callback: Callable[[], None] | None,
     ) -> tuple[float, int]:
+        self.loaded.assert_healthy()
         prompt_tokens, prompt_fingerprint = self._agreed_operation(
             "prompt contract validation",
             lambda: self._prompt_contract(
@@ -5250,7 +5661,10 @@ class KimiK3DSparkRequestRuntime:
                 "Kimi K3 compact verifier was requested but the target rank "
                 "does not expose its exact vocab-parallel greedy API"
             )
-        return TargetVerificationPlan("compact" if self.compact_greedy else "full")
+        return TargetVerificationPlan(
+            "compact" if self.compact_greedy else "full",
+            deferred_async_width3=self.loaded.config.deferred_async_width3,
+        )
 
     def _build_verification(
         self,
@@ -5270,25 +5684,46 @@ class KimiK3DSparkRequestRuntime:
             speculative_width=len(proposal_block),
         )
         if plan.mode == "compact":
-            forward = cast(
-                _CompactTargetForwardResult,
-                cast(
-                    _TargetWithAuxGreedyForward,
-                    self.target_model,
-                ).forward_with_aux_hidden_states_greedy(
-                    input_ids,
-                    self.target_cache,
-                    self.loaded.config.target_hidden_state_indices,
-                    self.banned_token_ids,
-                ),
-            )
+            forward_method = cast(
+                _TargetWithAuxGreedyForward,
+                self.target_model,
+            ).forward_with_aux_hidden_states_greedy
+            if plan.deferred_async_width3:
+                forward = cast(
+                    _CompactTargetForwardResult,
+                    forward_method(
+                        input_ids,
+                        self.target_cache,
+                        self.loaded.config.target_hidden_state_indices,
+                        self.banned_token_ids,
+                        defer_async_decode_boundaries=True,
+                    ),
+                )
+            else:
+                forward = cast(
+                    _CompactTargetForwardResult,
+                    forward_method(
+                        input_ids,
+                        self.target_cache,
+                        self.loaded.config.target_hidden_state_indices,
+                        self.banned_token_ids,
+                    ),
+                )
             validated_aux = _validated_aux_hidden_states(
                 forward.aux_hidden_states,
                 expected_width=len(proposal_block),
             )
+            deferred_async_decode_states = _validated_deferred_async_decode_states(
+                forward,
+                expected_width=len(proposal_block),
+                enabled=plan.deferred_async_width3,
+            )
             tokens = _validate_batched_greedy_tokens(
                 forward.tokens,
                 expected_width=len(proposal_block),
+            )
+            self._record_deferred_async_build(
+                len(deferred_async_decode_states),
             )
             return _BuiltKimiK3CompactTargetPosterior(
                 tokens=tokens,
@@ -5297,11 +5732,15 @@ class KimiK3DSparkRequestRuntime:
                 initial_offset=initial_offset,
                 width=len(proposal_block),
                 evaluate=self.evaluate,
+                deferred_async_decode_states=deferred_async_decode_states,
+                async_evaluate=self.async_evaluate,
+                on_deferred_materialized=self._record_deferred_async_materialized,
             )
         forward = self._build_forward_with_taps(
             input_ids,
             initial_offset=initial_offset,
             speculative_width=len(proposal_block),
+            defer_async_decode_boundaries=plan.deferred_async_width3,
         )
         tokens = _build_greedy_dspark_posterior_tokens(
             forward.forward.logits,
@@ -5395,6 +5834,7 @@ class KimiK3DSparkRequestRuntime:
         self,
         telemetry_sink: Callable[[DSparkRoundTelemetry], None] | None = None,
     ) -> KimiK3DSparkRoundEngine:
+        self.loaded.assert_healthy()
         target = ReplaySSMTargetAdapter(
             self.target_model,
             self.target_cache,
@@ -5436,6 +5876,7 @@ class KimiK3DSparkRequestRuntime:
             telemetry_sink=telemetry_sink,
             confidence_recorder=recorder,
             clock=self.clock,
+            _materialization_poison=self.loaded.materialization_poison,
         )
 
     @property
@@ -5474,6 +5915,28 @@ class KimiK3DSparkRequestRuntime:
                     "Kimi K3 packed agreement attestation logging failed"
                 ) from error
             _log_nonfatal_warning("Kimi K3 packed agreement attestation logging failed")
+
+    def log_deferred_async_width3_attestation(self) -> None:
+        """Publish request-local deferred-boundary counts without a collective."""
+
+        try:
+            attestation = self.deferred_async_width3_attestation
+            logger.info(
+                "MLX Kimi K3 deferred async width3 attestation: "
+                f"rank={self.collective.rank}, "
+                f"enabled={int(attestation.enabled)}, "
+                f"validated_rounds={attestation.validated_rounds}, "
+                f"materialized_rounds={attestation.materialized_rounds}, "
+                f"validated_roots={attestation.validated_roots}, "
+                f"submitted_roots={attestation.submitted_roots}, "
+                f"first_initial_offset={attestation.first_initial_offset}, "
+                f"last_initial_offset={attestation.last_initial_offset}, "
+                f"last_final_offset={attestation.last_final_offset}"
+            )
+        except Exception:
+            _log_nonfatal_warning(
+                "Kimi K3 deferred async width3 attestation logging failed"
+            )
 
 
 @dataclass(frozen=True)

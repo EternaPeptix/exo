@@ -22,6 +22,7 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     KimiK3DSparkConfig,
     KimiK3DSparkRoundEngine,
     TargetPosterior,
+    _DSparkMaterializationPoison,  # pyright: ignore[reportPrivateUsage]
     dspark_decode_tokens,
 )
 from exo.worker.tests.unittests.test_mlx.test_kimi_k3_dspark import (
@@ -165,6 +166,8 @@ def _overlap_engine(
     fail_submit: bool = False,
     fail_finalize: bool = False,
     fail_build_at_call: int | None = None,
+    deferred_async_width3: bool = False,
+    materialization_poison: _DSparkMaterializationPoison | None = None,
 ) -> tuple[
     KimiK3DSparkRoundEngine,
     _OverlapDraft,
@@ -185,6 +188,10 @@ def _overlap_engine(
         fail_build_at_call=fail_build_at_call,
     )
     target = _FakeTarget(tuple(posterior), events, fail_commit=target_fail_commit)
+    if deferred_async_width3:
+        target.deferred_async_decode_states = tuple(
+            f"boundary-{index}" for index in range(12)
+        )
     collective = _FakeAgreement(events)
     engine = KimiK3DSparkRoundEngine(
         config=KimiK3DSparkConfig(
@@ -192,11 +199,17 @@ def _overlap_engine(
             verify_width=width,
             round_telemetry=False,
             tail_overlap=tail_overlap,
+            deferred_async_width3=deferred_async_width3,
         ),
         draft=draft,
         target=target,
         collective=collective,
         terminal_token_ids=terminal_token_ids,
+        _materialization_poison=(
+            materialization_poison
+            if materialization_poison is not None
+            else _DSparkMaterializationPoison()
+        ),
     )
     return engine, draft, target, collective, events
 
@@ -260,6 +273,64 @@ def test_tail_overlap_prelaunches_next_draft_and_reuses_it(tmp_path: Path) -> No
         "draft_commit",
         "agree_stage_1",
     ]
+
+
+def test_tail_overlap_composes_with_deferred_width_three_in_safe_order(
+    tmp_path: Path,
+) -> None:
+    engine, _draft, _target, _collective, events = _overlap_engine(
+        tmp_path,
+        deferred_async_width3=True,
+    )
+
+    result = engine.decode_round(10, remaining=100)
+
+    assert result.emitted_tokens == (11, 12, 13)
+    build_index = events.index("target_build")
+    build_agreement_index = next(
+        index
+        for index, event in enumerate(events)
+        if index > build_index and event == "agree_stage_1"
+    )
+    deferred_indices = [
+        index
+        for index, event in enumerate(events)
+        if event.startswith("deferred_submit_")
+    ]
+    assert deferred_indices == list(range(min(deferred_indices), max(deferred_indices) + 1))
+    assert min(deferred_indices) > build_agreement_index
+    acceptance_index = events.index("agree_acceptance")
+    assert max(deferred_indices) < acceptance_index
+
+    tail_submit_index = events.index("draft_submit")
+    target_commit_index = events.index("target_commit")
+    assert tail_submit_index > acceptance_index
+    assert tail_submit_index < target_commit_index
+    assert events.index("draft_commit_finalize_lazy") > tail_submit_index
+
+
+def test_tail_overlap_poison_is_shared_with_later_round_engines(
+    tmp_path: Path,
+) -> None:
+    shared_poison = _DSparkMaterializationPoison()
+    engine, _draft, _target, _collective, _events = _overlap_engine(
+        tmp_path,
+        fail_submit=True,
+        materialization_poison=shared_poison,
+    )
+    later_engine, _draft2, _target2, _collective2, later_events = _overlap_engine(
+        tmp_path,
+        materialization_poison=shared_poison,
+    )
+
+    with pytest.raises(DSparkCollectivePoisonError, match="worker/ring must be recycled"):
+        engine.decode_round(10, remaining=100)
+
+    assert shared_poison.reason is not None
+    assert "tail-overlap async submission uncertainty" in shared_poison.reason
+    with pytest.raises(DSparkDistributedStateError, match="restart is required"):
+        later_engine.decode_round(10, remaining=100)
+    assert later_events == []
 
 
 def test_tail_overlap_skips_prelaunch_when_budget_exhausted(tmp_path: Path) -> None:

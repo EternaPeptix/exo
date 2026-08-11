@@ -1729,6 +1729,9 @@ def mlx_generate(
         raise ValueError("enabled width-four receipt requires Kimi K3 DSpark")
     dspark_setup: _DSparkRequestSetup | None = None
     if dspark is not None:
+        # A prior uncertain target submission can leave this process's shared
+        # Metal/JACCL stream unsafe. Reject locally before any setup agreement.
+        dspark.assert_healthy()
         if group is None:
             raise DSparkDistributedStateError(
                 "Kimi K3 DSpark setup requires a tensor-parallel group"
@@ -2347,6 +2350,7 @@ def mlx_generate(
                     )
                 else:
                     dspark_runtime.log_packed_agreement_attestation()
+                dspark_runtime.log_deferred_async_width3_attestation()
 
             if is_done and width4_receipt_context is not None:
                 if dspark_runtime is None:

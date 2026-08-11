@@ -709,6 +709,12 @@ def test_packed_selector_changes_load_contracts_and_off_keeps_legacy_json(
         round_telemetry=False,
         packed_agreements=True,
     )
+    deferred_config = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path / "draft",
+        verify_width=3,
+        round_telemetry=False,
+        deferred_async_width3=True,
+    )
     expected_legacy_config = json.dumps(
         {
             "checkpoint": str(legacy_config.checkpoint_path),
@@ -730,6 +736,10 @@ def test_packed_selector_changes_load_contracts_and_off_keeps_legacy_json(
     assert dspark_config_contract(packed_config) != expected_legacy_config
     assert (
         json.loads(dspark_config_contract(packed_config))["packed_agreements"] is True
+    )
+    assert (
+        json.loads(dspark_config_contract(deferred_config))["deferred_async_width3"]
+        is True
     )
 
     target_model = object()
@@ -767,6 +777,12 @@ def test_packed_selector_changes_load_contracts_and_off_keeps_legacy_json(
     )
     assert packed_loaded != expected_legacy_loaded
     assert json.loads(packed_loaded)["packed_agreements"] is True
+    deferred_loaded = loaded_dspark_contract(
+        loaded(deferred_config),
+        vision_processor_present=False,
+    )
+    assert deferred_loaded != expected_legacy_loaded
+    assert json.loads(deferred_loaded)["deferred_async_width3"] is True
 
 
 def _sequential_for_callback_test(cancel_receiver: object) -> SequentialGenerator:
@@ -1706,6 +1722,7 @@ def _run_mlx_generate_dspark_scenario(
             else None
         ),
         log_packed_agreement_attestation=lambda: None,
+        log_deferred_async_width3_attestation=lambda: None,
     )
 
     def create_runtime(*_args: object, **_kwargs: object) -> object:
@@ -1716,6 +1733,7 @@ def _run_mlx_generate_dspark_scenario(
         return runtime
 
     dspark = SimpleNamespace(
+        assert_healthy=lambda: None,
         verify_width=engine.verify_width,
         target_model=model,
         target_route_top_k=None,
