@@ -3295,7 +3295,12 @@ class _FakeRoundEngine:
     anchors: list[int] = field(default_factory=list)
     ordinary_anchors: list[int] = field(default_factory=list)
 
-    def decode_round(self, anchor_token: int) -> DSparkRoundResult:
+    def decode_round(
+        self,
+        anchor_token: int,
+        *,
+        remaining: int | None = None,
+    ) -> DSparkRoundResult:
         self.anchors.append(anchor_token)
         tokens = self.rounds.pop(0)
         return DSparkRoundResult(

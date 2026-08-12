@@ -1614,7 +1614,12 @@ class _ScenarioRoundEngine:
     ordinary: list[DSparkRoundResult] = field(default_factory=list)
     verify_width: int = 3
 
-    def decode_round(self, _anchor_token: int) -> DSparkRoundResult:
+    def decode_round(
+        self,
+        _anchor_token: int,
+        *,
+        remaining: int | None = None,
+    ) -> DSparkRoundResult:
         return self.speculative.pop(0)
 
     def decode_ordinary_tail(self, _anchor_token: int) -> DSparkRoundResult:

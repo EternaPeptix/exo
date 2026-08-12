@@ -51,6 +51,7 @@ DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV = (
     "EXO_MLX_KIMI_K3_DSPARK_RANK_ZERO_PROPOSAL_RECOVERY"
 )
 DSPARK_PACKED_AGREEMENTS_ENV = "EXO_MLX_KIMI_K3_DSPARK_PACKED_AGREEMENTS"
+DSPARK_TAIL_OVERLAP_ENV = "EXO_MLX_KIMI_K3_DSPARK_TAIL_OVERLAP"
 
 # These controls live on separate experimental branches.  The first dual
 # proposer deliberately rejects them instead of silently composing untested
@@ -118,6 +119,7 @@ _EXO_COMPANION_ENVS = (
     DSPARK_YARN_CHECKPOINT_ENV,
     DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV,
     DSPARK_PACKED_AGREEMENTS_ENV,
+    DSPARK_TAIL_OVERLAP_ENV,
 )
 
 
@@ -189,6 +191,7 @@ class KimiK3DSparkConfig:
     confidence_capture: DSparkConfidenceCaptureConfig | None = None
     rank_zero_proposal_recovery: bool = False
     packed_agreements: bool = False
+    tail_overlap: bool = False
 
     @property
     def gamma(self) -> int:
@@ -245,6 +248,7 @@ class KimiK3DSparkDualConfig:
             "confidence_capture",
             "rank_zero_proposal_recovery",
             "packed_agreements",
+            "tail_overlap",
         )
         if any(
             getattr(self.old, name) != getattr(self.yarn, name)
@@ -617,6 +621,10 @@ def kimi_k3_dspark_config(
         DSPARK_PACKED_AGREEMENTS_ENV,
         values.get(DSPARK_PACKED_AGREEMENTS_ENV, "0"),
     )
+    tail_overlap = _strict_flag(
+        DSPARK_TAIL_OVERLAP_ENV,
+        values.get(DSPARK_TAIL_OVERLAP_ENV, "0"),
+    )
     revision = RADIXARK_KIMI_K3_DSPARK_REVISION
     config_sha256 = RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256
     model_bytes = RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES
@@ -638,6 +646,7 @@ def kimi_k3_dspark_config(
         confidence_capture=confidence_capture,
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
         packed_agreements=packed_agreements,
+        tail_overlap=tail_overlap,
     )
     if not dual_enabled:
         return primary_config
@@ -672,6 +681,7 @@ def kimi_k3_dspark_config(
         aux_only_prefill=aux_only_prefill,
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
         packed_agreements=packed_agreements,
+        tail_overlap=tail_overlap,
     )
     return KimiK3DSparkDualConfig(old=primary_config, yarn=yarn_config)
 
@@ -709,6 +719,25 @@ class PreparedDraftRound(Protocol):
     def materialize(self) -> DraftRound: ...
 
     def cancel(self) -> None: ...
+
+
+class _SplitCommitDraftRound(Protocol):
+    """Draft round whose commit can be split around an asynchronous submit."""
+
+    def commit_build(
+        self,
+        accepted_draft_tokens: int,
+        next_anchor_token: int,
+        target_posterior: TargetPosterior,
+    ) -> tuple[int, tuple[object, ...]]: ...
+
+    def commit_finalize(self, *, evaluate: bool) -> None: ...
+
+
+class _SubmittablePreparedDraftRound(Protocol):
+    """Prepared draft round that can enqueue its graphs without blocking."""
+
+    def submit(self, context_arrays: Sequence[object]) -> None: ...
 
 
 class ReplicatedDraft(Protocol):
@@ -1087,6 +1116,9 @@ class DSparkRoundTelemetry:
     emitted: int
     fallback: bool
     error: str | None
+    prelaunch_ms: float = 0.0
+    prelaunch_submitted: bool = False
+    prelaunch_used: bool = False
 
 
 @dataclass(frozen=True)
@@ -1383,7 +1415,10 @@ def log_dspark_round(telemetry: DSparkRoundTelemetry) -> None:
         f"accepted={telemetry.accepted}, "
         f"emitted={telemetry.emitted}, "
         f"fallback={telemetry.fallback}, "
-        f"error={telemetry.error!r}"
+        f"error={telemetry.error!r}, "
+        f"prelaunch_ms={telemetry.prelaunch_ms:.3f}, "
+        f"prelaunch_submitted={telemetry.prelaunch_submitted}, "
+        f"prelaunch_used={telemetry.prelaunch_used}"
     )
 
 
@@ -1527,6 +1562,35 @@ def _request_control_fingerprint(
     )
 
 
+@dataclass(frozen=True)
+class _PrelaunchedDraftRound:
+    """A rank-agreed draft for the next round, already submitted for execution."""
+
+    anchor_token: int
+    context_offset: int | None
+    prepared: PreparedDraftRound
+
+
+@dataclass(frozen=True)
+class _TailPrelaunch:
+    """Outcome of one tail-overlap attempt between acceptance and target commit.
+
+    ``error`` carries a draft-commit failure that must surface through the
+    ``draft commit`` agreement at its usual slot.  Otherwise the lazy context
+    append succeeded and :meth:`_SplitCommitDraftRound.commit_finalize` still
+    has to run there.  ``submitted`` means every rank asynchronously enqueued
+    the appended context together with the next proposal graph, so the target
+    commit that follows overlaps the executing draft chain.
+    """
+
+    error: str | None
+    prepared: PreparedDraftRound | None
+    submitted: bool
+    context_offset: int | None
+    next_anchor_token: int
+    collective_ms: float
+
+
 @dataclass
 class KimiK3DSparkRoundEngine:
     """Run rank-agreed rounds with pre-commit fallback and commit fail-stop."""
@@ -1546,6 +1610,7 @@ class KimiK3DSparkRoundEngine:
         init=False,
     )
     _capture_round_started: float | None = field(default=None, init=False)
+    _prelaunched: _PrelaunchedDraftRound | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.clock = _nonthrowing_telemetry_clock(self.clock)
@@ -1666,6 +1731,38 @@ class KimiK3DSparkRoundEngine:
             (self.clock() - started) * 1000.0,
         )
 
+    def _discard_prelaunched(
+        self,
+        prelaunched: _PrelaunchedDraftRound | None = None,
+    ) -> None:
+        """Cancel a prelaunched draft locally; already-enqueued GPU work drains.
+
+        Discard decisions derive exclusively from rank-agreed integers, so all
+        ranks discard identically without an extra collective.
+        """
+
+        if prelaunched is None:
+            prelaunched = self._prelaunched
+            self._prelaunched = None
+        if prelaunched is None:
+            return
+        try:
+            prelaunched.prepared.cancel()
+        except Exception:
+            _log_nonfatal_warning("Kimi K3 DSpark prelaunched draft cancel failed")
+
+    def _take_prelaunched(self, anchor_token: int) -> _PrelaunchedDraftRound | None:
+        prelaunched = self._prelaunched
+        if prelaunched is None:
+            return None
+        self._prelaunched = None
+        if prelaunched.anchor_token != anchor_token:
+            # The driver anchor and the prelaunched anchor were both
+            # rank-agreed, so every rank observes the same mismatch.
+            self._discard_prelaunched(prelaunched)
+            return None
+        return prelaunched
+
     def _cancel_before_fallback(
         self,
         *,
@@ -1737,6 +1834,7 @@ class KimiK3DSparkRoundEngine:
         error: str,
         planned_tail: bool = False,
     ) -> DSparkRoundResult:
+        self._discard_prelaunched()
         self._disabled_reason = error
         fallback_error = None if planned_tail else error
 
@@ -1942,6 +2040,188 @@ class KimiK3DSparkRoundEngine:
         self._round_index += 1
         return DSparkRoundResult(emitted_tokens=emitted_tokens, telemetry=telemetry)
 
+    def _maybe_prelaunch_next_draft(
+        self,
+        *,
+        draft_round: DraftRound,
+        accepted: int,
+        next_anchor_token: int,
+        posterior: TargetPosterior,
+        remaining: int,
+        emitted_tokens: tuple[int, ...],
+    ) -> _TailPrelaunch | None:
+        """Commit the draft context and submit the next proposal graph early.
+
+        Runs between the acceptance agreement and the target commit so the
+        asynchronously submitted draft chain executes on the GPU while the
+        CPU resolves speculative target checkpoints.  Returns ``None`` when
+        this round cannot legally feed a speculative next round; that decision
+        uses only rank-agreed state (emitted tokens, config, remaining budget)
+        so every rank takes the same branch without extra collectives.
+        """
+
+        remaining_after = remaining - len(emitted_tokens)
+        if remaining_after < self.config.verify_width:
+            return None
+        if self.terminal_token_ids:
+            terminal_ids = frozenset(self.terminal_token_ids)
+            if any(token in terminal_ids for token in emitted_tokens):
+                return None
+        if not (
+            callable(getattr(draft_round, "commit_build", None))
+            and callable(getattr(draft_round, "commit_finalize", None))
+        ):
+            return None
+        split = cast(_SplitCommitDraftRound, cast(object, draft_round))
+
+        gamma = self.config.gamma
+        collective_ms = 0.0
+        prelaunch_error: str | None = None
+        context_offset: int | None = None
+        context_arrays: tuple[object, ...] = ()
+        try:
+            context_offset, context_arrays = split.commit_build(
+                accepted,
+                next_anchor_token,
+                posterior,
+            )
+        except Exception as error:
+            prelaunch_error = (
+                f"draft commit failed: {type(error).__name__}: {error}; "
+                "DSpark disabled for subsequent rounds"
+            )
+
+        (
+            preflight_outcome,
+            preflight_fingerprint,
+            agreed_payload,
+            agreement_ms,
+        ) = self._agree_stage_payload(
+            "draft preflight",
+            prelaunch_error is None,
+            prelaunch_error,
+            (context_offset,),
+        )
+        collective_ms += agreement_ms
+        agreed_offset = None if agreed_payload is None else agreed_payload[0]
+        if (
+            preflight_outcome is not True
+            or preflight_fingerprint != 0
+            or agreed_offset is None
+            or context_offset is None
+            or agreed_offset != context_offset
+        ):
+            if prelaunch_error is None:
+                try:
+                    split.commit_finalize(evaluate=True)
+                except Exception as error:
+                    prelaunch_error = (
+                        f"draft commit failed: {type(error).__name__}: {error}; "
+                        "DSpark disabled for subsequent rounds"
+                    )
+            return _TailPrelaunch(
+                error=prelaunch_error,
+                prepared=None,
+                submitted=False,
+                context_offset=context_offset,
+                next_anchor_token=next_anchor_token,
+                collective_ms=collective_ms,
+            )
+
+        prepared: PreparedDraftRound | None = None
+        graph_error: str | None = None
+        try:
+            # MLX is lazy: build the next proposal graph over the appended
+            # (still unevaluated) draft context without materializing anything.
+            prepared = self.draft.prepare_round(next_anchor_token, gamma)
+        except Exception as error:
+            graph_error = f"draft graph build failed: {type(error).__name__}: {error}"
+        if graph_error is None and not callable(getattr(prepared, "submit", None)):
+            graph_error = "draft graph build failed: prelaunch submit unsupported"
+
+        graph_outcome, graph_fingerprint, agreement_ms = self._agree_stage(
+            "draft graph build",
+            graph_error is None,
+            graph_error,
+        )
+        collective_ms += agreement_ms
+        if graph_outcome is not True or graph_fingerprint != 0 or prepared is None:
+            if prepared is not None:
+                try:
+                    prepared.cancel()
+                except Exception:
+                    _log_nonfatal_warning(
+                        "Kimi K3 DSpark prelaunched draft cancellation failed"
+                    )
+            finalize_error: str | None = None
+            try:
+                split.commit_finalize(evaluate=True)
+            except Exception as error:
+                finalize_error = (
+                    f"draft commit failed: {type(error).__name__}: {error}; "
+                    "DSpark disabled for subsequent rounds"
+                )
+            # A failed next-graph build is recoverable: the draft context is
+            # fully committed, so the next round simply rebuilds legacy-style.
+            return _TailPrelaunch(
+                error=finalize_error,
+                prepared=None,
+                submitted=False,
+                context_offset=context_offset,
+                next_anchor_token=next_anchor_token,
+                collective_ms=collective_ms,
+            )
+
+        submit_error: str | None = None
+        try:
+            cast(
+                _SubmittablePreparedDraftRound,
+                cast(object, prepared),
+            ).submit(context_arrays)
+        except Exception as error:
+            submit_error = (
+                f"draft commit failed: {type(error).__name__}: {error}; "
+                "DSpark disabled for subsequent rounds"
+            )
+        if submit_error is None:
+            try:
+                split.commit_finalize(evaluate=False)
+            except Exception as error:
+                submit_error = (
+                    f"draft commit failed: {type(error).__name__}: {error}; "
+                    "DSpark disabled for subsequent rounds"
+                )
+        if submit_error is not None:
+            try:
+                prepared.cancel()
+            except Exception:
+                _log_nonfatal_warning(
+                    "Kimi K3 DSpark prelaunched draft cancellation failed"
+                )
+            try:
+                split.commit_finalize(evaluate=True)
+            except Exception:
+                _log_nonfatal_warning(
+                    "Kimi K3 DSpark draft finalize after failed submit failed"
+                )
+            return _TailPrelaunch(
+                error=submit_error,
+                prepared=None,
+                submitted=False,
+                context_offset=context_offset,
+                next_anchor_token=next_anchor_token,
+                collective_ms=collective_ms,
+            )
+
+        return _TailPrelaunch(
+            error=None,
+            prepared=prepared,
+            submitted=True,
+            context_offset=context_offset,
+            next_anchor_token=next_anchor_token,
+            collective_ms=collective_ms,
+        )
+
     def decode_ordinary_tail(self, anchor_token: int) -> DSparkRoundResult:
         """Commit one target token when a full verifier round cannot fit."""
 
@@ -1960,7 +2240,12 @@ class KimiK3DSparkRoundEngine:
             planned_tail=True,
         )
 
-    def decode_round(self, anchor_token: int) -> DSparkRoundResult:
+    def decode_round(
+        self,
+        anchor_token: int,
+        *,
+        remaining: int | None = None,
+    ) -> DSparkRoundResult:
         """Decode one speculative round, or one ordinary token after rollback."""
 
         if type(anchor_token) is not int or anchor_token < 0:
@@ -1989,83 +2274,104 @@ class KimiK3DSparkRoundEngine:
                 "no proposer or target TP graph was built"
             ) from None
         draft_start = self.clock()
-        local_context_offset: int | None = None
-        local_error: str | None = None
-        try:
-            local_context_offset = self.draft.preflight_round(anchor_token, gamma)
-        except Exception as error:
-            local_error = f"draft preflight failed: {type(error).__name__}: {error}"
-
-        (
-            preflight_outcome,
-            preflight_fingerprint,
-            agreed_preflight_payload,
-            agreement_ms,
-        ) = self._agree_stage_payload(
-            "draft preflight",
-            local_error is None,
-            local_error,
-            (local_context_offset,),
-        )
-        collective_ms += agreement_ms
-        agreed_context_offset = (
-            None if agreed_preflight_payload is None else agreed_preflight_payload[0]
-        )
-        if (
-            preflight_outcome is not True
-            or preflight_fingerprint != 0
-            or agreed_context_offset is None
-            or local_context_offset is None
-            or agreed_context_offset != local_context_offset
-        ):
-            draft_ms = (self.clock() - draft_start) * 1000.0
-            return self._ordinary_fallback(
-                anchor_token,
-                draft_ms=draft_ms,
-                target_verify_ms=0.0,
-                target_commit_ms=0.0,
-                draft_commit_ms=0.0,
-                collective_ms=collective_ms,
-                proposed=0,
-                error=local_error or "DSpark draft readiness disagreed across ranks",
-            )
-
+        prelaunched = self._take_prelaunched(anchor_token)
+        prelaunch_used = prelaunched is not None
         prepared_draft: PreparedDraftRound | None = None
-        graph_error: str | None = None
-        try:
-            # MLX is lazy: this constructs the proposer and borrowed target-head
-            # graph, but must not call mx.eval()/tolist() yet.
-            prepared_draft = self.draft.prepare_round(anchor_token, gamma)
-        except Exception as error:
-            graph_error = f"draft graph build failed: {type(error).__name__}: {error}"
+        local_error: str | None = None
+        agreed_context_offset: int | None = None
+        if prelaunched is not None:
+            # The previous round rank-agreed this draft's readiness and graph
+            # build at its tail and asynchronously submitted the graphs;
+            # materialization below only waits on the in-flight evaluation.
+            prepared_draft = prelaunched.prepared
+            agreed_context_offset = prelaunched.context_offset
+        else:
+            local_context_offset: int | None = None
+            try:
+                local_context_offset = self.draft.preflight_round(
+                    anchor_token, gamma
+                )
+            except Exception as error:
+                local_error = (
+                    f"draft preflight failed: {type(error).__name__}: {error}"
+                )
 
-        graph_outcome, graph_fingerprint, agreement_ms = self._agree_stage(
-            "draft graph build",
-            graph_error is None,
-            graph_error,
-        )
-        collective_ms += agreement_ms
-        if (
-            graph_outcome is not True
-            or graph_fingerprint != 0
-            or prepared_draft is None
-        ):
-            collective_ms += self._cancel_before_fallback(
-                draft_round=prepared_draft,
-                target_round=None,
-                already_uncertain=False,
+            (
+                preflight_outcome,
+                preflight_fingerprint,
+                agreed_preflight_payload,
+                agreement_ms,
+            ) = self._agree_stage_payload(
+                "draft preflight",
+                local_error is None,
+                local_error,
+                (local_context_offset,),
             )
-            draft_ms = (self.clock() - draft_start) * 1000.0
-            return self._ordinary_fallback(
-                anchor_token,
-                draft_ms=draft_ms,
-                target_verify_ms=0.0,
-                target_commit_ms=0.0,
-                draft_commit_ms=0.0,
-                collective_ms=collective_ms,
-                proposed=0,
-                error=graph_error or "DSpark draft graph build disagreed across ranks",
+            collective_ms += agreement_ms
+            agreed_context_offset = (
+                None
+                if agreed_preflight_payload is None
+                else agreed_preflight_payload[0]
             )
+            if (
+                preflight_outcome is not True
+                or preflight_fingerprint != 0
+                or agreed_context_offset is None
+                or local_context_offset is None
+                or agreed_context_offset != local_context_offset
+            ):
+                draft_ms = (self.clock() - draft_start) * 1000.0
+                return self._ordinary_fallback(
+                    anchor_token,
+                    draft_ms=draft_ms,
+                    target_verify_ms=0.0,
+                    target_commit_ms=0.0,
+                    draft_commit_ms=0.0,
+                    collective_ms=collective_ms,
+                    proposed=0,
+                    error=local_error
+                    or "DSpark draft readiness disagreed across ranks",
+                )
+
+            graph_error: str | None = None
+            try:
+                # MLX is lazy: this constructs the proposer and borrowed
+                # target-head graph, but must not call mx.eval()/tolist() yet.
+                prepared_draft = self.draft.prepare_round(anchor_token, gamma)
+            except Exception as error:
+                graph_error = (
+                    f"draft graph build failed: {type(error).__name__}: {error}"
+                )
+
+            graph_outcome, graph_fingerprint, agreement_ms = self._agree_stage(
+                "draft graph build",
+                graph_error is None,
+                graph_error,
+            )
+            collective_ms += agreement_ms
+            if (
+                graph_outcome is not True
+                or graph_fingerprint != 0
+                or prepared_draft is None
+            ):
+                collective_ms += self._cancel_before_fallback(
+                    draft_round=prepared_draft,
+                    target_round=None,
+                    already_uncertain=False,
+                )
+                draft_ms = (self.clock() - draft_start) * 1000.0
+                return self._ordinary_fallback(
+                    anchor_token,
+                    draft_ms=draft_ms,
+                    target_verify_ms=0.0,
+                    target_commit_ms=0.0,
+                    draft_commit_ms=0.0,
+                    collective_ms=collective_ms,
+                    proposed=0,
+                    error=graph_error
+                    or "DSpark draft graph build disagreed across ranks",
+                )
+        assert prepared_draft is not None
 
         draft_round: DraftRound | None = None
         local_block: tuple[int, ...] | None = None
@@ -2329,6 +2635,27 @@ class KimiK3DSparkRoundEngine:
             next_anchor_token,
         )
 
+        # Before the CPU-bound target commit, optionally commit the draft
+        # context and submit the next round's proposal graph so the GPU is
+        # busy while python resolves speculative target checkpoints.  The
+        # eligibility branch is a pure function of rank-agreed state.
+        tail: _TailPrelaunch | None = None
+        prelaunch_ms = 0.0
+        assert draft_round is not None
+        if self.config.tail_overlap and remaining is not None:
+            prelaunch_started = self.clock()
+            tail = self._maybe_prelaunch_next_draft(
+                draft_round=draft_round,
+                accepted=accepted,
+                next_anchor_token=next_anchor_token,
+                posterior=posterior,
+                remaining=remaining,
+                emitted_tokens=emitted_tokens,
+            )
+            prelaunch_ms = (self.clock() - prelaunch_started) * 1000.0
+            if tail is not None:
+                collective_ms += tail.collective_ms
+
         # Acceptance is collective before either state commit.  The target is
         # authoritative; its consumed input count is anchor + accepted drafts.
         target_commit_error: str | None = None
@@ -2359,6 +2686,13 @@ class KimiK3DSparkRoundEngine:
         )
         collective_ms += agreement_ms
         if target_commit_consensus is not True or target_commit_fingerprint != 0:
+            if tail is not None and tail.prepared is not None:
+                try:
+                    tail.prepared.cancel()
+                except Exception:
+                    _log_nonfatal_warning(
+                        "Kimi K3 DSpark prelaunched draft cancellation failed"
+                    )
             collective_ms += self._cancel_draft_after_fatal_target_commit(draft_round)
             outcome = (
                 "disagreed across ranks"
@@ -2371,19 +2705,25 @@ class KimiK3DSparkRoundEngine:
             ) from None
 
         draft_commit_error: str | None = None
-        assert draft_round is not None
-        draft_commit_started = self.clock()
-        try:
-            draft_round.commit(accepted, next_anchor_token, posterior)
-        except Exception as error:
-            # The target commit is already authoritative.  Keep its emitted
-            # tokens, discard this draft for future rounds, and use ordinary
-            # target decode from the next anchor.
-            draft_commit_error = (
-                f"draft commit failed: {type(error).__name__}: {error}; "
-                "DSpark disabled for subsequent rounds"
-            )
-        draft_commit_ms = (self.clock() - draft_commit_started) * 1000.0
+        draft_commit_ms = 0.0
+        if tail is not None:
+            # The draft context was already committed (and possibly submitted)
+            # by the tail prelaunch; surface its outcome through the same
+            # "draft commit" agreement the legacy path uses.
+            draft_commit_error = tail.error
+        else:
+            draft_commit_started = self.clock()
+            try:
+                draft_round.commit(accepted, next_anchor_token, posterior)
+            except Exception as error:
+                # The target commit is already authoritative.  Keep its emitted
+                # tokens, discard this draft for future rounds, and use ordinary
+                # target decode from the next anchor.
+                draft_commit_error = (
+                    f"draft commit failed: {type(error).__name__}: {error}; "
+                    "DSpark disabled for subsequent rounds"
+                )
+            draft_commit_ms = (self.clock() - draft_commit_started) * 1000.0
 
         (
             draft_commit_consensus,
@@ -2405,6 +2745,19 @@ class KimiK3DSparkRoundEngine:
                 f"draft commit {outcome}; DSpark disabled on every rank"
             )
             self._disabled_reason = draft_commit_error
+            if tail is not None and tail.prepared is not None:
+                try:
+                    tail.prepared.cancel()
+                except Exception:
+                    _log_nonfatal_warning(
+                        "Kimi K3 DSpark prelaunched draft cancellation failed"
+                    )
+        elif tail is not None and tail.submitted and tail.prepared is not None:
+            self._prelaunched = _PrelaunchedDraftRound(
+                anchor_token=tail.next_anchor_token,
+                context_offset=tail.context_offset,
+                prepared=tail.prepared,
+            )
 
         telemetry = DSparkRoundTelemetry(
             round_index=self._round_index,
@@ -2419,6 +2772,9 @@ class KimiK3DSparkRoundEngine:
             emitted=len(emitted_tokens),
             fallback=False,
             error=draft_commit_error,
+            prelaunch_ms=prelaunch_ms,
+            prelaunch_submitted=tail is not None and tail.submitted,
+            prelaunch_used=prelaunch_used,
         )
         self._publish(telemetry)
         self._round_index += 1
@@ -3030,6 +3386,20 @@ def _materialize_context_cache(
     evaluate(arrays)
 
 
+def _context_cache_arrays(context_cache: object) -> tuple[object, ...]:
+    """Collect the context-cache arrays without evaluating them."""
+
+    entries = cast(Sequence[object], context_cache)
+    arrays: list[object] = []
+    for entry in entries:
+        keys = getattr(entry, "keys", None)
+        values = getattr(entry, "values", None)
+        if keys is None or values is None:
+            raise ValueError("MLX-LM DSpark context cache is not populated")
+        arrays.extend((keys, values))
+    return tuple(arrays)
+
+
 @final
 class _MlxDSparkDraftRound:
     """Non-mutating proposal followed by append-only committed target context."""
@@ -3050,6 +3420,7 @@ class _MlxDSparkDraftRound:
         self._verify_width = verify_width
         self._evaluate = evaluate
         self._active = True
+        self._pending_offset: int | None = None
 
     @property
     def proposal_tokens(self) -> tuple[int, ...]:
@@ -3065,8 +3436,26 @@ class _MlxDSparkDraftRound:
         next_anchor_token: int,
         target_posterior: TargetPosterior,
     ) -> None:
+        self.commit_build(accepted_draft_tokens, next_anchor_token, target_posterior)
+        self.commit_finalize(evaluate=True)
+
+    def commit_build(
+        self,
+        accepted_draft_tokens: int,
+        next_anchor_token: int,
+        target_posterior: TargetPosterior,
+    ) -> tuple[int, tuple[object, ...]]:
+        """Validate and lazily append committed context; defer materialization.
+
+        Returns the expected post-commit context offset together with the
+        appended cache arrays so a tail-overlap caller can enqueue them
+        asynchronously.  :meth:`commit_finalize` must run afterwards.
+        """
+
         if not self._active:
             raise RuntimeError("MLX-LM DSpark draft round is no longer active")
+        if self._pending_offset is not None:
+            raise RuntimeError("MLX-LM DSpark draft commit was already built")
         if type(
             accepted_draft_tokens
         ) is not int or not 0 <= accepted_draft_tokens <= len(self._proposal_tokens):
@@ -3094,8 +3483,25 @@ class _MlxDSparkDraftRound:
                 context_offset,
                 self._context_cache,
             )
-            _materialize_context_cache(self._context_cache, self._evaluate)
-            expected_offset = context_offset + consumed
+        except Exception:
+            # MLX-LM exposes append-only context, not rollback. Never retry a
+            # possibly partial append; rank consensus disables the draft.
+            self._active = False
+            raise
+        self._pending_offset = context_offset + consumed
+        return self._pending_offset, _context_cache_arrays(self._context_cache)
+
+    def commit_finalize(self, *, evaluate: bool) -> None:
+        """Materialize (unless already submitted) and assert the new offset."""
+
+        if not self._active:
+            raise RuntimeError("MLX-LM DSpark draft round is no longer active")
+        expected_offset = self._pending_offset
+        if expected_offset is None:
+            raise RuntimeError("MLX-LM DSpark draft commit was not built")
+        try:
+            if evaluate:
+                _materialize_context_cache(self._context_cache, self._evaluate)
             if _context_cache_offset(self._context_cache) != expected_offset:
                 raise ValueError(
                     "MLX-LM DSpark committed context offset does not match"
@@ -3134,6 +3540,26 @@ class _PreparedMlxDSparkRound:
         self._verify_width = verify_width
         self._evaluate = evaluate
         self._active = True
+        self._submitted = False
+
+    def submit(self, context_arrays: Sequence[object]) -> None:
+        """Asynchronously enqueue the appended context plus proposal graphs.
+
+        The proposal graph closes over the freshly appended context arrays, so
+        one ``mx.async_eval`` schedules the exact kernel sequence the serial
+        path would run, without blocking the caller.  ``materialize`` keeps its
+        token-only contract afterwards.
+        """
+
+        if not self._active:
+            raise RuntimeError("MLX-LM DSpark proposal graph is no longer active")
+        if self._submitted:
+            raise RuntimeError("MLX-LM DSpark proposal graph was already submitted")
+        roots: list[object] = [*context_arrays, self._proposal_tokens]
+        if self._confidence_logits is not None:
+            roots.append(self._confidence_logits)
+        cast(Callable[..., None], mx.async_eval)(roots)
+        self._submitted = True
 
     def materialize(self) -> DraftRound:
         if not self._active:
@@ -5013,7 +5439,12 @@ class DSparkRoundDecoder(Protocol):
     @property
     def verify_width(self) -> int: ...
 
-    def decode_round(self, anchor_token: int) -> DSparkRoundResult: ...
+    def decode_round(
+        self,
+        anchor_token: int,
+        *,
+        remaining: int | None = None,
+    ) -> DSparkRoundResult: ...
 
     def decode_ordinary_tail(self, anchor_token: int) -> DSparkRoundResult: ...
 
@@ -5040,7 +5471,7 @@ def dspark_decode_tokens(
         result = (
             engine.decode_ordinary_tail(next_anchor)
             if force_ordinary or remaining < engine.verify_width
-            else engine.decode_round(next_anchor)
+            else engine.decode_round(next_anchor, remaining=remaining)
         )
         if round_observer is not None:
             try:
