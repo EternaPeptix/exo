@@ -1,20 +1,29 @@
 # Kimi K3 width-four receipt and tail-overlap composition
 
 This branch is an offline, strict-default-off composition candidate. It starts
-from the hardened width-four receipt stack at EXO commit
-`4205da9df81dc76895e6d1af08af72c8e09b682e` and applies the existing tail
-overlap changes, in order:
+from the authenticated width-four C1 source at EXO commit
+`c122d175512d91e01a67b4bf58c6f1803a5eef25` and replays the promoted
+tail-overlap changes, in order:
 
-1. `226355a72601b727c5a94c65915d821d6c3f81cb` — prelaunch the next draft under
+1. `691f55fb4b126e0655525e7f7f0eb9f38ad04350` — prelaunch the next draft under
    the target commit;
-2. `886b450752b5a9157b19d33fe49580e65365c90b` — fail-stop an asymmetric async
-   submission without entering another collective.
+2. `80ea94ec479f3a535d9d8b30352186db32ccccc3` — fail-stop an asymmetric async
+   submission without entering another collective;
+3. `1b2f75fc91a3e9548fb4090d1538144cc20e6504` — seal the composition tests and
+   provenance document.
 
-The source commits share base
-`04fe574f993471ece70a53651e669d5ea1f6f6c0`. Both cherry-picks applied without
-conflicts. The resulting delta relative to the hardened tail tip is the receipt
-stack plus the previously screened width-four DSpark admission; there is no
-manual reconciliation of the state machines.
+The authenticated C1 source and promoted tail-overlap tip share merge base
+`4205da9df81dc76895e6d1af08af72c8e09b682e`. All three cherry-picks applied
+without conflicts. The resulting delta relative to `c122d175` is confined to
+the DSpark generator, its focused integration tests, and this document; there
+is no manual reconciliation of the state machines.
+
+The authenticated loader/runtime chain remains byte-identical to `c122d175`:
+the rank-local loader SHA-256 is
+`9f10d5572f43c2dac34a9dfb2969118dad9d42326c36eace28d7b63a80897639`,
+and it continues to pin MLX-LM commit
+`591e11093b55b3b03f7cbc5018cd3b7d47abba4f` and the exact runtime source
+digests documented in `kimi-k3-width4-runtime-pin.md`.
 
 ## Selector boundary
 
@@ -52,16 +61,17 @@ terminal receipt.
 
 ## Offline evidence
 
-- Focused tail-overlap, DSpark, and greedy integration tests exercise proposal
-  reuse, default-off behavior, width-four composition, target-commit ordering,
-  anchor mismatch, and fail-stop submission/finalization paths.
-- The isolated receipt suite exercises strict selectors, native identity,
-  transactional counters, terminal ordering, and rank agreement.
-- Rank-local loader tests preserve the exact EXO/MLX-LM/source pins.
-- Ruff lint and format checks, Python byte-compilation, and strict basedpyright
-  on the three production generator modules are required before sealing this
-  branch. Third-party MLX/MLX-LM imports may report missing-source warnings;
-  errors are not accepted.
+- 273 focused tail-overlap, DSpark, greedy, rank-local loader, and loader-pin
+  tests passed. They exercise proposal reuse, default-off behavior, width-four
+  composition, target-commit ordering, anchor mismatch, fail-stop
+  submission/finalization paths, and the exact EXO/MLX-LM/source pins.
+- 43 isolated receipt tests passed, exercising strict selectors, native
+  identity, transactional counters, terminal ordering, and rank agreement.
+- 144 K3 TP2 and loader-pin tests passed.
+- Ruff lint and format checks and Python byte-compilation passed. Strict
+  basedpyright on the three production generator modules reported zero errors;
+  its six warnings were only the expected missing-source warnings for
+  third-party MLX/MLX-LM imports.
 
 This is not live evidence. No cluster, model weights, network, service, quality
 parity, memory, prefill, decode, or end-to-end throughput was exercised while
