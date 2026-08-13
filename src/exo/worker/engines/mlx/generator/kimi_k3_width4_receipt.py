@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import importlib
 import json
 import os
@@ -14,6 +15,7 @@ WIDTH4_RECEIPT_LOG_ENV = "EXO_MLX_KIMI_K3_WIDTH4_DISPATCH_RECEIPT_LOG"
 MLX_LM_WIDTH4_RECEIPT_ENV = "MLX_LM_KIMI_K3_WIDTH4_DISPATCH_RECEIPT"
 MLX_Q4_RECEIPT_ENV = "MLX_METAL_K3_AFFINE6_Q4_DISPATCH_RECEIPT"
 RECEIPT_MARKER = "K3_WIDTH4_DISPATCH_RECEIPT "
+EXPECTED_LIBMLX_SHA256_ENV = "EXO_MLX_KIMI_K3_WIDTH4_LIBMLX_SHA256"
 
 
 class _MlxModule(Protocol):
@@ -71,8 +73,26 @@ def _runtime_libmlx_path(mx_module: _MlxModule) -> Path:
     return candidate.resolve(strict=True)
 
 
-def _native_q4_dispatch_count(mx_module: _MlxModule) -> tuple[int, str]:
+def _native_q4_dispatch_count(mx_module: _MlxModule) -> tuple[int, str, str]:
     libmlx_path = _runtime_libmlx_path(mx_module)
+    expected_sha256 = os.environ.get(EXPECTED_LIBMLX_SHA256_ENV)
+    if (
+        expected_sha256 is None
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise Width4ReceiptError(
+            f"{EXPECTED_LIBMLX_SHA256_ENV} must be an exact lowercase SHA-256"
+        )
+    digest = hashlib.sha256()
+    with libmlx_path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise Width4ReceiptError(
+            f"authenticated libmlx SHA-256 differs: {actual_sha256} != {expected_sha256}"
+        )
     library = ctypes.CDLL(str(libmlx_path))
     try:
         getter = cast(
@@ -85,7 +105,7 @@ def _native_q4_dispatch_count(mx_module: _MlxModule) -> tuple[int, str]:
         ) from error
     getter.argtypes = []
     getter.restype = ctypes.c_uint64
-    return int(getter()), str(libmlx_path)
+    return int(getter()), str(libmlx_path), actual_sha256
 
 
 def _integer_field(fields: dict[str, object], name: str) -> int:
@@ -166,7 +186,7 @@ def capture_width4_dispatch_receipt(
         raise Width4ReceiptError("MLX-LM width-four receipt must be an object")
     python_receipt = cast(dict[str, object], cast(object, python_receipt_raw))
     validate_width4_python_receipt(python_receipt)
-    native_count, libmlx_path = _native_q4_dispatch_count(mx_module)
+    native_count, libmlx_path, libmlx_sha256 = _native_q4_dispatch_count(mx_module)
     totals = cast(dict[str, object], python_receipt["totals"])
     if _integer_field(totals, "dispatched") <= 0:
         raise Width4ReceiptError("MLX-LM width-four receipt has no dispatch")
@@ -185,6 +205,7 @@ def capture_width4_dispatch_receipt(
         "python_width4": python_receipt,
         "native_q4_dispatch_count": native_count,
         "libmlx_path": libmlx_path,
+        "libmlx_sha256": libmlx_sha256,
         "terminal_output_consumed": True,
     }
 

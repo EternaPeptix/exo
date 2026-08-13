@@ -11,12 +11,13 @@ Enable all three receipt selectors in a fresh C1 worker process:
 EXO_MLX_KIMI_K3_WIDTH4_DISPATCH_RECEIPT_LOG=1
 MLX_LM_KIMI_K3_WIDTH4_DISPATCH_RECEIPT=1
 MLX_METAL_K3_AFFINE6_Q4_DISPATCH_RECEIPT=1
+EXO_MLX_KIMI_K3_WIDTH4_LIBMLX_SHA256=<exact candidate SHA-256>
 ```
 
 At terminal response construction, after the output has been consumed, each
 rank writes one grep-safe `K3_WIDTH4_DISPATCH_RECEIPT` JSON record. The record
 binds hostname, process ID, TP rank, sibling `libmlx.dylib` path, native Q4
-dispatch count, and the transactional MLX-LM W4 receipt. It fails closed on a
+dispatch count, exact `libmlx.dylib` SHA-256, and the transactional MLX-LM W4 receipt. It fails closed on a
 missing native symbol, impossible/nonterminal Python totals, a stale completion
 from an earlier receipt generation, or any child selector not exactly `1`.
 

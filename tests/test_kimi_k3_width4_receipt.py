@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -43,6 +44,9 @@ def _enable(monkeypatch: pytest.MonkeyPatch) -> None:
         subject.MLX_Q4_RECEIPT_ENV,
     ):
         monkeypatch.setenv(name, "1")
+    monkeypatch.setenv(
+        subject.EXPECTED_LIBMLX_SHA256_ENV, hashlib.sha256(b"libmlx").hexdigest()
+    )
     subject.width4_receipt_log_enabled.cache_clear()
 
 
@@ -191,6 +195,7 @@ def test_capture_binds_python_and_native_receipts(
     assert receipt["host"] == "512S2.local"
     assert receipt["native_q4_dispatch_count"] == 17
     assert receipt["libmlx_path"] == str(libmlx)
+    assert receipt["libmlx_sha256"] == hashlib.sha256(b"libmlx").hexdigest()
     assert receipt["terminal_output_consumed"] is True
     assert getter.argtypes == []
     assert getter.restype is ctypes.c_uint64
