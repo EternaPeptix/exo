@@ -14,7 +14,7 @@ The execution source contract is:
 - `mlx_lm/models/kimi_k3_width4_fused_expert.py` SHA-256:
   `5e22a89e1c9b731eedfd342d6b18a3e3324574477e7991df8040658769e0a832`;
 - rank-local loader SHA-256:
-  `1f7e344b0f99636f567394294304f9a5c7b9730b301380e173fddd1b921794f1`;
+  `7ae67eba9a64e4ca921697680d17c2060cd39a82d88eba724d89d7a72b7946ab`;
 - rank-local manifest schema: `k3-rank-local-tp/v2`.
 
 The loader authenticates both changed MLX-LM modules before the model opens a
