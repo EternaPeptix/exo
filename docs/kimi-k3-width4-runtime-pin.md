@@ -8,13 +8,13 @@ MLX-LM integration. It is an authentication update, not a throughput result.
 The execution source contract is:
 
 - EXO parent: `d91b6ff7ef0f666ddeadee664fd3999fcd0394b0`;
-- MLX-LM: `80e466255323c9e52d305acaddf270450b703d1d`;
+- MLX-LM: `b9d09bde034328cf2a10817e4c05cb0533fc1fc2`;
 - `mlx_lm/models/kimi_k3_fused_expert.py` SHA-256:
-  `b736af039484b621c52a560b20ad86d4a421eea45372b45b263553c4da179cf7`;
+  `3e5e45337d521bf4e8f5e4b2578ab75cffe40d4fd7af39387acfb4c4e87bc95d`;
 - `mlx_lm/models/kimi_k3_width4_fused_expert.py` SHA-256:
   `5e22a89e1c9b731eedfd342d6b18a3e3324574477e7991df8040658769e0a832`;
 - rank-local loader SHA-256:
-  `fca455cb0143152473ea4c8fabca8c7660c519467bd370f8c96bb41283ca9afe`;
+  `de9a611233eb70dbde747301bb2a07bbf9feac0b07dc843c7bc7656137cba5ec`;
 - rank-local manifest schema: `k3-rank-local-tp/v2`.
 
 The loader authenticates both changed MLX-LM modules before the model opens a
