@@ -29,7 +29,7 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = "d59cae05a0cdf1a58f0629776c5cef7371273909"
+RUNTIME_MLX_LM_COMMIT = "80e466255323c9e52d305acaddf270450b703d1d"
 RUNTIME_MLX_LM_DSPARK_0731_COMMIT = "e041c6ac9296bd9a73bd4c8b1f4f0d4b55b62e35"
 MLX_LM_KIMI_K3_SHA256 = (
     "7851e5548b9e3d0ed9231e09a2078b4e09f29462c77e1ea2d727b4b6eba645d8"
@@ -57,7 +57,10 @@ MLX_LM_SWITCH_LAYERS_SHA256 = (
     "793679ed80ab4051858ac76ab32b9b9abcabe21eb02bac7c3fde75b6c15de840"
 )
 MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256 = (
-    "0ebcb48c53de18a96664f95c86617792598ae9c15a5ee3252bc8cf2b8f16d726"
+    "b736af039484b621c52a560b20ad86d4a421eea45372b45b263553c4da179cf7"
+)
+MLX_LM_KIMI_K3_WIDTH4_FUSED_EXPERT_SHA256 = (
+    "5e22a89e1c9b731eedfd342d6b18a3e3324574477e7991df8040658769e0a832"
 )
 MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256 = (
     "9deca87fa4deeae2a320abe4fb50ef49ab245ae070fb123110d0c9243ed9cb85"
@@ -386,6 +389,7 @@ def _verify_runtime_source() -> str:
         kimi_k3_packed_moe_front,
         kimi_k3_prefill_route_combine,
         kimi_k3_tuned_gather_qmv,
+        kimi_k3_width4_fused_expert,
         switch_layers,
     )
 
@@ -404,6 +408,11 @@ def _verify_runtime_source() -> str:
             kimi_k3_fused_expert,
             "kimi_k3_fused_expert.py",
             MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256,
+        ),
+        (
+            kimi_k3_width4_fused_expert,
+            "kimi_k3_width4_fused_expert.py",
+            MLX_LM_KIMI_K3_WIDTH4_FUSED_EXPERT_SHA256,
         ),
         (
             kimi_k3_fused_switch_glu,

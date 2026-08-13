@@ -46,7 +46,7 @@ SUPPORTED_TP_CONTRACT_DIGEST = (
     "1b7fdf1b28433fb08fff7e0e26a7bccc2ca0fcd51f29498ab611892c9fc48da5"
 )
 SUPPORTED_LOADER_SHA256 = (
-    "dadc21b38669eb70c3b3b90c7b15054cafa6e512d81f0e2aa472ad26c49d304b"
+    "fca455cb0143152473ea4c8fabca8c7660c519467bd370f8c96bb41283ca9afe"
 )
 # Exact non-weight inventory from SOURCE_REPO@SUPPORTED_SOURCE_REVISION.  Some
 # of these files execute under ``trust_remote_code=True``.  Pinning only their
