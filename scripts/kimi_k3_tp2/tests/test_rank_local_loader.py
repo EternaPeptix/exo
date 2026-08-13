@@ -248,7 +248,7 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
 def test_execution_runtime_pin_matches_width_four_candidate():
     assert loader.RUNTIME_MLX_LM_COMMIT == ("591e11093b55b3b03f7cbc5018cd3b7d47abba4f")
     assert loader.MLX_LM_KIMI_K3_SHA256 == (
-        "7851e5548b9e3d0ed9231e09a2078b4e09f29462c77e1ea2d727b4b6eba645d8"
+        "c20fe4020bc2a830403b98a2eacac7f1fa90cc2c5406a6ed3cfd2f1ff7a9107f"
     )
     assert loader.MLX_LM_KIMI_K3_DSPARK_SHA256 == (
         "be221a4dde09ec97011a961a4f2d7de1f5f0327af706395967166f710f968021"
@@ -257,7 +257,7 @@ def test_execution_runtime_pin_matches_width_four_candidate():
         "14a7cb54eb3585c992504c109db8bed45eb6ec521ae37e680eb601c419ed8ed1"
     )
     assert loader.MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256 == (
-        "0b8eec17606b8a4fbd8c6656acbe085dd293436a33004c9282d8e549b8f2c66d"
+        "584b4c94a623b583dae470a62851a8c882580dc7cb1519916a4019a631e7a3e5"
     )
     assert loader.MLX_LM_KIMI_K3_WIDTH4_FUSED_EXPERT_SHA256 == (
         "5e22a89e1c9b731eedfd342d6b18a3e3324574477e7991df8040658769e0a832"

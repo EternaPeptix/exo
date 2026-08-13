@@ -10,11 +10,11 @@ The execution source contract is:
 - EXO parent: `d91b6ff7ef0f666ddeadee664fd3999fcd0394b0`;
 - MLX-LM: `591e11093b55b3b03f7cbc5018cd3b7d47abba4f`;
 - `mlx_lm/models/kimi_k3_fused_expert.py` SHA-256:
-  `0b8eec17606b8a4fbd8c6656acbe085dd293436a33004c9282d8e549b8f2c66d`;
+  `584b4c94a623b583dae470a62851a8c882580dc7cb1519916a4019a631e7a3e5`;
 - `mlx_lm/models/kimi_k3_width4_fused_expert.py` SHA-256:
   `5e22a89e1c9b731eedfd342d6b18a3e3324574477e7991df8040658769e0a832`;
 - rank-local loader SHA-256:
-  `7ae67eba9a64e4ca921697680d17c2060cd39a82d88eba724d89d7a72b7946ab`;
+  `9f10d5572f43c2dac34a9dfb2969118dad9d42326c36eace28d7b63a80897639`;
 - rank-local manifest schema: `k3-rank-local-tp/v2`.
 
 The loader authenticates both changed MLX-LM modules before the model opens a
