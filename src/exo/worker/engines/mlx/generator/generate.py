@@ -83,8 +83,15 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     validate_dspark_greedy_sampling,
 )
 from exo.worker.engines.mlx.generator.kimi_k3_width4_receipt import (
+    Width4RequestReceiptContext,
+    begin_width4_request_receipt,
     capture_width4_dispatch_receipt,
     format_width4_dispatch_receipt,
+    mark_width4_receipt_rank_agreed,
+    reset_width4_dispatch_counters_after_warmup,
+    validate_width4_request_contract,
+    width4_receipt_agreement_contract,
+    width4_receipt_log_enabled,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -153,6 +160,8 @@ class _DSparkRequestSetup:
     runtime: KimiK3DSparkRequestRuntime
     proposer_selection: KimiK3DSparkProposerSelection | None
     fingerprint: tuple[int, ...]
+    verify_width: int
+    receipt_session_id: str | None
 
 
 @dataclass
@@ -1029,6 +1038,7 @@ def warmup_inference(
         kv_prefix_cache=None,
         group=group,
         dspark=dspark,
+        width4_receipt_scope="warmup",
     ):
         tokens_generated += 1
         if response.stats is not None:
@@ -1097,6 +1107,24 @@ def warmup_inference(
     )
 
     mx_barrier(group)
+
+    if dspark is not None and width4_receipt_log_enabled():
+        post_warmup_reset = rank_agreed_local_stage(
+            "width-four receipt post-warmup reset",
+            group,
+            lambda: reset_width4_dispatch_counters_after_warmup(
+                rank=group.rank() if group is not None else 0,
+                world_size=group.size() if group is not None else 1,
+                verify_width=verify_width,
+                model_id=str(model_id),
+                mx_module=mx,
+            ),
+            lambda reset: (
+                reset.agreement_contract() if reset is not None else "disabled"
+            ),
+        )
+        if post_warmup_reset is None:
+            raise RuntimeError("enabled width-four receipt reset returned disabled")
 
     logger.info(f"warmed up by generating {tokens_generated} tokens")
     if group is not None:
@@ -1200,6 +1228,8 @@ def _dspark_setup_fingerprint(
     confidence_capture: DSparkConfidenceCaptureConfig | None = None,
     target_route_top_k: int | None = None,
     proposer_selection: KimiK3DSparkProposerSelection | None = None,
+    receipt_session_id: str | None = None,
+    receipt_model_id: str | None = None,
 ) -> tuple[int, ...]:
     """Bind every local choice that can alter DSpark graph or loop ordering."""
 
@@ -1292,6 +1322,12 @@ def _dspark_setup_fingerprint(
             proposer_selection.identity_sha256,
             name="dual proposer identity SHA-256",
         )
+    if receipt_session_id is not None:
+        if receipt_model_id is None:
+            raise ValueError("width-four receipt model ID is missing")
+        digest.update(b"exo-kimi-k3-width4-receipt-binding/v2\0")
+        add_text(receipt_session_id, name="width-four receipt session")
+        add_text(receipt_model_id, name="width-four receipt model ID")
 
     raw = digest.digest()
     return tuple(
@@ -1361,6 +1397,7 @@ def _prepare_dspark_request_setup(
     vision_processor: VisionProcessor | None,
     agreement: MlxRankAgreement,
     generation_progress: bool,
+    width4_receipt_scope: Literal["request", "warmup"],
 ) -> _DSparkRequestSetup:
     """Build all failure-prone local request state without entering TP graphs."""
 
@@ -1393,6 +1430,16 @@ def _prepare_dspark_request_setup(
         dspark,
         initial_prompt_tokens=len(all_prompt_tokens),
     )
+    receipt_session_id: str | None = None
+    receipt_model_id: str | None = None
+    if width4_receipt_scope == "request" and width4_receipt_log_enabled():
+        receipt_model_id = str(task.model)
+        receipt_session_id, _receipt_selectors = validate_width4_request_contract(
+            rank=group.rank(),
+            world_size=group.size(),
+            verify_width=request_dspark.verify_width,
+            model_id=receipt_model_id,
+        )
     anchor_token = int(all_prompt_tokens[-1].item())
     if not 0 <= anchor_token <= 0x7FFFFFFF:
         raise ValueError("Kimi K3 DSpark anchor token must fit non-negative int32")
@@ -1499,6 +1546,8 @@ def _prepare_dspark_request_setup(
         confidence_capture=request_dspark.config.confidence_capture,
         target_route_top_k=request_dspark.target_route_top_k,
         proposer_selection=proposer_selection,
+        receipt_session_id=receipt_session_id,
+        receipt_model_id=receipt_model_id,
     )
     return _DSparkRequestSetup(
         is_pipeline=is_pipeline,
@@ -1521,6 +1570,8 @@ def _prepare_dspark_request_setup(
         runtime=runtime,
         proposer_selection=proposer_selection,
         fingerprint=fingerprint,
+        verify_width=request_dspark.verify_width,
+        receipt_session_id=receipt_session_id,
     )
 
 
@@ -1654,7 +1705,16 @@ def mlx_generate(
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
     dspark: LoadedKimiK3DSpark | None = None,
+    width4_receipt_scope: Literal["request", "warmup"] = "request",
 ) -> Generator[GenerationResponse]:
+    if width4_receipt_scope not in {"request", "warmup"}:
+        raise ValueError(f"invalid width-four receipt scope: {width4_receipt_scope}")
+    if (
+        width4_receipt_scope == "request"
+        and dspark is None
+        and width4_receipt_log_enabled()
+    ):
+        raise ValueError("enabled width-four receipt requires Kimi K3 DSpark")
     dspark_setup: _DSparkRequestSetup | None = None
     if dspark is not None:
         if group is None:
@@ -1678,6 +1738,7 @@ def mlx_generate(
                 vision_processor=vision_processor,
                 agreement=agreement,
                 generation_progress=on_generation_token is not None,
+                width4_receipt_scope=width4_receipt_scope,
             ),
         )
         selection = dspark_setup.proposer_selection
@@ -1836,9 +1897,45 @@ def mlx_generate(
     prefill_tokens = 0
     ssm_snapshots_list: list[CacheSnapshot] = []
     dspark_runtime: KimiK3DSparkRequestRuntime | None = None
+    width4_receipt_context: Width4RequestReceiptContext | None = None
+    if dspark_setup is not None:
+        dspark_runtime = dspark_setup.runtime
+        if dspark_setup.receipt_session_id is not None:
+            local_receipt_context: Width4RequestReceiptContext | None = None
+
+            def begin_receipt_contract() -> str:
+                nonlocal local_receipt_context
+                context = begin_width4_request_receipt(
+                    rank=group.rank() if group is not None else 0,
+                    world_size=group.size() if group is not None else 1,
+                    verify_width=dspark_setup.verify_width,
+                    model_id=str(task.model),
+                    request_fingerprint=dspark_setup.fingerprint,
+                    mx_module=mx,
+                )
+                if context is None:
+                    raise RuntimeError(
+                        "rank-agreed width-four receipt became disabled before prefill"
+                    )
+                if context.session_id != dspark_setup.receipt_session_id:
+                    raise RuntimeError(
+                        "width-four receipt session changed after setup agreement"
+                    )
+                local_receipt_context = context
+                return context.agreement_contract()
+
+            dspark_runtime.agree_text(
+                "width-four request receipt reset contract",
+                begin_receipt_contract,
+            )
+            if local_receipt_context is None:
+                raise RuntimeError(
+                    "width-four request receipt context was not retained"
+                )
+            width4_receipt_context = local_receipt_context
     with maybe_vision_ctx:
         if dspark_setup is not None:
-            dspark_runtime = dspark_setup.runtime
+            assert dspark_runtime is not None
             prefill_tps, prefill_tokens = dspark_runtime.seed_prompt(
                 prompt_tokens[:-1],
                 prefill_step_size=dspark_setup.prefill_step_size,
@@ -2179,14 +2276,6 @@ def mlx_generate(
                         f"{prefill_tps:.1f} tok/s, generated {generated_tokens} "
                         f"tokens @ {generation_tps:.1f} tok/s"
                     )
-                    receipt = capture_width4_dispatch_receipt(
-                        rank=group.rank() if group is not None else 0,
-                        mx_module=mx,
-                        process_id=os.getpid(),
-                        host=platform.node(),
-                    )
-                    if receipt is not None:
-                        logger.info(format_width4_dispatch_receipt(receipt))
 
                 return GenerationResponse(
                     text=text,
@@ -2236,6 +2325,43 @@ def mlx_generate(
 
             if is_done and dspark_runtime is not None:
                 dspark_runtime.log_packed_agreement_attestation()
+
+            if is_done and width4_receipt_context is not None:
+                if dspark_runtime is None:
+                    raise RuntimeError(
+                        "width-four receipt reached terminal output without DSpark"
+                    )
+
+                local_receipt: dict[str, object] | None = None
+
+                def capture_receipt_contract() -> str:
+                    nonlocal local_receipt
+                    receipt = capture_width4_dispatch_receipt(
+                        context=width4_receipt_context,
+                        process_id=os.getpid(),
+                        host=platform.node(),
+                        response_built=True,
+                        generation_callback_complete=True,
+                        terminal_barrier_complete=True,
+                        confidence_finalization_complete=True,
+                        packed_attestation_complete=True,
+                    )
+                    if receipt is None:
+                        raise RuntimeError(
+                            "enabled width-four terminal receipt became disabled"
+                        )
+                    local_receipt = receipt
+                    return width4_receipt_agreement_contract(receipt)
+
+                dspark_runtime.agree_text(
+                    "width-four terminal receipt capture contract",
+                    capture_receipt_contract,
+                )
+                if local_receipt is None:
+                    raise RuntimeError("width-four terminal receipt was not retained")
+                receipt = local_receipt
+                mark_width4_receipt_rank_agreed(receipt)
+                logger.info(format_width4_dispatch_receipt(receipt))
 
             yield response
 
