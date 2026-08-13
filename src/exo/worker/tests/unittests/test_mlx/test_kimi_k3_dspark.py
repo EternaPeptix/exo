@@ -3294,6 +3294,10 @@ class _FakeRoundEngine:
     ordinary_tokens: list[int] = field(default_factory=list)
     anchors: list[int] = field(default_factory=list)
     ordinary_anchors: list[int] = field(default_factory=list)
+    closed: bool = False
+
+    def close(self) -> None:
+        self.closed = True
 
     def decode_round(
         self,

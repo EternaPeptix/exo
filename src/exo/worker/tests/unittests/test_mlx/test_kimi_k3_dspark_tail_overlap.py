@@ -17,10 +17,12 @@ from pathlib import Path
 import pytest
 
 from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
+    DSparkCollectivePoisonError,
     DSparkDistributedStateError,
     KimiK3DSparkConfig,
     KimiK3DSparkRoundEngine,
     TargetPosterior,
+    dspark_decode_tokens,
 )
 from exo.worker.tests.unittests.test_mlx.test_kimi_k3_dspark import (
     _FakeAgreement,  # pyright: ignore[reportPrivateUsage]
@@ -63,6 +65,8 @@ class _OverlapDraftRound:
         self.events.append(
             "draft_commit_finalize_eval" if evaluate else "draft_commit_finalize_lazy"
         )
+        if self.owner.fail_finalize:
+            raise RuntimeError("injected draft finalize failure")
         self.finalizes.append(evaluate)
 
     def commit(
@@ -122,6 +126,7 @@ class _OverlapDraft:
     placement: str = "replicated"
     fail_commit_build: bool = False
     fail_submit: bool = False
+    fail_finalize: bool = False
     fail_build_at_call: int | None = None
     build_calls: int = field(default=0, init=False)
     rounds: list[_OverlapDraftRound] = field(default_factory=list)
@@ -158,6 +163,7 @@ def _overlap_engine(
     target_fail_commit: bool = False,
     fail_commit_build: bool = False,
     fail_submit: bool = False,
+    fail_finalize: bool = False,
     fail_build_at_call: int | None = None,
 ) -> tuple[
     KimiK3DSparkRoundEngine,
@@ -175,6 +181,7 @@ def _overlap_engine(
         events,
         fail_commit_build=fail_commit_build,
         fail_submit=fail_submit,
+        fail_finalize=fail_finalize,
         fail_build_at_call=fail_build_at_call,
     )
     target = _FakeTarget(tuple(posterior), events, fail_commit=target_fail_commit)
@@ -366,21 +373,54 @@ def test_tail_overlap_graph_build_failure_recovers(tmp_path: Path) -> None:
     assert events[0] == "draft_preflight"
 
 
-def test_tail_overlap_submit_failure_disables_dspark(tmp_path: Path) -> None:
+def test_tail_overlap_submit_failure_poison_stops_before_later_collective(
+    tmp_path: Path,
+) -> None:
     engine, draft, _target, _collective, _events = _overlap_engine(
         tmp_path,
         fail_submit=True,
     )
 
-    result = engine.decode_round(10, remaining=100)
+    with pytest.raises(DSparkCollectivePoisonError, match="worker/ring must be recycled"):
+        engine.decode_round(10, remaining=100)
 
-    assert result.emitted_tokens == (11, 12, 13)
-    assert result.telemetry.error is not None
-    assert "draft commit" in result.telemetry.error
-    assert result.telemetry.prelaunch_submitted is False
     assert draft.prepared[1].cancelled is True
-    assert draft.rounds[0].finalizes == [True]
+    assert draft.rounds[0].cancelled is True
+    assert "target_commit" not in _events
+    assert _events[-4:] == [
+        "draft_submit",
+        "draft_graph_cancel",
+        "draft_cancel",
+        "target_cancel",
+    ]
     assert engine._prelaunched is None  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(DSparkCollectivePoisonError, match="earlier"):
+        engine.decode_ordinary_tail(13)
+
+
+def test_tail_overlap_finalize_failure_after_submit_is_poison_fail_stop(
+    tmp_path: Path,
+) -> None:
+    engine, draft, _target, _collective, events = _overlap_engine(
+        tmp_path,
+        fail_finalize=True,
+    )
+
+    with pytest.raises(DSparkCollectivePoisonError, match="worker/ring must be recycled"):
+        engine.decode_round(10, remaining=100)
+
+    assert draft.prepared[1].submitted is True
+    assert draft.prepared[1].cancelled is True
+    assert draft.rounds[0].cancelled is True
+    assert "target_commit" not in events
+    assert events[-5:] == [
+        "draft_submit",
+        "draft_commit_finalize_lazy",
+        "draft_graph_cancel",
+        "draft_cancel",
+        "target_cancel",
+    ]
 
 
 def test_tail_overlap_discards_prelaunch_on_anchor_mismatch(tmp_path: Path) -> None:
@@ -427,3 +467,21 @@ def test_ordinary_tail_discards_pending_prelaunch(tmp_path: Path) -> None:
     # A planned max-token tail is an ordinary round, not an error fallback.
     assert result.telemetry.fallback is False
     assert result.telemetry.error is None
+
+
+def test_decode_generator_close_discards_pending_prelaunch(tmp_path: Path) -> None:
+    engine, draft, _target, _collective, _events = _overlap_engine(tmp_path)
+    decoded = dspark_decode_tokens(
+        engine,
+        anchor_token=10,
+        max_tokens=100,
+        eos_token_ids=(),
+    )
+
+    assert next(decoded).token == 11
+    assert engine._prelaunched is not None  # pyright: ignore[reportPrivateUsage]
+
+    decoded.close()
+
+    assert engine._prelaunched is None  # pyright: ignore[reportPrivateUsage]
+    assert draft.prepared[1].cancelled is True

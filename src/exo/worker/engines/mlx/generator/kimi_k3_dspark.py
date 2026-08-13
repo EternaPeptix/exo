@@ -135,6 +135,15 @@ class DSparkDistributedStateError(RuntimeError):
     """A distributed state transition cannot be recovered safely."""
 
 
+class DSparkCollectivePoisonError(DSparkDistributedStateError):
+    """An asynchronous TP graph may have been submitted unevenly across ranks.
+
+    No further collective is safe on this request's group. The caller must
+    fail the request and recycle the distributed worker/ring rather than try
+    ordinary fallback or another speculative round.
+    """
+
+
 class DSparkCancellationError(RuntimeError):
     """A speculative transaction could not be cancelled safely."""
 
@@ -1611,6 +1620,7 @@ class KimiK3DSparkRoundEngine:
     )
     _capture_round_started: float | None = field(default=None, init=False)
     _prelaunched: _PrelaunchedDraftRound | None = field(default=None, init=False)
+    _collective_poison_reason: str | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.clock = _nonthrowing_telemetry_clock(self.clock)
@@ -1762,6 +1772,56 @@ class KimiK3DSparkRoundEngine:
             self._discard_prelaunched(prelaunched)
             return None
         return prelaunched
+
+    def _raise_if_collective_poisoned(self) -> None:
+        if self._collective_poison_reason is not None:
+            raise DSparkCollectivePoisonError(
+                "Kimi K3 DSpark collective order was poisoned by an earlier "
+                f"tail-overlap submission failure: {self._collective_poison_reason}; "
+                "the distributed worker/ring must be recycled"
+            ) from None
+
+    def _poison_after_async_submission(
+        self,
+        *,
+        error: Exception,
+        prepared: PreparedDraftRound,
+        draft_round: DraftRound,
+    ) -> None:
+        """Fail-stop without entering another collective after async submit.
+
+        A successful rank may already have enqueued proposal TP collectives
+        when a peer's ``mx.async_eval`` or lazy-finalize call fails. A
+        post-submit agreement on the same group cannot repair that asymmetry:
+        it would be ordered behind proposal collectives on the successful rank
+        but become the next collective on the failed rank. Record a permanent
+        request-local poison state, perform local-only cancellation, and raise
+        before target commit or any agreement. Normal successful ordering and
+        collective count remain unchanged.
+        """
+
+        reason = f"{type(error).__name__}: {error}"
+        self._collective_poison_reason = reason
+        for state, name in (
+            (prepared, "prelaunched draft graph"),
+            (draft_round, "draft round"),
+        ):
+            try:
+                state.cancel()
+            except Exception:
+                _log_nonfatal_warning(
+                    f"Kimi K3 DSpark poisoned {name} cancellation failed"
+                )
+        raise DSparkCollectivePoisonError(
+            "Kimi K3 DSpark tail-overlap async submission may differ across "
+            f"ranks: {reason}; no later collective is safe and the "
+            "distributed worker/ring must be recycled"
+        ) from error
+
+    def close(self) -> None:
+        """Discard request-local lookahead when its token stream is abandoned."""
+
+        self._discard_prelaunched()
 
     def _cancel_before_fallback(
         self,
@@ -2172,45 +2232,24 @@ class KimiK3DSparkRoundEngine:
                 collective_ms=collective_ms,
             )
 
-        submit_error: str | None = None
         try:
             cast(
                 _SubmittablePreparedDraftRound,
                 cast(object, prepared),
             ).submit(context_arrays)
         except Exception as error:
-            submit_error = (
-                f"draft commit failed: {type(error).__name__}: {error}; "
-                "DSpark disabled for subsequent rounds"
+            self._poison_after_async_submission(
+                error=error,
+                prepared=prepared,
+                draft_round=draft_round,
             )
-        if submit_error is None:
-            try:
-                split.commit_finalize(evaluate=False)
-            except Exception as error:
-                submit_error = (
-                    f"draft commit failed: {type(error).__name__}: {error}; "
-                    "DSpark disabled for subsequent rounds"
-                )
-        if submit_error is not None:
-            try:
-                prepared.cancel()
-            except Exception:
-                _log_nonfatal_warning(
-                    "Kimi K3 DSpark prelaunched draft cancellation failed"
-                )
-            try:
-                split.commit_finalize(evaluate=True)
-            except Exception:
-                _log_nonfatal_warning(
-                    "Kimi K3 DSpark draft finalize after failed submit failed"
-                )
-            return _TailPrelaunch(
-                error=submit_error,
-                prepared=None,
-                submitted=False,
-                context_offset=context_offset,
-                next_anchor_token=next_anchor_token,
-                collective_ms=collective_ms,
+        try:
+            split.commit_finalize(evaluate=False)
+        except Exception as error:
+            self._poison_after_async_submission(
+                error=error,
+                prepared=prepared,
+                draft_round=draft_round,
             )
 
         return _TailPrelaunch(
@@ -2227,6 +2266,7 @@ class KimiK3DSparkRoundEngine:
 
         if type(anchor_token) is not int or anchor_token < 0:
             raise ValueError("anchor_token must be a non-negative integer")
+        self._raise_if_collective_poisoned()
         self._begin_capture_round()
         return self._ordinary_fallback(
             anchor_token,
@@ -2250,6 +2290,7 @@ class KimiK3DSparkRoundEngine:
 
         if type(anchor_token) is not int or anchor_token < 0:
             raise ValueError("anchor_token must be a non-negative integer")
+        self._raise_if_collective_poisoned()
         self._begin_capture_round()
         if self._disabled_reason is not None:
             return self._ordinary_fallback(
@@ -2644,14 +2685,25 @@ class KimiK3DSparkRoundEngine:
         assert draft_round is not None
         if self.config.tail_overlap and remaining is not None:
             prelaunch_started = self.clock()
-            tail = self._maybe_prelaunch_next_draft(
-                draft_round=draft_round,
-                accepted=accepted,
-                next_anchor_token=next_anchor_token,
-                posterior=posterior,
-                remaining=remaining,
-                emitted_tokens=emitted_tokens,
-            )
+            try:
+                tail = self._maybe_prelaunch_next_draft(
+                    draft_round=draft_round,
+                    accepted=accepted,
+                    next_anchor_token=next_anchor_token,
+                    posterior=posterior,
+                    remaining=remaining,
+                    emitted_tokens=emitted_tokens,
+                )
+            except DSparkCollectivePoisonError:
+                # Local rollback is still useful for teardown, but any
+                # agreement here could itself be the mismatched collective.
+                try:
+                    target_round.cancel()
+                except Exception:
+                    _log_nonfatal_warning(
+                        "Kimi K3 DSpark poisoned target cancellation failed"
+                    )
+                raise
             prelaunch_ms = (self.clock() - prelaunch_started) * 1000.0
             if tail is not None:
                 collective_ms += tail.collective_ms
@@ -5448,6 +5500,8 @@ class DSparkRoundDecoder(Protocol):
 
     def decode_ordinary_tail(self, anchor_token: int) -> DSparkRoundResult: ...
 
+    def close(self) -> None: ...
+
 
 def dspark_decode_tokens(
     engine: DSparkRoundDecoder,
@@ -5466,35 +5520,38 @@ def dspark_decode_tokens(
     eos = frozenset(eos_token_ids)
     emitted = 0
     next_anchor = anchor_token
-    while emitted < max_tokens:
-        remaining = max_tokens - emitted
-        result = (
-            engine.decode_ordinary_tail(next_anchor)
-            if force_ordinary or remaining < engine.verify_width
-            else engine.decode_round(next_anchor, remaining=remaining)
-        )
-        if round_observer is not None:
-            try:
-                round_observer(result.telemetry)
-            except Exception:
-                _log_nonfatal_warning("Kimi K3 DSpark round observer failed")
-        if not result.emitted_tokens:
-            raise DSparkDistributedStateError(
-                "Kimi K3 DSpark round committed no output token"
+    try:
+        while emitted < max_tokens:
+            remaining = max_tokens - emitted
+            result = (
+                engine.decode_ordinary_tail(next_anchor)
+                if force_ordinary or remaining < engine.verify_width
+                else engine.decode_round(next_anchor, remaining=remaining)
             )
-        for round_token_index, token in enumerate(result.emitted_tokens):
-            emitted += 1
-            next_anchor = token
-            from_draft = round_token_index < result.telemetry.accepted
-            if token_observer is not None:
+            if round_observer is not None:
                 try:
-                    token_observer(from_draft)
+                    round_observer(result.telemetry)
                 except Exception:
-                    _log_nonfatal_warning("Kimi K3 DSpark token observer failed")
-            if token in eos:
-                yield DSparkDecodedToken(token, from_draft, "stop")
-                return
-            if emitted == max_tokens:
-                yield DSparkDecodedToken(token, from_draft, "length")
-                return
-            yield DSparkDecodedToken(token, from_draft, None)
+                    _log_nonfatal_warning("Kimi K3 DSpark round observer failed")
+            if not result.emitted_tokens:
+                raise DSparkDistributedStateError(
+                    "Kimi K3 DSpark round committed no output token"
+                )
+            for round_token_index, token in enumerate(result.emitted_tokens):
+                emitted += 1
+                next_anchor = token
+                from_draft = round_token_index < result.telemetry.accepted
+                if token_observer is not None:
+                    try:
+                        token_observer(from_draft)
+                    except Exception:
+                        _log_nonfatal_warning("Kimi K3 DSpark token observer failed")
+                if token in eos:
+                    yield DSparkDecodedToken(token, from_draft, "stop")
+                    return
+                if emitted == max_tokens:
+                    yield DSparkDecodedToken(token, from_draft, "length")
+                    return
+                yield DSparkDecodedToken(token, from_draft, None)
+    finally:
+        engine.close()
