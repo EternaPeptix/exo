@@ -174,7 +174,7 @@ def _overlap_engine(
 ]:
     events: list[str] = []
     width = len(posterior)
-    assert width == 3
+    assert width in (3, 4, 8)
     draft = _OverlapDraft(
         [tuple(proposals) for proposals in proposal_rounds],
         width,
@@ -189,7 +189,7 @@ def _overlap_engine(
     engine = KimiK3DSparkRoundEngine(
         config=KimiK3DSparkConfig(
             checkpoint_path=tmp_path,
-            verify_width=3,
+            verify_width=width,
             round_telemetry=False,
             tail_overlap=tail_overlap,
         ),
@@ -325,6 +325,25 @@ def test_tail_overlap_disabled_by_default_config(tmp_path: Path) -> None:
     assert "draft_commit" in events
 
 
+def test_tail_overlap_composes_with_width_four(tmp_path: Path) -> None:
+    engine, draft, target, _collective, events = _overlap_engine(
+        tmp_path,
+        proposal_rounds=((11, 12, 13), (11, 12, 13), (11, 12, 13)),
+        posterior=(11, 12, 13, 14),
+    )
+
+    first = engine.decode_round(10, remaining=100)
+    second = engine.decode_round(14, remaining=96)
+
+    assert engine.verify_width == 4
+    assert first.emitted_tokens == (11, 12, 13, 14)
+    assert first.telemetry.prelaunch_submitted is True
+    assert second.telemetry.prelaunch_used is True
+    assert target.rounds[0].commits == [4]
+    assert draft.rounds[0].commits == [(3, 14, (11, 12, 13, 14))]
+    assert "draft_commit_finalize_lazy" in events
+
+
 def test_tail_overlap_commit_build_failure_disables_dspark(tmp_path: Path) -> None:
     engine, draft, target, _collective, _events = _overlap_engine(
         tmp_path,
@@ -381,7 +400,9 @@ def test_tail_overlap_submit_failure_poison_stops_before_later_collective(
         fail_submit=True,
     )
 
-    with pytest.raises(DSparkCollectivePoisonError, match="worker/ring must be recycled"):
+    with pytest.raises(
+        DSparkCollectivePoisonError, match="worker/ring must be recycled"
+    ):
         engine.decode_round(10, remaining=100)
 
     assert draft.prepared[1].cancelled is True
@@ -407,7 +428,9 @@ def test_tail_overlap_finalize_failure_after_submit_is_poison_fail_stop(
         fail_finalize=True,
     )
 
-    with pytest.raises(DSparkCollectivePoisonError, match="worker/ring must be recycled"):
+    with pytest.raises(
+        DSparkCollectivePoisonError, match="worker/ring must be recycled"
+    ):
         engine.decode_round(10, remaining=100)
 
     assert draft.prepared[1].submitted is True

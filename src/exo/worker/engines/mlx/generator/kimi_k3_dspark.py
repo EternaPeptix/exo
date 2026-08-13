@@ -299,7 +299,7 @@ def _strict_verify_width(raw: str) -> KimiK3DSparkVerifyWidth:
     parsed = int(raw)
     if parsed not in DSPARK_ALLOWED_VERIFY_WIDTHS:
         raise DSparkConfigurationError(f"{DSPARK_VERIFY_WIDTH_ENV} must be 3, 4, or 8")
-    return cast(KimiK3DSparkVerifyWidth, parsed)
+    return parsed
 
 
 def _strict_capture_label(name: str, raw: str) -> str:
@@ -2329,13 +2329,9 @@ class KimiK3DSparkRoundEngine:
         else:
             local_context_offset: int | None = None
             try:
-                local_context_offset = self.draft.preflight_round(
-                    anchor_token, gamma
-                )
+                local_context_offset = self.draft.preflight_round(anchor_token, gamma)
             except Exception as error:
-                local_error = (
-                    f"draft preflight failed: {type(error).__name__}: {error}"
-                )
+                local_error = f"draft preflight failed: {type(error).__name__}: {error}"
 
             (
                 preflight_outcome,
