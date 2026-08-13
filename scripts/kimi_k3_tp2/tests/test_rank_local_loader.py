@@ -246,7 +246,7 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
 
 
 def test_execution_runtime_pin_matches_width_four_candidate():
-    assert loader.RUNTIME_MLX_LM_COMMIT == ("fd38e8483d852d5bb698d3794581a4d568097a12")
+    assert loader.RUNTIME_MLX_LM_COMMIT == ("591e110cd3b826975515238ea8113bff0ce82cd5")
     assert loader.MLX_LM_KIMI_K3_SHA256 == (
         "7851e5548b9e3d0ed9231e09a2078b4e09f29462c77e1ea2d727b4b6eba645d8"
     )

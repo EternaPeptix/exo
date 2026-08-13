@@ -8,7 +8,7 @@ MLX-LM integration. It is an authentication update, not a throughput result.
 The execution source contract is:
 
 - EXO parent: `d91b6ff7ef0f666ddeadee664fd3999fcd0394b0`;
-- MLX-LM: `fd38e8483d852d5bb698d3794581a4d568097a12`;
+- MLX-LM: `591e110cd3b826975515238ea8113bff0ce82cd5`;
 - `mlx_lm/models/kimi_k3_fused_expert.py` SHA-256:
   `0b8eec17606b8a4fbd8c6656acbe085dd293436a33004c9282d8e549b8f2c66d`;
 - `mlx_lm/models/kimi_k3_width4_fused_expert.py` SHA-256:
