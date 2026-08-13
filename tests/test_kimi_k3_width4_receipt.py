@@ -67,16 +67,7 @@ class _ReceiptState:
 
 
 def _python_selectors() -> dict[str, str]:
-    return {
-        name: "1"
-        for name in (
-            subject.MLX_LM_WIDTH4_RECEIPT_ENV,
-            subject.MLX_LM_FUSED_EXPERT_ENV,
-            subject.MLX_LM_FUSED_DOWN_REDUCE_ENV,
-            subject.MLX_LM_WIDTH4_EXACT_ENV,
-            subject.MLX_LM_DERIVE_AFFINE2_BIAS_ENV,
-        )
-    }
+    return dict(subject._PYTHON_SELECTOR_EXPECTED)
 
 
 def _python_receipt(
@@ -146,11 +137,9 @@ def _reset_process_state(monkeypatch: pytest.MonkeyPatch):
 
 
 def _enable(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (
-        subject.WIDTH4_RECEIPT_LOG_ENV,
-        *subject._REQUIRED_SELECTOR_ENVS,
-    ):
-        monkeypatch.setenv(name, "1")
+    monkeypatch.setenv(subject.WIDTH4_RECEIPT_LOG_ENV, "1")
+    for name, value in subject._REQUIRED_SELECTOR_EXPECTED.items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setenv(subject.WIDTH4_RECEIPT_SESSION_ID_ENV, "c1-20260813:trial_01")
     monkeypatch.setenv(
         subject.EXPECTED_LIBMLX_SHA256_ENV,
@@ -302,8 +291,8 @@ def test_every_candidate_selector_is_mandatory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable(monkeypatch)
-    for name in subject._REQUIRED_SELECTOR_ENVS:
-        monkeypatch.setenv(name, "0")
+    for name, expected in subject._REQUIRED_SELECTOR_EXPECTED.items():
+        monkeypatch.setenv(name, "16" if expected == "8" else "0")
         with pytest.raises(subject.Width4ReceiptError, match="exact candidate"):
             subject.validate_width4_request_contract(
                 rank=0,
@@ -311,7 +300,27 @@ def test_every_candidate_selector_is_mandatory(
                 verify_width=4,
                 model_id="kernelpool/Kimi-K3-2bit-UVMAX",
             )
-        monkeypatch.setenv(name, "1")
+        monkeypatch.setenv(name, expected)
+
+
+@pytest.mark.parametrize("value", (None, "16", "08", "8 "))
+def test_receipt_admission_requires_exact_expert_top_k_eight(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+) -> None:
+    _enable(monkeypatch)
+    if value is None:
+        monkeypatch.delenv(subject.MLX_LM_EXPERT_TOP_K_ENV)
+    else:
+        monkeypatch.setenv(subject.MLX_LM_EXPERT_TOP_K_ENV, value)
+
+    with pytest.raises(subject.Width4ReceiptError, match="exact candidate"):
+        subject.validate_width4_request_contract(
+            rank=0,
+            world_size=2,
+            verify_width=4,
+            model_id="kernelpool/Kimi-K3-2bit-UVMAX",
+        )
 
 
 def test_failed_first_attempt_still_consumes_worker(
@@ -405,6 +414,49 @@ def test_nonexact_python_path_receipts_are_rejected(mutation: str) -> None:
         subject.validate_width4_python_receipt(receipt)
 
 
+@pytest.mark.parametrize(
+    "location",
+    ("current_selectors", "terminal_records", "selector_states"),
+)
+@pytest.mark.parametrize("value", (None, "16", "08", "8 "))
+def test_python_receipt_requires_exact_top_k_in_every_selector_snapshot(
+    location: str,
+    value: str | None,
+) -> None:
+    receipt = _python_receipt()
+    if location == "current_selectors":
+        selectors = receipt[location]
+    else:
+        records = receipt[location]
+        assert isinstance(records, list) and records
+        record = records[0]
+        assert isinstance(record, dict)
+        selectors = record["selectors"]
+    assert isinstance(selectors, dict)
+    if value is None:
+        selectors.pop(subject.MLX_LM_EXPERT_TOP_K_ENV)
+    else:
+        selectors[subject.MLX_LM_EXPERT_TOP_K_ENV] = value
+
+    with pytest.raises(subject.Width4ReceiptError, match="selectors differ"):
+        subject.validate_width4_python_receipt(receipt)
+
+
+def test_mid_request_top_k_mutation_fails_before_receipt_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _enable(monkeypatch)
+    mx_module, _counter, _receipt_state, _getter, _resetter = _install_runtime(
+        monkeypatch, tmp_path
+    )
+    context = _begin(mx_module)
+    monkeypatch.setenv(subject.MLX_LM_EXPERT_TOP_K_ENV, "16")
+
+    with pytest.raises(subject.Width4ReceiptError, match="exact candidate"):
+        _capture(context)
+
+
 def test_capture_binds_request_and_exact_counter_deltas(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -431,9 +483,7 @@ def test_capture_binds_request_and_exact_counter_deltas(
         "final": 17,
         "delta": 17,
     }
-    assert receipt["selectors"] == {
-        name: "1" for name in subject._REQUIRED_SELECTOR_ENVS
-    }
+    assert receipt["selectors"] == subject._REQUIRED_SELECTOR_EXPECTED
     boundaries = receipt["terminal_boundaries"]
     assert isinstance(boundaries, dict)
     assert boundaries["rank_agreement_pending"] is False

@@ -1442,6 +1442,47 @@ def test_dspark_setup_fingerprint_binds_generation_callback_presence(
     )
 
 
+def test_dspark_receipt_fingerprint_requires_and_binds_attested_top8() -> None:
+    common = {
+        "prompt_tokens": cast(object, _PromptTokens((1, 2, 3))),
+        "max_tokens": 16,
+        "prefill_step_size": 4,
+        "capacity_hint": 18,
+        "verify_width": 4,
+        "seed": 42,
+        "is_bench": False,
+        "compact_greedy": False,
+        "generation_progress": False,
+        "eos_token_ids": (2,),
+        "banned_token_ids": (),
+        "terminal_token_ids": (2,),
+        "stop_sequences": (),
+        "receipt_session_id": "c1-top8",
+        "receipt_model_id": "kernelpool/Kimi-K3-2bit-UVMAX",
+    }
+
+    for target_route_top_k in (None, 16):
+        with pytest.raises(ValueError, match="attested target route top-k 8"):
+            generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+                **common,
+                target_route_top_k=target_route_top_k,
+            )
+
+    receipt = generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        target_route_top_k=8,
+    )
+    without_receipt = generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **{
+            name: value
+            for name, value in common.items()
+            if name not in {"receipt_session_id", "receipt_model_id"}
+        },
+        target_route_top_k=8,
+    )
+    assert receipt != without_receipt
+
+
 def test_packed_selector_activates_only_after_legacy_setup_sequence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

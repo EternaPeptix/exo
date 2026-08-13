@@ -24,24 +24,28 @@ MLX_LM_FUSED_EXPERT_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERTS"
 MLX_LM_FUSED_DOWN_REDUCE_ENV = "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE"
 MLX_LM_WIDTH4_EXACT_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH4_EXACT"
 MLX_LM_DERIVE_AFFINE2_BIAS_ENV = "MLX_LM_KIMI_K3_DERIVE_AFFINE2_BIAS"
+MLX_LM_EXPERT_TOP_K_ENV = "MLX_LM_KIMI_K3_EXPERT_TOP_K"
 MLX_Q4_RECEIPT_ENV = "MLX_METAL_K3_AFFINE6_Q4_DISPATCH_RECEIPT"
 MLX_Q4_SELECTOR_ENV = "MLX_METAL_K3_AFFINE6_Q4_QUAD"
 
 RECEIPT_MARKER = "K3_WIDTH4_DISPATCH_RECEIPT "
 
-_PYTHON_SELECTOR_ENVS = (
-    MLX_LM_WIDTH4_RECEIPT_ENV,
-    MLX_LM_FUSED_EXPERT_ENV,
-    MLX_LM_FUSED_DOWN_REDUCE_ENV,
-    MLX_LM_WIDTH4_EXACT_ENV,
-    MLX_LM_DERIVE_AFFINE2_BIAS_ENV,
-)
-_REQUIRED_SELECTOR_ENVS = (
-    *_PYTHON_SELECTOR_ENVS,
-    MLX_Q4_RECEIPT_ENV,
-    MLX_Q4_SELECTOR_ENV,
-    DSPARK_PACKED_AGREEMENTS_ENV,
-)
+_PYTHON_SELECTOR_EXPECTED = {
+    MLX_LM_WIDTH4_RECEIPT_ENV: "1",
+    MLX_LM_FUSED_EXPERT_ENV: "1",
+    MLX_LM_FUSED_DOWN_REDUCE_ENV: "1",
+    MLX_LM_WIDTH4_EXACT_ENV: "1",
+    MLX_LM_DERIVE_AFFINE2_BIAS_ENV: "1",
+    MLX_LM_EXPERT_TOP_K_ENV: "8",
+}
+_REQUIRED_SELECTOR_EXPECTED = {
+    **_PYTHON_SELECTOR_EXPECTED,
+    MLX_Q4_RECEIPT_ENV: "1",
+    MLX_Q4_SELECTOR_ENV: "1",
+    DSPARK_PACKED_AGREEMENTS_ENV: "1",
+}
+_PYTHON_SELECTOR_ENVS = tuple(_PYTHON_SELECTOR_EXPECTED)
+_REQUIRED_SELECTOR_ENVS = tuple(_REQUIRED_SELECTOR_EXPECTED)
 _RECEIPT_PATHS = ("switch_glu", "switch_glu_reduce")
 _RECEIPT_METRICS = ("attempted", "supported", "dispatched", "fallback", "error")
 _SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", flags=re.ASCII)
@@ -185,7 +189,11 @@ def width4_receipt_session_id() -> str:
 
 def _require_exact_receipt_selectors() -> dict[str, str]:
     selectors = {name: os.environ.get(name) for name in _REQUIRED_SELECTOR_ENVS}
-    differing = {name: value for name, value in selectors.items() if value != "1"}
+    differing = {
+        name: {"expected": expected, "actual": selectors[name]}
+        for name, expected in _REQUIRED_SELECTOR_EXPECTED.items()
+        if selectors[name] != expected
+    }
     if differing:
         raise Width4ReceiptError(
             "EXO width-four receipt logging requires exact candidate selectors: "
@@ -336,8 +344,7 @@ def _validate_selectors(raw: object, *, label: str) -> None:
     if not isinstance(raw, dict):
         raise Width4ReceiptError(f"MLX-LM width-four {label} selectors are missing")
     selectors = cast(dict[str, object], cast(object, raw))
-    expected = {name: "1" for name in _PYTHON_SELECTOR_ENVS}
-    if selectors != expected:
+    if selectors != _PYTHON_SELECTOR_EXPECTED:
         raise Width4ReceiptError(
             f"MLX-LM width-four {label} selectors differ: {selectors}"
         )

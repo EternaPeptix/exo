@@ -1326,9 +1326,14 @@ def _dspark_setup_fingerprint(
     if receipt_session_id is not None:
         if receipt_model_id is None:
             raise ValueError("width-four receipt model ID is missing")
-        digest.update(b"exo-kimi-k3-width4-receipt-binding/v2\0")
+        if target_route_top_k != 8:
+            raise ValueError(
+                "width-four receipt requires attested target route top-k 8"
+            )
+        digest.update(b"exo-kimi-k3-width4-receipt-binding/v3\0")
         add_text(receipt_session_id, name="width-four receipt session")
         add_text(receipt_model_id, name="width-four receipt model ID")
+        add_integer(target_route_top_k, name="width-four target route top-k")
 
     raw = digest.digest()
     return tuple(

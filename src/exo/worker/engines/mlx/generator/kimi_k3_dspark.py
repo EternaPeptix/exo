@@ -33,6 +33,9 @@ from typing import Literal, Protocol, cast, final
 
 import mlx.core as mx
 
+from exo.worker.engines.mlx.generator.kimi_k3_width4_receipt import (
+    width4_receipt_log_enabled,
+)
 from exo.worker.runner.bootstrap import logger
 
 DSPARK_ENABLE_ENV = "EXO_MLX_KIMI_K3_DSPARK_SPECULATIVE"
@@ -3494,7 +3497,7 @@ def load_replicated_mlx_dspark(
     """
 
     target_route_top_k = None
-    if config.confidence_capture is not None:
+    if config.confidence_capture is not None or width4_receipt_log_enabled():
         target_route_top_k = attest_kimi_k3_target_route_top_k(
             target_model,
             expected=8,

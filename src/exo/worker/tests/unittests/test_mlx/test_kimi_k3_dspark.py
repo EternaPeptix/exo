@@ -2563,6 +2563,45 @@ def test_confidence_capture_rejects_native_top16_target_before_loading(
     assert calls == []
 
 
+def test_width4_receipt_attests_top8_target_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(dspark_module, "width4_receipt_log_enabled", lambda: True)
+    config = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path,
+        verify_width=4,
+        round_telemetry=False,
+    )
+
+    with pytest.raises(
+        DSparkConfigurationError,
+        match="target route top-k is 16, expected 8",
+    ):
+        load_replicated_mlx_dspark(
+            config,
+            _fake_sparse_target(16, 16),
+            features=_mock_mlx_features(calls, [[11, 12, 13]]),
+            evaluate=lambda *_values: None,
+        )
+    assert calls == []
+
+    target = _fake_sparse_target(8, 8)
+    loaded = load_replicated_mlx_dspark(
+        config,
+        target,
+        features=_mock_mlx_features(calls, [[11, 12, 13]]),
+        evaluate=lambda *_values: None,
+    )
+    assert loaded.target_model is target
+    assert loaded.target_route_top_k == 8
+    assert calls[:2] == [
+        ("load", tmp_path, target, True),
+        ("proposer", "draft", 4, True),
+    ]
+
+
 def test_target_route_top_k_attestation_rejects_mixed_sparse_layers() -> None:
     assert (
         attest_kimi_k3_target_route_top_k(
