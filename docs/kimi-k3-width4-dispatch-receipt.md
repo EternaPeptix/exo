@@ -65,6 +65,14 @@ Each rank then writes one grep-safe `K3_WIDTH4_DISPATCH_RECEIPT` JSON record.
 The one-shot path drains Loguru's enqueued sinks before yielding the terminal
 response, so a returned C1 request cannot race its own receipt record.
 
+The two receipt-only text agreements (request reset and terminal capture) also
+authenticate the complete formatted local exception with the packed agreement
+payload. If and only if both ranks report the same failure fingerprint and the
+same four-word error-text digest, the distributed error includes that local
+diagnostic. Any missing or differing agreement field remains redacted as a
+generic cross-rank mismatch. Ordinary detokenizer agreements retain their
+previous behavior because this diagnostic is an explicit call-site opt-in.
+
 ## Reducer contract
 
 An external TP2 reducer should require exactly two schema-v3 terminal records,

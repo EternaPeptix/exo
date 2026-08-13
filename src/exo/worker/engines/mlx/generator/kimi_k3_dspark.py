@@ -4275,6 +4275,8 @@ class KimiK3DSparkRequestRuntime:
         self,
         name: str,
         operation: Callable[[], str],
+        *,
+        preserve_unanimous_error: bool = False,
     ) -> str:
         """Agree successful local text production and its exact UTF-8 digest."""
 
@@ -4290,12 +4292,27 @@ class KimiK3DSparkRequestRuntime:
                 text, fingerprint = render_and_fingerprint()
             except Exception as error:
                 local_error = f"{name} failed: {type(error).__name__}: {error}"
+                if preserve_unanimous_error:
+                    fingerprint = _token_contract_fingerprint(
+                        tuple(local_error.encode("utf-8"))
+                    )
             agreement = self.collective.agree_packed(
                 f"text:{name}",
                 local_success=local_error is None,
                 error_fingerprint=_error_fingerprint(local_error),
                 payload=fingerprint,
             )
+            if (
+                preserve_unanimous_error
+                and agreement.success is False
+                and local_error is not None
+                and agreement.error_fingerprint == _error_fingerprint(local_error)
+                and agreement.payload == fingerprint
+            ):
+                raise DSparkDistributedStateError(
+                    f"Kimi K3 DSpark {name} failed on every rank: {local_error}; "
+                    "request caches cannot continue"
+                ) from None
             if (
                 agreement.success is not True
                 or agreement.error_fingerprint != 0
@@ -4304,7 +4321,8 @@ class KimiK3DSparkRequestRuntime:
             ):
                 detail = (
                     "outcomes disagreed across ranks"
-                    if agreement.success is None
+                    if (preserve_unanimous_error and local_error is not None)
+                    or agreement.success is None
                     or agreement.error_fingerprint is None
                     or agreement.payload is None
                     else "failed on every rank"

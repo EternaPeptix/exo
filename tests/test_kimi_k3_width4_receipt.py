@@ -548,12 +548,16 @@ def test_generate_terminal_receipt_order_is_promotion_safe() -> None:
     capture_rank_agreement = source.index(
         '"width-four terminal receipt capture contract"', capture
     )
+    capture_diagnostic = source.index(
+        "preserve_unanimous_error=True", capture_rank_agreement
+    )
     log = source.index("logger.info(format_width4_dispatch_receipt(receipt))", capture)
     flush = source.index("logger.complete()", log)
     yield_response = source.index("yield response", capture)
     assert callback < barrier < confidence < rank_agreement < attestation
     assert attestation < required < capture
-    assert capture < capture_rank_agreement < log < flush < yield_response
+    assert capture < capture_rank_agreement < capture_diagnostic < log
+    assert log < flush < yield_response
 
 
 def test_generate_resets_after_warmup_and_immediately_before_prefill() -> None:
@@ -565,8 +569,15 @@ def test_generate_resets_after_warmup_and_immediately_before_prefill() -> None:
     warmup_barrier = source.index("mx_barrier(group)", warmup_call)
     post_warmup_reset = source.index("post_warmup_reset =", warmup_barrier)
     begin = source.index("def begin_receipt_contract()")
+    reset_rank_agreement = source.index(
+        '"width-four request receipt reset contract"', begin
+    )
+    reset_diagnostic = source.index(
+        "preserve_unanimous_error=True", reset_rank_agreement
+    )
     prefill = source.index(
         "prefill_tps, prefill_tokens = dspark_runtime.seed_prompt", begin
     )
     assert warmup_call < warmup_barrier < post_warmup_reset
-    assert begin < prefill
+    assert begin < reset_rank_agreement < reset_diagnostic < prefill
+    assert source.count("preserve_unanimous_error=True") == 2

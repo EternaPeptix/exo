@@ -1935,6 +1935,7 @@ def mlx_generate(
             dspark_runtime.agree_text(
                 "width-four request receipt reset contract",
                 begin_receipt_contract,
+                preserve_unanimous_error=True,
             )
             if local_receipt_context is None:
                 raise RuntimeError(
@@ -2372,6 +2373,7 @@ def mlx_generate(
                 dspark_runtime.agree_text(
                     "width-four terminal receipt capture contract",
                     capture_receipt_contract,
+                    preserve_unanimous_error=True,
                 )
                 if local_receipt is None:
                     raise RuntimeError("width-four terminal receipt was not retained")

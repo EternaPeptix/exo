@@ -4270,6 +4270,106 @@ def test_packed_callback_unanimous_failure_preserves_original_exception(
     assert agreement.packed_calls[0][0] == "side-effect:distributed progress"
 
 
+def test_packed_text_unanimous_failure_preserves_authenticated_diagnostic(
+    tmp_path: Path,
+) -> None:
+    agreement = _FakeAgreement([])
+    runtime, _target_cache = _prompt_runtime(
+        tmp_path,
+        agreement,
+        packed_agreements=True,
+    )
+
+    def fail() -> str:
+        raise RuntimeError("exact local receipt failure")
+
+    with pytest.raises(
+        DSparkDistributedStateError,
+        match=(
+            "text capture failed on every rank: text capture failed: RuntimeError: "
+            "exact local receipt failure; "
+            "request caches cannot continue"
+        ),
+    ):
+        runtime.agree_text("text capture", fail, preserve_unanimous_error=True)
+
+    assert len(agreement.packed_calls) == 1
+    name, local_success, error_fingerprint, payload = agreement.packed_calls[0]
+    assert name == "text:text capture"
+    assert local_success is False
+    assert error_fingerprint != 0
+    assert payload != (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("tamper", ("agreement", "error", "payload"))
+def test_packed_text_asymmetric_failure_keeps_diagnostic_redacted(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    class _TamperingAgreement(_FakeAgreement):
+        def agree_packed(
+            self,
+            name: str,
+            *,
+            local_success: bool,
+            error_fingerprint: int,
+            payload: tuple[int, ...] = (),
+        ) -> PackedRankAgreement:
+            super().agree_packed(
+                name,
+                local_success=local_success,
+                error_fingerprint=error_fingerprint,
+                payload=payload,
+            )
+            if tamper == "agreement":
+                return PackedRankAgreement(None, None, None)
+            if tamper == "error":
+                return PackedRankAgreement(False, error_fingerprint ^ 1, payload)
+            assert tamper == "payload"
+            return PackedRankAgreement(
+                False,
+                error_fingerprint,
+                (payload[0] ^ 1, *payload[1:]),
+            )
+
+    agreement = _TamperingAgreement([])
+    runtime, _target_cache = _prompt_runtime(
+        tmp_path,
+        agreement,
+        packed_agreements=True,
+    )
+
+    def fail() -> str:
+        raise RuntimeError("rank-local secret")
+
+    with pytest.raises(DSparkDistributedStateError) as captured:
+        runtime.agree_text("text capture", fail, preserve_unanimous_error=True)
+
+    assert "outcomes disagreed across ranks" in str(captured.value)
+    assert "rank-local secret" not in str(captured.value)
+
+
+def test_packed_text_default_failure_keeps_diagnostic_redacted(
+    tmp_path: Path,
+) -> None:
+    agreement = _FakeAgreement([])
+    runtime, _target_cache = _prompt_runtime(
+        tmp_path,
+        agreement,
+        packed_agreements=True,
+    )
+
+    def fail() -> str:
+        raise RuntimeError("ordinary rank-local secret")
+
+    with pytest.raises(DSparkDistributedStateError) as captured:
+        runtime.agree_text("detokenizer output", fail)
+
+    assert "failed on every rank" in str(captured.value)
+    assert "ordinary rank-local secret" not in str(captured.value)
+    assert agreement.packed_calls[0][3] == (0, 0, 0, 0)
+
+
 def test_response_agreement_sequence_collapses_from_twenty_one_to_five_rows(
     tmp_path: Path,
 ) -> None:
