@@ -3,6 +3,7 @@ import functools
 import hashlib
 import math
 import os
+import platform
 import time
 import uuid
 from dataclasses import dataclass
@@ -80,6 +81,10 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     dspark_decode_tokens,
     select_loaded_mlx_dspark,
     validate_dspark_greedy_sampling,
+)
+from exo.worker.engines.mlx.generator.kimi_k3_width4_receipt import (
+    capture_width4_dispatch_receipt,
+    format_width4_dispatch_receipt,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -2174,6 +2179,14 @@ def mlx_generate(
                         f"{prefill_tps:.1f} tok/s, generated {generated_tokens} "
                         f"tokens @ {generation_tps:.1f} tok/s"
                     )
+                    receipt = capture_width4_dispatch_receipt(
+                        rank=group.rank() if group is not None else 0,
+                        mx_module=mx,
+                        process_id=os.getpid(),
+                        host=platform.node(),
+                    )
+                    if receipt is not None:
+                        logger.info(format_width4_dispatch_receipt(receipt))
 
                 return GenerationResponse(
                     text=text,
