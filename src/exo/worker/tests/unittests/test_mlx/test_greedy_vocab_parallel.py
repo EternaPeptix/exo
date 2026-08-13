@@ -974,7 +974,12 @@ def test_dspark_peer_prep_failure_prevents_first_generator_step(
         events.append("next generator")
         yield cast(object, SimpleNamespace(finish_reason=None))
 
-    def build(_task: TextGeneration):
+    def build(
+        _task: TextGeneration,
+        *,
+        width4_receipt_claim: object | None = None,
+    ):
+        assert width4_receipt_claim is None
         events.append("build generator")
         return lazy_generation()
 
@@ -1004,6 +1009,62 @@ def test_dspark_peer_prep_failure_prevents_first_generator_step(
         "error",
     ]
     assert "next generator" not in events
+    assert generator._active is None
+
+
+def test_width4_receipt_claim_precedes_task_digest_and_failed_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    sender = SimpleNamespace(
+        send=lambda _event: events.append("blocking error"),
+        send_nowait=lambda _event: events.append("error"),
+    )
+    generator = _dspark_sequential(sender=sender)
+    generator._queue.append(_fake_dspark_task())
+    claim = object()
+
+    def claim_request() -> object:
+        events.append("receipt claim")
+        return claim
+
+    def fail_digest(_task: TextGeneration) -> str:
+        events.append("task digest")
+        raise ValueError("malformed request binding")
+
+    def agreed_stage(
+        stage: str,
+        _group: object,
+        operation: Callable[[], object],
+        _contract: Callable[[object], str],
+    ) -> object:
+        events.append(stage)
+        return operation()
+
+    monkeypatch.setattr(
+        batch_generator,
+        "claim_width4_request_receipt_attempt",
+        claim_request,
+    )
+    monkeypatch.setattr(batch_generator, "_task_digest", fail_digest)
+    monkeypatch.setattr(batch_generator, "rank_agreed_local_stage", agreed_stage)
+    monkeypatch.setattr(
+        generator,
+        "_build_generator",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("request preparation followed a failed binding")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="malformed request binding"):
+        generator._start_next()
+
+    assert events == [
+        "Kimi K3 DSpark task binding",
+        "receipt claim",
+        "task digest",
+        "error",
+    ]
     assert generator._active is None
 
 

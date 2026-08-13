@@ -33,7 +33,9 @@ regular, non-symlink `lib/libmlx.dylib` sibling of the imported `mlx.core`, then
 binds its native getter and reset symbols through `ctypes`.
 
 Enabled workers are deliberately one-shot. The first service request consumes
-the worker before validation or reset begins, whether it later passes or fails.
+the worker in the rank-agreed task-binding operation, before task hashing,
+template/parser work, candidate validation, cache construction, or reset begins,
+whether it later passes or fails.
 A second request fails before another reset or capture. Warmup is excluded from
 that one-shot state.
 

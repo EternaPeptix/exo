@@ -328,15 +328,18 @@ def test_failed_first_attempt_still_consumes_worker(
 
 def test_service_admission_precedes_all_request_setup() -> None:
     source_path = (
-        Path(__file__).parents[1] / "src/exo/worker/engines/mlx/generator/generate.py"
+        Path(__file__).parents[1]
+        / "src/exo/worker/runner/llm_inference/batch_generator.py"
     )
     source = source_path.read_text()
-    admission = source.index("claim_width4_request_receipt_attempt()")
-    no_dspark = source.index("enabled width-four receipt requires Kimi K3 DSpark")
-    setup = source.index("dspark_setup = _rank_agreed_dspark_setup(")
-    prepare = source.index("_prepare_dspark_request_setup(", setup)
-    begin = source.index("begin_width4_request_receipt(", prepare)
-    assert admission < no_dspark < setup < prepare < begin
+    admission = source.index(
+        "width4_receipt_claim = claim_width4_request_receipt_attempt()"
+    )
+    task_digest = source.index("return _task_digest(task)", admission)
+    template = source.index("_check_for_debug_prompts(task.task_params)", task_digest)
+    parser = source.index("self._build_output_generator(task, queue)", task_digest)
+    assert admission < task_digest < template
+    assert admission < task_digest < parser
 
 
 def test_post_warmup_reset_does_not_consume_one_shot_request(
@@ -526,12 +529,7 @@ def test_generate_terminal_receipt_order_is_promotion_safe() -> None:
         Path(__file__).parents[1] / "src/exo/worker/engines/mlx/generator/generate.py"
     )
     source = source_path.read_text()
-    assert (
-        "\n            if is_done and dspark_runtime is not None:\n"
-        "                if width4_receipt_context is not None:\n"
-        "                    dspark_runtime.log_packed_agreement_attestation("
-        "required=True)\n"
-    ) in source
+    assert '"width-four packed agreement attestation"' in source
     callback = source.index('"generation progress callback"')
     barrier = source.index(
         "if is_done and dspark_runtime is not None and not is_pipeline:"
@@ -540,18 +538,22 @@ def test_generate_terminal_receipt_order_is_promotion_safe() -> None:
     attestation = source.index(
         "dspark_runtime.log_packed_agreement_attestation(", confidence
     )
-    required = source.index("required=True", attestation)
+    rank_agreement = source.index(
+        '"width-four packed agreement attestation"', confidence
+    )
+    required = source.index("required=True", rank_agreement)
     capture = source.index(
         "if is_done and width4_receipt_context is not None:", attestation
     )
-    rank_agreement = source.index(
+    capture_rank_agreement = source.index(
         '"width-four terminal receipt capture contract"', capture
     )
     log = source.index("logger.info(format_width4_dispatch_receipt(receipt))", capture)
     flush = source.index("logger.complete()", log)
     yield_response = source.index("yield response", capture)
-    assert callback < barrier < confidence < attestation < required < capture
-    assert capture < rank_agreement < log < flush < yield_response
+    assert callback < barrier < confidence < rank_agreement < attestation
+    assert attestation < required < capture
+    assert capture < capture_rank_agreement < log < flush < yield_response
 
 
 def test_generate_resets_after_warmup_and_immediately_before_prefill() -> None:

@@ -4801,3 +4801,30 @@ def test_optional_packed_attestation_retains_nonfatal_behavior() -> None:
         collective=SimpleNamespace(rank=0),
     )
     KimiK3DSparkRequestRuntime.log_packed_agreement_attestation(disabled)
+
+
+def test_asymmetric_required_attestation_failure_is_rank_agreed(
+    tmp_path: Path,
+) -> None:
+    agreement = _FakeAgreement([], reject_packed_call=1)
+    runtime, _target_cache = _prompt_runtime(
+        tmp_path,
+        agreement,
+        packed_agreements=True,
+    )
+
+    with pytest.raises(
+        DSparkDistributedStateError,
+        match="width-four packed agreement attestation outcomes disagreed",
+    ):
+        runtime.agree_local_side_effect(
+            "width-four packed agreement attestation",
+            lambda: runtime.log_packed_agreement_attestation(required=True),
+        )
+
+    assert len(agreement.packed_calls) == 1
+    name, local_success, error_fingerprint, payload = agreement.packed_calls[0]
+    assert name == "side-effect:width-four packed agreement attestation"
+    assert local_success is False
+    assert error_fingerprint != 0
+    assert payload == ()

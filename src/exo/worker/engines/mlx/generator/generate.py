@@ -87,7 +87,6 @@ from exo.worker.engines.mlx.generator.kimi_k3_width4_receipt import (
     Width4RequestReceiptContext,
     begin_width4_request_receipt,
     capture_width4_dispatch_receipt,
-    claim_width4_request_receipt_attempt,
     format_width4_dispatch_receipt,
     mark_width4_receipt_rank_agreed,
     reset_width4_dispatch_counters_after_warmup,
@@ -1708,15 +1707,20 @@ def mlx_generate(
     vision_processor: VisionProcessor | None = None,
     dspark: LoadedKimiK3DSpark | None = None,
     width4_receipt_scope: Literal["request", "warmup"] = "request",
+    width4_receipt_claim: Width4RequestReceiptClaim | None = None,
 ) -> Generator[GenerationResponse]:
     if width4_receipt_scope not in {"request", "warmup"}:
         raise ValueError(f"invalid width-four receipt scope: {width4_receipt_scope}")
-    width4_receipt_claim: Width4RequestReceiptClaim | None = None
-    if width4_receipt_scope == "request" and width4_receipt_log_enabled():
-        # Consume the one-shot worker before request/candidate validation,
-        # prompt encoding, cache construction, or distributed setup.
-        width4_receipt_claim = claim_width4_request_receipt_attempt()
-    if width4_receipt_claim is not None and dspark is None:
+    if width4_receipt_scope == "warmup" and width4_receipt_claim is not None:
+        raise ValueError("width-four warmup cannot carry a request-admission claim")
+    receipt_enabled = width4_receipt_scope == "request" and width4_receipt_log_enabled()
+    if receipt_enabled and width4_receipt_claim is None:
+        raise ValueError(
+            "enabled width-four receipt requires a service-admission claim"
+        )
+    if not receipt_enabled and width4_receipt_claim is not None:
+        raise ValueError("width-four request-admission claim reached disabled receipt")
+    if receipt_enabled and dspark is None:
         raise ValueError("enabled width-four receipt requires Kimi K3 DSpark")
     dspark_setup: _DSparkRequestSetup | None = None
     if dspark is not None:
@@ -2329,7 +2333,12 @@ def mlx_generate(
 
             if is_done and dspark_runtime is not None:
                 if width4_receipt_context is not None:
-                    dspark_runtime.log_packed_agreement_attestation(required=True)
+                    dspark_runtime.agree_local_side_effect(
+                        "width-four packed agreement attestation",
+                        lambda: dspark_runtime.log_packed_agreement_attestation(
+                            required=True
+                        ),
+                    )
                 else:
                     dspark_runtime.log_packed_agreement_attestation()
 

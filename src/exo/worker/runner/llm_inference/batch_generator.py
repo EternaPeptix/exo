@@ -43,6 +43,10 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     LoadedKimiK3DSpark,
     LoadedMlxDSparkDual,
 )
+from exo.worker.engines.mlx.generator.kimi_k3_width4_receipt import (
+    Width4RequestReceiptClaim,
+    claim_width4_request_receipt_attempt,
+)
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -304,12 +308,22 @@ class SequentialGenerator(Engine):
 
     def _start_next(self) -> None:
         task = self._queue.popleft()
+        width4_receipt_claim: Width4RequestReceiptClaim | None = None
         try:
             if self.dspark is not None:
+
+                def bind_request() -> str:
+                    nonlocal width4_receipt_claim
+                    # This is the first rank-agreed request-admission operation.
+                    # In receipt mode it consumes the worker before task digest,
+                    # template, parser, cache, or model-request preparation.
+                    width4_receipt_claim = claim_width4_request_receipt_attempt()
+                    return _task_digest(task)
+
                 task_digest = rank_agreed_local_stage(
                     "Kimi K3 DSpark task binding",
                     self.group,
-                    lambda: _task_digest(task),
+                    bind_request,
                     lambda digest: digest,
                 )
 
@@ -318,7 +332,10 @@ class SequentialGenerator(Engine):
                     GeneratorQueue[GenerationResponse],
                     Iterator[GenerationChunk | None],
                 ]:
-                    gen = self._build_generator(task)
+                    gen = self._build_generator(
+                        task,
+                        width4_receipt_claim=width4_receipt_claim,
+                    )
                     queue = GeneratorQueue[GenerationResponse]()
                     return gen, queue, self._build_output_generator(task, queue)
 
@@ -335,7 +352,11 @@ class SequentialGenerator(Engine):
                     ),
                 )
             else:
-                gen = self._build_generator(task)
+                width4_receipt_claim = claim_width4_request_receipt_attempt()
+                gen = self._build_generator(
+                    task,
+                    width4_receipt_claim=width4_receipt_claim,
+                )
                 queue = GeneratorQueue[GenerationResponse]()
                 output_generator = self._build_output_generator(task, queue)
         except Exception as e:
@@ -381,7 +402,12 @@ class SequentialGenerator(Engine):
                     "blocking; the rank-agreed request failure is preserved"
                 )
 
-    def _build_generator(self, task: TextGeneration) -> Generator[GenerationResponse]:
+    def _build_generator(
+        self,
+        task: TextGeneration,
+        *,
+        width4_receipt_claim: Width4RequestReceiptClaim | None = None,
+    ) -> Generator[GenerationResponse]:
         _check_for_debug_prompts(task.task_params)
         prompt = apply_chat_template(self.tokenizer, task.task_params)
 
@@ -435,6 +461,7 @@ class SequentialGenerator(Engine):
             group=self.group,
             vision_processor=self.vision_processor,
             dspark=self.dspark,
+            width4_receipt_claim=width4_receipt_claim,
         )
 
     def close(self) -> None:
