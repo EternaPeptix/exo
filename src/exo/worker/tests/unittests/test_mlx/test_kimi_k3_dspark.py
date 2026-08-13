@@ -4769,3 +4769,35 @@ def test_target_only_fallback_compact_greedy_matches_full_path(
     assert target_cache[0].offset == 6
     assert target_cache[1].speculative_width == 0
     assert target_cache[1].speculative_ready is False
+
+
+def test_required_packed_attestation_fails_closed() -> None:
+    method = KimiK3DSparkRequestRuntime.log_packed_agreement_attestation
+    disabled = SimpleNamespace(
+        loaded=SimpleNamespace(config=SimpleNamespace(packed_agreements=False)),
+        collective=SimpleNamespace(rank=0),
+    )
+    with pytest.raises(RuntimeError, match="required but disabled"):
+        method(disabled, required=True)
+
+    class _BrokenCollective:
+        rank = 0
+
+        @property
+        def packed_agreement_attestation(self) -> object:
+            raise ValueError("missing attestation")
+
+    broken = SimpleNamespace(
+        loaded=SimpleNamespace(config=SimpleNamespace(packed_agreements=True)),
+        collective=_BrokenCollective(),
+    )
+    with pytest.raises(RuntimeError, match="attestation logging failed"):
+        method(broken, required=True)
+
+
+def test_optional_packed_attestation_retains_nonfatal_behavior() -> None:
+    disabled = SimpleNamespace(
+        loaded=SimpleNamespace(config=SimpleNamespace(packed_agreements=False)),
+        collective=SimpleNamespace(rank=0),
+    )
+    KimiK3DSparkRequestRuntime.log_packed_agreement_attestation(disabled)

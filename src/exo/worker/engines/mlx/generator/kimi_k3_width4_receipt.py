@@ -17,6 +17,7 @@ from typing import Protocol, cast
 WIDTH4_RECEIPT_LOG_ENV = "EXO_MLX_KIMI_K3_WIDTH4_DISPATCH_RECEIPT_LOG"
 WIDTH4_RECEIPT_SESSION_ID_ENV = "EXO_MLX_KIMI_K3_WIDTH4_RECEIPT_SESSION_ID"
 EXPECTED_LIBMLX_SHA256_ENV = "EXO_MLX_KIMI_K3_WIDTH4_LIBMLX_SHA256"
+DSPARK_PACKED_AGREEMENTS_ENV = "EXO_MLX_KIMI_K3_DSPARK_PACKED_AGREEMENTS"
 
 MLX_LM_WIDTH4_RECEIPT_ENV = "MLX_LM_KIMI_K3_WIDTH4_DISPATCH_RECEIPT"
 MLX_LM_FUSED_EXPERT_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERTS"
@@ -39,6 +40,7 @@ _REQUIRED_SELECTOR_ENVS = (
     *_PYTHON_SELECTOR_ENVS,
     MLX_Q4_RECEIPT_ENV,
     MLX_Q4_SELECTOR_ENV,
+    DSPARK_PACKED_AGREEMENTS_ENV,
 )
 _RECEIPT_PATHS = ("switch_glu", "switch_glu_reduce")
 _RECEIPT_METRICS = ("attempted", "supported", "dispatched", "fallback", "error")
@@ -141,6 +143,13 @@ class Width4RequestReceiptContext:
         )
 
 
+@dataclass(frozen=True)
+class Width4RequestReceiptClaim:
+    """Opaque proof that the one-shot worker was consumed at request admission."""
+
+    token: object = field(default_factory=object, repr=False, compare=False)
+
+
 class Width4ReceiptError(RuntimeError):
     """The opt-in receipt could not prove its exact runtime path."""
 
@@ -148,6 +157,7 @@ class Width4ReceiptError(RuntimeError):
 _one_shot_lock = Lock()
 _request_attempted = False
 _capture_attempted = False
+_active_request_claim: Width4RequestReceiptClaim | None = None
 _active_context_signature: tuple[object, ...] | None = None
 
 
@@ -537,6 +547,29 @@ def _context_signature(context: Width4RequestReceiptContext) -> tuple[object, ..
     )
 
 
+def claim_width4_request_receipt_attempt() -> Width4RequestReceiptClaim | None:
+    """Consume the enabled worker at service-request admission.
+
+    This deliberately runs before request decoding, candidate validation, cache
+    construction, or distributed setup. Any later failure therefore leaves the
+    worker unusable until both ranks are restarted.
+    """
+
+    if not width4_receipt_log_enabled():
+        return None
+
+    global _request_attempted, _active_request_claim
+    with _one_shot_lock:
+        if _request_attempted:
+            raise Width4ReceiptError(
+                "width-four receipt worker is one-shot; a request was already attempted"
+            )
+        _request_attempted = True
+        claim = Width4RequestReceiptClaim()
+        _active_request_claim = claim
+        return claim
+
+
 def begin_width4_request_receipt(
     *,
     rank: int,
@@ -545,20 +578,21 @@ def begin_width4_request_receipt(
     model_id: str,
     request_fingerprint: tuple[int, ...],
     mx_module: _MlxModule,
+    claim: Width4RequestReceiptClaim | None = None,
 ) -> Width4RequestReceiptContext | None:
-    """Claim the worker once and reset counters immediately before C1 prefill."""
+    """Consume an admission claim and reset counters immediately before prefill."""
 
     if not width4_receipt_log_enabled():
         return None
 
-    global _request_attempted
+    global _active_request_claim
     with _one_shot_lock:
-        if _request_attempted:
+        if claim is None or claim is not _active_request_claim:
             raise Width4ReceiptError(
-                "width-four receipt worker is one-shot; a request was already attempted"
+                "width-four receipt request has no active one-shot admission claim"
             )
-        # Consume the worker before any failure-prone validation/reset operation.
-        _request_attempted = True
+        # Invalidate the opaque claim before any failure-prone validation/reset.
+        _active_request_claim = None
 
     session_id, selectors = validate_width4_request_contract(
         rank=rank,
@@ -661,7 +695,7 @@ def capture_width4_dispatch_receipt(
 
     paths = cast(dict[str, object], python_receipt["paths"])
     return {
-        "schema": "k3-width4-dispatch-receipt/v2",
+        "schema": "k3-width4-dispatch-receipt/v3",
         "scope": "single-request-reset-after-warmup",
         "session_id": context.session_id,
         "model_id": context.model_id,

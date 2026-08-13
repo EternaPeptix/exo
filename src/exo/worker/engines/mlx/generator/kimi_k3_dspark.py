@@ -4951,10 +4951,14 @@ class KimiK3DSparkRequestRuntime:
         if self._confidence_recorder is not None:
             self._confidence_recorder.finalize(complete=complete)
 
-    def log_packed_agreement_attestation(self) -> None:
+    def log_packed_agreement_attestation(self, *, required: bool = False) -> None:
         """Publish cumulative request-local row counts without a collective."""
 
         if not self.loaded.config.packed_agreements:
+            if required:
+                raise RuntimeError(
+                    "Kimi K3 packed agreement attestation is required but disabled"
+                )
             return
         try:
             attestation = cast(
@@ -4969,7 +4973,11 @@ class KimiK3DSparkRequestRuntime:
                 f"legacy_row_calls={attestation.legacy_row_calls}, "
                 f"physical_all_gathers={attestation.physical_all_gathers}"
             )
-        except Exception:
+        except Exception as error:
+            if required:
+                raise RuntimeError(
+                    "Kimi K3 packed agreement attestation logging failed"
+                ) from error
             _log_nonfatal_warning("Kimi K3 packed agreement attestation logging failed")
 
 

@@ -16,6 +16,7 @@ candidate selector exactly `1`:
 EXO_MLX_KIMI_K3_WIDTH4_DISPATCH_RECEIPT_LOG=1
 EXO_MLX_KIMI_K3_WIDTH4_RECEIPT_SESSION_ID=<1-128 ASCII [A-Za-z0-9._:-]>
 EXO_MLX_KIMI_K3_WIDTH4_LIBMLX_SHA256=<exact lowercase candidate SHA-256>
+EXO_MLX_KIMI_K3_DSPARK_PACKED_AGREEMENTS=1
 
 MLX_LM_KIMI_K3_WIDTH4_DISPATCH_RECEIPT=1
 MLX_LM_KIMI_K3_FUSED_EXPERTS=1
@@ -54,14 +55,17 @@ No terminal JSON is logged until all of these have completed:
 2. the optional generation callback;
 3. the terminal rank barrier;
 4. confidence-capture finalization, when configured;
-5. packed-agreement attestation; and
+5. strict packed-agreement attestation (disabled or unreadable is fatal in
+   receipt mode); and
 6. rank agreement that local receipt capture succeeded on both ranks.
 
 Each rank then writes one grep-safe `K3_WIDTH4_DISPATCH_RECEIPT` JSON record.
+The one-shot path drains Loguru's enqueued sinks before yielding the terminal
+response, so a returned C1 request cannot race its own receipt record.
 
 ## Reducer contract
 
-An external TP2 reducer should require exactly two schema-v2 terminal records,
+An external TP2 reducer should require exactly two schema-v3 terminal records,
 ranks `{0,1}`, with identical:
 
 - `session_id`, `model_id`, model fingerprint, request fingerprint, and request

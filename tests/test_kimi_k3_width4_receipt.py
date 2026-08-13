@@ -138,6 +138,7 @@ def _python_receipt(
 def _reset_process_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(subject, "_request_attempted", False)
     monkeypatch.setattr(subject, "_capture_attempted", False)
+    monkeypatch.setattr(subject, "_active_request_claim", None)
     monkeypatch.setattr(subject, "_active_context_signature", None)
     subject.width4_receipt_log_enabled.cache_clear()
     yield
@@ -192,6 +193,8 @@ def _install_runtime(
 def _begin(
     mx_module: _FakeMlxModule,
 ) -> subject.Width4RequestReceiptContext:
+    claim = subject.claim_width4_request_receipt_attempt()
+    assert claim is not None
     context = subject.begin_width4_request_receipt(
         rank=1,
         world_size=2,
@@ -199,6 +202,7 @@ def _begin(
         model_id="kernelpool/Kimi-K3-2bit-UVMAX",
         request_fingerprint=(1, 2, 3, 4),
         mx_module=mx_module,
+        claim=claim,
     )
     assert context is not None
     return context
@@ -245,6 +249,7 @@ def test_default_off_is_inert(monkeypatch: pytest.MonkeyPatch) -> None:
             model_id="",
             request_fingerprint=(),
             mx_module=_FakeMlxModule(None),
+            claim=None,
         )
         is None
     )
@@ -319,6 +324,19 @@ def test_failed_first_attempt_still_consumes_worker(
     monkeypatch.setenv(subject.MLX_Q4_SELECTOR_ENV, "1")
     with pytest.raises(subject.Width4ReceiptError, match="one-shot"):
         _begin(_FakeMlxModule(None))
+
+
+def test_service_admission_precedes_all_request_setup() -> None:
+    source_path = (
+        Path(__file__).parents[1] / "src/exo/worker/engines/mlx/generator/generate.py"
+    )
+    source = source_path.read_text()
+    admission = source.index("claim_width4_request_receipt_attempt()")
+    no_dspark = source.index("enabled width-four receipt requires Kimi K3 DSpark")
+    setup = source.index("dspark_setup = _rank_agreed_dspark_setup(")
+    prepare = source.index("_prepare_dspark_request_setup(", setup)
+    begin = source.index("begin_width4_request_receipt(", prepare)
+    assert admission < no_dspark < setup < prepare < begin
 
 
 def test_post_warmup_reset_does_not_consume_one_shot_request(
@@ -398,7 +416,7 @@ def test_capture_binds_request_and_exact_counter_deltas(
     receipt = _capture(context)
     assert receipt is not None
     subject.mark_width4_receipt_rank_agreed(receipt)
-    assert receipt["schema"] == "k3-width4-dispatch-receipt/v2"
+    assert receipt["schema"] == "k3-width4-dispatch-receipt/v3"
     assert receipt["session_id"] == "c1-20260813:trial_01"
     assert receipt["model_id"] == "kernelpool/Kimi-K3-2bit-UVMAX"
     assert receipt["request_fingerprint"] == [1, 2, 3, 4]
@@ -508,14 +526,21 @@ def test_generate_terminal_receipt_order_is_promotion_safe() -> None:
         Path(__file__).parents[1] / "src/exo/worker/engines/mlx/generator/generate.py"
     )
     source = source_path.read_text()
+    assert (
+        "\n            if is_done and dspark_runtime is not None:\n"
+        "                if width4_receipt_context is not None:\n"
+        "                    dspark_runtime.log_packed_agreement_attestation("
+        "required=True)\n"
+    ) in source
     callback = source.index('"generation progress callback"')
     barrier = source.index(
         "if is_done and dspark_runtime is not None and not is_pipeline:"
     )
     confidence = source.index('"confidence capture finalization"', barrier)
     attestation = source.index(
-        "dspark_runtime.log_packed_agreement_attestation()", confidence
+        "dspark_runtime.log_packed_agreement_attestation(", confidence
     )
+    required = source.index("required=True", attestation)
     capture = source.index(
         "if is_done and width4_receipt_context is not None:", attestation
     )
@@ -523,9 +548,10 @@ def test_generate_terminal_receipt_order_is_promotion_safe() -> None:
         '"width-four terminal receipt capture contract"', capture
     )
     log = source.index("logger.info(format_width4_dispatch_receipt(receipt))", capture)
+    flush = source.index("logger.complete()", log)
     yield_response = source.index("yield response", capture)
-    assert callback < barrier < confidence < attestation < capture
-    assert capture < rank_agreement < log < yield_response
+    assert callback < barrier < confidence < attestation < required < capture
+    assert capture < rank_agreement < log < flush < yield_response
 
 
 def test_generate_resets_after_warmup_and_immediately_before_prefill() -> None:

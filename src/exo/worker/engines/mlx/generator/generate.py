@@ -83,9 +83,11 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     validate_dspark_greedy_sampling,
 )
 from exo.worker.engines.mlx.generator.kimi_k3_width4_receipt import (
+    Width4RequestReceiptClaim,
     Width4RequestReceiptContext,
     begin_width4_request_receipt,
     capture_width4_dispatch_receipt,
+    claim_width4_request_receipt_attempt,
     format_width4_dispatch_receipt,
     mark_width4_receipt_rank_agreed,
     reset_width4_dispatch_counters_after_warmup,
@@ -1709,11 +1711,12 @@ def mlx_generate(
 ) -> Generator[GenerationResponse]:
     if width4_receipt_scope not in {"request", "warmup"}:
         raise ValueError(f"invalid width-four receipt scope: {width4_receipt_scope}")
-    if (
-        width4_receipt_scope == "request"
-        and dspark is None
-        and width4_receipt_log_enabled()
-    ):
+    width4_receipt_claim: Width4RequestReceiptClaim | None = None
+    if width4_receipt_scope == "request" and width4_receipt_log_enabled():
+        # Consume the one-shot worker before request/candidate validation,
+        # prompt encoding, cache construction, or distributed setup.
+        width4_receipt_claim = claim_width4_request_receipt_attempt()
+    if width4_receipt_claim is not None and dspark is None:
         raise ValueError("enabled width-four receipt requires Kimi K3 DSpark")
     dspark_setup: _DSparkRequestSetup | None = None
     if dspark is not None:
@@ -1912,6 +1915,7 @@ def mlx_generate(
                     model_id=str(task.model),
                     request_fingerprint=dspark_setup.fingerprint,
                     mx_module=mx,
+                    claim=width4_receipt_claim,
                 )
                 if context is None:
                     raise RuntimeError(
@@ -2324,7 +2328,10 @@ def mlx_generate(
                 )
 
             if is_done and dspark_runtime is not None:
-                dspark_runtime.log_packed_agreement_attestation()
+                if width4_receipt_context is not None:
+                    dspark_runtime.log_packed_agreement_attestation(required=True)
+                else:
+                    dspark_runtime.log_packed_agreement_attestation()
 
             if is_done and width4_receipt_context is not None:
                 if dspark_runtime is None:
@@ -2362,6 +2369,10 @@ def mlx_generate(
                 receipt = local_receipt
                 mark_width4_receipt_rank_agreed(receipt)
                 logger.info(format_width4_dispatch_receipt(receipt))
+                # Receipt workers are one-shot. Drain every enqueue=True sink
+                # before the terminal response can escape, so a successful C1
+                # cannot race collection of its own evidence record.
+                logger.complete()
 
             yield response
 
