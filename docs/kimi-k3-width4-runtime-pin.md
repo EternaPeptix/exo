@@ -2,6 +2,11 @@
 
 Date: 2026-08-16
 
+> **Historical donor scope:** The MLX-LM, Kimi K3, and loader hashes below are
+> intermediate packed-only donor identities retained for provenance. They are
+> not the final combined runtime identity. The authoritative current identity
+> is recorded in `kimi-k3-current-w3-composition-freeze.md`.
+
 This branch binds EXO's rank-local checkpoint loader to the sealed width-four
 MLX-LM integration. It is an authentication update, not a throughput result.
 

@@ -1,5 +1,10 @@
 # Kimi K3 width-four receipt and tail-overlap composition
 
+> **Historical donor scope:** The MLX-LM and loader hashes below are
+> intermediate packed-only donor identities retained for provenance. They are
+> not the final combined runtime identity. The authoritative current identity
+> is recorded in `kimi-k3-current-w3-composition-freeze.md`.
+
 This branch is an offline, strict-default-off composition candidate based on
 EXO control `d30cc7b73460ff34d32545b5bc5118555c0716d5`. It retains the
 authenticated width-four C1 source and promoted tail-overlap behavior already
