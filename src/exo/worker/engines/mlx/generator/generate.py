@@ -1,12 +1,18 @@
 import contextlib
+import ctypes
 import functools
 import hashlib
+import importlib
+import json
 import math
 import os
 import platform
+import stat
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
+from threading import Lock
 from typing import Callable, Generator, Literal, Protocol, TypedDict, cast, get_args
 
 import mlx.core as mx
@@ -24,6 +30,7 @@ from exo.api.types import (
     CompletionTokensDetails,
     FinishReason,
     GenerationStats,
+    K3W3CompositionReceipt,
     PromptTokensDetails,
     TopLogprobItem,
     Usage,
@@ -168,12 +175,18 @@ class _DSparkRequestSetup:
 @dataclass
 class _PromptLookupTelemetry:
     rounds: int = 0
+    full_width_rounds: int = 0
+    target_width1_rounds: int = 0
+    prefill_width1_chunks: int = 0
+    prefill_width3_chunks: int = 0
+    prefill_noncontract_chunks: int = 0
     drafted_tokens: int = 0
     accepted_tokens: int = 0
     committed_tokens: int = 0
     visible_accepted_tokens: int = 0
     fallback_rounds: int = 0
     error_rounds: int = 0
+    composition_receipt: "_PackedFrontReceiptRequest | None" = None
 
     def observe(self, stats: "_SpeculativeRoundStatsLike") -> None:
         self.rounds += 1
@@ -181,7 +194,12 @@ class _PromptLookupTelemetry:
         self.accepted_tokens += int(stats.accepted_tokens)
         self.committed_tokens += int(stats.committed_tokens)
 
-    def observe_dspark_round(self, stats: DSparkRoundTelemetry) -> None:
+    def observe_dspark_round(
+        self,
+        stats: DSparkRoundTelemetry,
+        *,
+        target_cache_tokens: int | None = None,
+    ) -> None:
         """Account committed speculative work at the target transaction boundary.
 
         A textual stop can end response iteration partway through an already
@@ -191,16 +209,40 @@ class _PromptLookupTelemetry:
         """
 
         self.rounds += 1
+        self.full_width_rounds += int(stats.proposed == 2)
+        self.target_width1_rounds += int(stats.proposed == 0)
         self.drafted_tokens += stats.proposed
         self.accepted_tokens += stats.accepted
         self.committed_tokens += stats.emitted
         self.fallback_rounds += int(stats.fallback)
         self.error_rounds += int(stats.error is not None)
+        if self.composition_receipt is not None:
+            self.composition_receipt.observe_round(
+                stats,
+                target_cache_tokens=target_cache_tokens,
+            )
 
     def observe_visible_token(self, *, from_draft: bool) -> None:
         """Track accepted predictions that remain in the public completion."""
 
         self.visible_accepted_tokens += int(from_draft)
+
+
+def _exact_prefill_chunk_geometry(
+    token_count: int,
+    step_size: int,
+) -> tuple[int, int, int]:
+    """Count exact width-one, width-three, and other DSpark prefill chunks."""
+
+    if type(token_count) is not int or token_count < 0:
+        raise ValueError("packed-front prefill token count is invalid")
+    if type(step_size) is not int or step_size < 4:
+        raise ValueError("packed-front prefill step size is invalid")
+    full_chunks, tail = divmod(token_count, step_size)
+    width1_chunks = int(tail == 1)
+    width3_chunks = int(tail == 3)
+    noncontract_chunks = full_chunks + int(tail not in {0, 1, 3})
+    return width1_chunks, width3_chunks, noncontract_chunks
 
 
 class _SpeculativeRoundStatsLike(Protocol):
@@ -251,6 +293,2172 @@ def _strict_env_flag(name: str, value: str) -> bool:
     if value not in {"0", "1"}:
         raise ValueError(f"{name} must be 0 or 1")
     return value == "1"
+
+
+_PACKED_FRONT_DIAGNOSTIC_ENV = "EXO_MLX_KIMI_K3_W3_COMPOSITION_RECEIPT"
+_PACKED_FRONT_EXPECTED_LAYERS_ENV = (
+    "EXO_MLX_KIMI_K3_W3_COMPOSITION_EXPECTED_SPARSE_LAYERS"
+)
+_KDA_EXPECTED_LAYERS_ENV = "EXO_MLX_KIMI_K3_W3_COMPOSITION_EXPECTED_KDA_LAYERS"
+_DEFERRED_EXPECTED_ROOTS_ENV = "EXO_MLX_KIMI_K3_W3_COMPOSITION_EXPECTED_DEFERRED_ROOTS"
+_EXPECTED_LIBMLX_SHA256_ENV = "EXO_MLX_KIMI_K3_W3_COMPOSITION_LIBMLX_SHA256"
+_SEALED_LIBMLX_SHA256 = (
+    "91f742bfa20f3559c2fb85e6b3b5aad7a5b6264e1158d2cfc1a089a35d1b18cd"
+)
+_LAUNCH_CONTRACT_SHA256_ENV = "EXO_MLX_KIMI_K3_W3_COMPOSITION_LAUNCH_CONTRACT_SHA256"
+_MLX_PACKED_FRONT_RECEIPT_ENV = "MLX_LM_KIMI_K3_W3_COMPOSITION_RECEIPT"
+_MLX_AUTHORITATIVE_PACKED_FRONT_ENV = "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT"
+_MLX_AUTHORITATIVE_PACKED_FRONT_WIDTH3_ENV = (
+    "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3"
+)
+_MLX_DUPLICATING_PACKED_FRONT_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT"
+_MLX_PACKED_FRONT_WIDTH8_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_WIDTH8"
+_MLX_MULTIBANK_PACKED_FRONT_ENV = "MLX_LM_KIMI_K3_MULTIBANK_MOE_FRONT"
+_MLX_COMPILED_DECODE_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE"
+_MLX_KDA_PREWORK_ENV = "MLX_LM_KIMI_K3_W3_PREWORK_HISTORY"
+_MLX_PROJECTED_KV_CACHE_MAX_TOKENS_ENV = "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE_MAX_TOKENS"
+_EXO_DEFERRED_WIDTH3_ENV = "EXO_MLX_KIMI_K3_DEFERRED_ASYNC_WIDTH3"
+_MLX_DEFERRED_WIDTH3_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_WIDTH3"
+_EXO_TAIL_OVERLAP_ENV = "EXO_MLX_KIMI_K3_DSPARK_TAIL_OVERLAP"
+_MLX_NATIVE_AFFINE8_Q3_TRIPLET_ENV = "MLX_METAL_K3_AFFINE8_Q3_TRIPLET"
+_MLX_NATIVE_AFFINE8_Q3_RECEIPT_ENV = "MLX_METAL_K3_AFFINE8_Q3_DISPATCH_RECEIPT"
+_WIDTH4_RECEIPT_ENV = "EXO_MLX_KIMI_K3_WIDTH4_DISPATCH_RECEIPT_LOG"
+_PACKED_FRONT_RECEIPT_SCHEMA = "kimi-k3-w3-composition-receipt/v1"
+_PACKED_FRONT_EXPECTED_LAYERS = 92
+_KDA_EXPECTED_LAYERS = 69
+_DEFERRED_EXPECTED_ROOTS = 12
+_PROJECTED_KV_CACHE_MAX_TOKENS = 32768
+_PACKED_FRONT_COUNTER_LIMIT = 1_000_000_000
+_PACKED_FRONT_SEQUENCE_LIMIT = 0x7FFFFFFFFFFFFFFF
+_PACKED_FRONT_PHASE_ENGINE_STARTUP = 1
+_PACKED_FRONT_PHASE_API = 2
+_PACKED_FRONT_PHASE_CODES = {
+    "engine_startup": _PACKED_FRONT_PHASE_ENGINE_STARTUP,
+    "api": _PACKED_FRONT_PHASE_API,
+}
+_COMPOSITION_RECEIPT_LOCK = Lock()
+_COMPOSITION_RECEIPT_ATTEMPTED_PHASES: set[int] = set()
+_COMPOSITION_RECEIPT_PUBLISHED_PHASES: set[int] = set()
+_COMPOSITION_RECEIPT_COMPLETED_PHASES: set[int] = set()
+_COMPOSITION_RECEIPT_PHASE_IDENTITIES: dict[int, tuple[int, ...]] = {}
+_COMPOSITION_RECEIPT_ACTIVE_PHASE: int | None = None
+_PACKED_FRONT_MLX_KEYS = frozenset(
+    {
+        "schema",
+        "request_sequence",
+        "request_token",
+        "expected_sparse_layers",
+        "expected_kda_layers",
+        "finalized",
+        "aborted",
+        "poisoned",
+        "packed_authoritative_enabled",
+        "packed_width3_enabled",
+        "kda_prework_enabled",
+        "replayssm_speculative_enabled",
+        "projected_kv_cache_enabled",
+        "projected_kv_cache_max_tokens",
+        "async_decode_boundaries",
+        "async_decode_state",
+        "async_decode_width3_enabled",
+        "native_q3_triplet_enabled",
+        "native_q3_dispatch_receipt_enabled",
+        "helper_calls",
+        "eligible_width1_calls",
+        "eligible_width3_calls",
+        "packed_width1_hits",
+        "packed_width3_hits",
+        "packed_hits",
+        "packed_width1_output_tensors",
+        "packed_width3_output_tensors",
+        "packed_output_tensors",
+        "packed_width1_installs",
+        "packed_width3_installs",
+        "lazy_installs",
+        "gate_disabled_calls",
+        "noncontract_calls",
+        "width1_unsupported_calls",
+        "width3_unsupported_calls",
+        "unsupported_calls",
+        "width1_dispatch_fallback_calls",
+        "width3_dispatch_fallback_calls",
+        "packed_dispatch_fallback_calls",
+        "invalidations",
+        "stale_resets",
+        "pack_count_before",
+        "pack_count_after",
+        "kda_helper_calls",
+        "kda_gate_disabled_calls",
+        "kda_noncontract_calls",
+        "kda_admitted_calls",
+        "kda_success_calls",
+        "kda_fallback_calls",
+        "kda_pending_calls",
+    }
+)
+_PACKED_FRONT_COUNTER_FIELDS = (
+    "helper_calls",
+    "eligible_width1_calls",
+    "eligible_width3_calls",
+    "packed_width1_hits",
+    "packed_width3_hits",
+    "packed_hits",
+    "packed_width1_output_tensors",
+    "packed_width3_output_tensors",
+    "packed_output_tensors",
+    "packed_width1_installs",
+    "packed_width3_installs",
+    "lazy_installs",
+    "gate_disabled_calls",
+    "noncontract_calls",
+    "width1_unsupported_calls",
+    "width3_unsupported_calls",
+    "unsupported_calls",
+    "width1_dispatch_fallback_calls",
+    "width3_dispatch_fallback_calls",
+    "packed_dispatch_fallback_calls",
+    "invalidations",
+    "stale_resets",
+    "pack_count_before",
+    "pack_count_after",
+    "kda_helper_calls",
+    "kda_gate_disabled_calls",
+    "kda_noncontract_calls",
+    "kda_admitted_calls",
+    "kda_success_calls",
+    "kda_fallback_calls",
+    "kda_pending_calls",
+)
+
+
+@dataclass(frozen=True)
+class _PackedFrontReceiptAPI:
+    begin: Callable[..., object]
+    finish: Callable[..., object]
+    abort: Callable[[int, int], None]
+    source_digest: tuple[int, int, int, int]
+
+
+class _NativeQ3Getter(Protocol):
+    argtypes: list[object]
+    restype: object
+
+    def __call__(self) -> int: ...
+
+
+class _NativeQ3Resetter(Protocol):
+    argtypes: list[object]
+    restype: object
+
+    def __call__(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class _NativeQ3ReceiptAPI:
+    library: object = field(repr=False, compare=False)
+    total: _NativeQ3Getter = field(repr=False, compare=False)
+    n4480: _NativeQ3Getter = field(repr=False, compare=False)
+    n6144: _NativeQ3Getter = field(repr=False, compare=False)
+    n10624: _NativeQ3Getter = field(repr=False, compare=False)
+    reset: _NativeQ3Resetter = field(repr=False, compare=False)
+    lib_path: Path = field(repr=False, compare=False)
+    lib_fd: int = field(repr=False, compare=False)
+    lib_identity: tuple[int, ...]
+    lib_digest: tuple[int, int, int, int]
+
+
+def _digest_words(digest: bytes) -> tuple[int, int, int, int]:
+    if len(digest) != 32:
+        raise ValueError("W3 composition digest must be SHA-256")
+    return cast(
+        tuple[int, int, int, int],
+        tuple(
+            int.from_bytes(digest[offset : offset + 8], "big")
+            & _PACKED_FRONT_SEQUENCE_LIMIT
+            for offset in range(0, 32, 8)
+        ),
+    )
+
+
+def _regular_file_sha256(path: Path, *, identity: str) -> bytes:
+    """Hash one authenticated regular file without following a replacement link."""
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if type(nofollow) is not int:
+        raise RuntimeError(f"{identity} requires O_NOFOLLOW")
+    flags = os.O_RDONLY | nofollow
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if type(cloexec) is int:
+        flags |= cloexec
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"{identity} must be a regular file")
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise RuntimeError(f"{identity} changed while being hashed")
+        named = os.lstat(path)
+        if (named.st_dev, named.st_ino) != (after.st_dev, after.st_ino):
+            raise RuntimeError(f"{identity} path changed while being hashed")
+        return digest.digest()
+    finally:
+        os.close(fd)
+
+
+def _native_stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    if not stat.S_ISREG(value.st_mode):
+        raise RuntimeError("W3 composition libmlx is not a regular file")
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_uid,
+        value.st_gid,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _hash_native_fd(fd: int) -> tuple[tuple[int, ...], bytes]:
+    """Hash one pinned dylib descriptor and reject concurrent mutation."""
+
+    before = _native_stat_identity(os.fstat(fd))
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
+    after = _native_stat_identity(os.fstat(fd))
+    if after != before:
+        raise RuntimeError("W3 composition libmlx changed while being hashed")
+    return after, digest.digest()
+
+
+def _open_native_snapshot(path: Path) -> tuple[int, tuple[int, ...], bytes]:
+    """Open the named dylib without following its final path component."""
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if type(nofollow) is not int:
+        raise RuntimeError("W3 composition libmlx requires O_NOFOLLOW")
+    flags = os.O_RDONLY | nofollow
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if type(cloexec) is int:
+        flags |= cloexec
+    fd = os.open(path, flags)
+    try:
+        identity, digest = _hash_native_fd(fd)
+        named_identity = _native_stat_identity(os.lstat(path))
+        if named_identity != identity:
+            raise RuntimeError("W3 composition libmlx path changed while opening")
+        return fd, identity, digest
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _assert_native_library_identity(api: _NativeQ3ReceiptAPI) -> None:
+    """Recheck both the pinned inode and its canonical name at receipt finish."""
+
+    pinned_identity, pinned_digest = _hash_native_fd(api.lib_fd)
+    if (
+        pinned_identity != api.lib_identity
+        or _digest_words(pinned_digest) != api.lib_digest
+    ):
+        raise ValueError("loaded W3 composition libmlx identity changed")
+    named_fd, named_identity, named_digest = _open_native_snapshot(api.lib_path)
+    try:
+        if (
+            named_identity != api.lib_identity
+            or _digest_words(named_digest) != api.lib_digest
+        ):
+            raise ValueError(
+                "W3 composition libmlx path no longer names the loaded file"
+            )
+    finally:
+        os.close(named_fd)
+
+
+def _runtime_source_digest() -> tuple[int, int, int, int]:
+    digest = hashlib.sha256(b"exo-kimi-k3-w3-composition-source/v1\0")
+    for module_name in (
+        "mlx_lm.models.kimi_k3",
+        "mlx_lm.models.kimi_k3_packed_moe_front",
+        "mlx_lm.models.kimi_k3_w3_prework",
+    ):
+        module = importlib.import_module(module_name)
+        raw_path = getattr(module, "__file__", None)
+        if type(raw_path) is not str:
+            raise RuntimeError(f"{module_name} has no source identity")
+        path = Path(raw_path)
+        digest.update(module_name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(
+            _regular_file_sha256(path, identity=f"{module_name} source identity")
+        )
+    return _digest_words(digest.digest())
+
+
+def _exo_source_digest() -> tuple[int, int, int, int]:
+    """Bind the EXO validator, causal observer, schema, and loader bridge."""
+
+    generate_path = Path(__file__)
+    repository = generate_path.resolve(strict=True).parents[6]
+    api_module = importlib.import_module("exo.api.types.api")
+    api_init_module = importlib.import_module("exo.api.types")
+    rank_local_module = importlib.import_module(
+        "exo.worker.engines.mlx.rank_local_checkpoint"
+    )
+
+    def module_path(module: object, name: str) -> Path:
+        raw_path = getattr(module, "__file__", None)
+        if type(raw_path) is not str:
+            raise RuntimeError(f"{name} has no filesystem identity")
+        return Path(raw_path)
+
+    configured_loader = os.environ.get("EXO_MLX_RANK_LOCAL_LOADER")
+    loader_path = (
+        Path(configured_loader)
+        if configured_loader is not None
+        else repository / "scripts" / "kimi_k3_tp2" / "rank_local_loader.py"
+    )
+
+    module_paths = {
+        "exo.generate": generate_path,
+        "exo.kimi_k3_dspark": generate_path.with_name("kimi_k3_dspark.py"),
+        "exo.builder": generate_path.parent.parent / "builder.py",
+        "exo.api.types.api": module_path(api_module, "exo.api.types.api"),
+        "exo.api.types.init": module_path(api_init_module, "exo.api.types"),
+        "exo.rank_local_checkpoint": module_path(
+            rank_local_module,
+            "exo.worker.engines.mlx.rank_local_checkpoint",
+        ),
+        "scripts.rank_local_loader": loader_path,
+    }
+    digest = hashlib.sha256(b"exo-kimi-k3-w3-exo-source/v1\0")
+    for name, path in module_paths.items():
+        digest.update(name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(_regular_file_sha256(path, identity=f"{name} source identity"))
+    return _digest_words(digest.digest())
+
+
+def _load_native_q3_receipt_api() -> _NativeQ3ReceiptAPI:
+    core_file = getattr(mx, "__file__", None)
+    if type(core_file) is not str:
+        raise RuntimeError("mlx.core has no filesystem identity")
+    core_path = Path(core_file).resolve(strict=True)
+    libmlx_path = core_path.parent / "lib" / "libmlx.dylib"
+    expected_sha256 = os.environ.get(_EXPECTED_LIBMLX_SHA256_ENV)
+    if expected_sha256 != _SEALED_LIBMLX_SHA256:
+        raise RuntimeError(
+            f"{_EXPECTED_LIBMLX_SHA256_ENV} must equal the sealed diagnostic "
+            "libmlx SHA-256"
+        )
+    lib_fd, lib_identity, file_digest = _open_native_snapshot(libmlx_path)
+    try:
+        canonical_libmlx_path = libmlx_path.resolve(strict=True)
+        if canonical_libmlx_path != libmlx_path:
+            raise RuntimeError("W3 composition libmlx path is not canonical")
+        actual_sha256 = file_digest.hex()
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError("authenticated W3 composition libmlx SHA-256 differs")
+        rtld_noload = getattr(os, "RTLD_NOLOAD", None)
+        rtld_now = getattr(os, "RTLD_NOW", None)
+        rtld_local = getattr(os, "RTLD_LOCAL", None)
+        if any(type(value) is not int for value in (rtld_noload, rtld_now, rtld_local)):
+            raise RuntimeError("W3 composition native receipt requires RTLD_NOLOAD")
+        # mlx.core has already loaded this image. RTLD_NOLOAD ensures a path
+        # replacement can never instantiate a different counter-bearing dylib.
+        library = ctypes.CDLL(
+            str(canonical_libmlx_path),
+            mode=cast(int, rtld_noload) | cast(int, rtld_now) | cast(int, rtld_local),
+        )
+        pinned_after, digest_after = _hash_native_fd(lib_fd)
+        named_fd, named_after, named_digest_after = _open_native_snapshot(
+            canonical_libmlx_path
+        )
+        try:
+            if (
+                pinned_after != lib_identity
+                or named_after != lib_identity
+                or digest_after != file_digest
+                or named_digest_after != file_digest
+            ):
+                raise RuntimeError(
+                    "W3 composition libmlx changed across native symbol binding"
+                )
+        finally:
+            os.close(named_fd)
+    except BaseException:
+        os.close(lib_fd)
+        raise
+    try:
+        symbols = {
+            "total": "mlx_k3_affine8_q3_triplet_dispatch_count",
+            "n4480": "mlx_k3_affine8_q3_triplet_dispatch_count_n4480",
+            "n6144": "mlx_k3_affine8_q3_triplet_dispatch_count_n6144",
+            "n10624": "mlx_k3_affine8_q3_triplet_dispatch_count_n10624",
+            "reset": "mlx_k3_affine8_q3_triplet_reset_dispatch_counts",
+        }
+        total = cast(_NativeQ3Getter, getattr(library, symbols["total"]))
+        n4480 = cast(_NativeQ3Getter, getattr(library, symbols["n4480"]))
+        n6144 = cast(_NativeQ3Getter, getattr(library, symbols["n6144"]))
+        n10624 = cast(_NativeQ3Getter, getattr(library, symbols["n10624"]))
+        reset = cast(_NativeQ3Resetter, getattr(library, symbols["reset"]))
+        for getter in (total, n4480, n6144, n10624):
+            getter.argtypes = []
+            getter.restype = ctypes.c_uint64
+        reset.argtypes = []
+        reset.restype = None
+    except BaseException as error:
+        os.close(lib_fd)
+        if isinstance(error, AttributeError):
+            raise RuntimeError(
+                "authenticated libmlx lacks dedicated affine8 Q3 receipt symbols"
+            ) from error
+        raise
+    return _NativeQ3ReceiptAPI(
+        library=library,
+        total=total,
+        n4480=n4480,
+        n6144=n6144,
+        n10624=n10624,
+        reset=reset,
+        lib_path=canonical_libmlx_path,
+        lib_fd=lib_fd,
+        lib_identity=lib_identity,
+        lib_digest=_digest_words(file_digest),
+    )
+
+
+def _load_packed_front_receipt_api() -> _PackedFrontReceiptAPI:
+    module = importlib.import_module("mlx_lm.models.kimi_k3_packed_moe_front")
+    if (
+        getattr(module, "K3_W3_COMPOSITION_RECEIPT_SCHEMA", None)
+        != _PACKED_FRONT_RECEIPT_SCHEMA
+    ):
+        raise RuntimeError("MLX-LM W3 composition receipt schema is unavailable")
+    begin = getattr(module, "begin_k3_w3_composition_receipt", None)
+    finish = getattr(module, "finish_k3_w3_composition_receipt", None)
+    abort = getattr(module, "abort_k3_w3_composition_receipt", None)
+    if not callable(begin) or not callable(finish) or not callable(abort):
+        raise RuntimeError("MLX-LM W3 composition receipt APIs are unavailable")
+    return _PackedFrontReceiptAPI(
+        begin=begin,
+        finish=finish,
+        abort=cast(Callable[[int, int], None], abort),
+        source_digest=_runtime_source_digest(),
+    )
+
+
+def _require_exact_selector(name: str, expected: str) -> None:
+    if os.environ.get(name) != expected:
+        raise ValueError(f"{name} must be exactly {expected} in diagnostic mode")
+
+
+def _reject_orphan_composition_receipt_environment() -> None:
+    for name in (
+        _PACKED_FRONT_EXPECTED_LAYERS_ENV,
+        _KDA_EXPECTED_LAYERS_ENV,
+        _DEFERRED_EXPECTED_ROOTS_ENV,
+        _EXPECTED_LIBMLX_SHA256_ENV,
+        _LAUNCH_CONTRACT_SHA256_ENV,
+    ):
+        if name in os.environ:
+            raise ValueError(f"{name} requires {_PACKED_FRONT_DIAGNOSTIC_ENV}=1")
+    for name in (
+        _MLX_PACKED_FRONT_RECEIPT_ENV,
+        _MLX_NATIVE_AFFINE8_Q3_RECEIPT_ENV,
+    ):
+        if os.environ.get(name, "0") != "0":
+            raise ValueError(f"{name} requires {_PACKED_FRONT_DIAGNOSTIC_ENV}=1")
+
+
+@dataclass(frozen=True)
+class _CompositionSelectors:
+    packed: bool
+    kda: bool
+    deferred: bool
+    arm_code: int
+    canonical: bool
+    digest: tuple[int, int, int, int]
+    launch_digest: tuple[int, int, int, int]
+
+
+def _launch_contract_digest() -> tuple[int, int, int, int]:
+    """Authenticate the complete experiment environment without publishing it."""
+
+    common_names = {
+        "EXO_ADVERTISED_MODEL_IDS",
+        "EXO_NO_BATCH",
+        "EXO_OFFLINE",
+        "MLX_METAL_FAST_SYNCH",
+        "EXO_MLX_JACCL_FORCE_MESH",
+        "EXO_MLX_K3_REQUANT_ATTENTION_QKVG_MXFP4",
+        "EXO_MLX_K3_REQUANT_ROUTED_LATENT_MXFP4",
+        "EXO_MLX_K3_VOCAB_PARALLEL_GREEDY",
+        "EXO_MLX_K3_VOCAB_PARALLEL_HEAD",
+        "EXO_MLX_KIMI_K3_DEFERRED_ASYNC_WIDTH3",
+        "EXO_MLX_KIMI_K3_DSPARK_AUX_ONLY_PREFILL",
+        "EXO_MLX_KIMI_K3_DSPARK_DUAL_PROPOSER",
+        "EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY",
+        "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT",
+        "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_W3_GATE",
+        "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_W3_GATE_POLICY",
+        "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_W3_GATE_POLICY_SHA256",
+        "EXO_MLX_KIMI_K3_DSPARK_PACKED_AGREEMENTS",
+        "EXO_MLX_KIMI_K3_DSPARK_PREFIX_CACHE",
+        "EXO_MLX_KIMI_K3_DSPARK_RANK_ZERO_PROPOSAL_RECOVERY",
+        "EXO_MLX_KIMI_K3_DSPARK_ROUND_TELEMETRY",
+        "EXO_MLX_KIMI_K3_DSPARK_SPECULATIVE",
+        "EXO_MLX_KIMI_K3_DSPARK_TAIL_OVERLAP",
+        "EXO_MLX_KIMI_K3_DSPARK_VERIFY_WIDTH",
+        "EXO_MLX_KIMI_K3_W3_COMPOSITION_EXPECTED_DEFERRED_ROOTS",
+        "EXO_MLX_KIMI_K3_W3_COMPOSITION_EXPECTED_KDA_LAYERS",
+        "EXO_MLX_KIMI_K3_W3_COMPOSITION_EXPECTED_SPARSE_LAYERS",
+        "EXO_MLX_KIMI_K3_W3_COMPOSITION_LIBMLX_SHA256",
+        "EXO_MLX_KIMI_K3_W3_COMPOSITION_RECEIPT",
+        "EXO_MLX_KIMI_K3_WIDTH4_DISPATCH_RECEIPT_LOG",
+        "EXO_MLX_KIMI_K3_WIDTH4_LIBMLX_SHA256",
+        "EXO_MLX_KIMI_K3_WIDTH4_RECEIPT_SESSION_ID",
+        "EXO_MLX_MAX_ATTENTION_CELLS_PER_CHUNK",
+        "EXO_MLX_PIPELINE_LONG_CONTEXT_MIN_TOKENS",
+        "EXO_MLX_PIPELINE_LONG_CONTEXT_STEP_SIZE",
+        "EXO_MLX_PIPELINE_MAX_ATTENTION_CELLS_PER_CHUNK",
+        "EXO_MLX_PREFILL_MEMORY_LOG_INTERVAL",
+        "EXO_MLX_PREFILL_STEP_SIZE",
+        "EXO_MLX_PROMPT_LOOKUP_MAX_NGRAM_SIZE",
+        "EXO_MLX_PROMPT_LOOKUP_NUM_TOKENS",
+        "EXO_MLX_PROMPT_LOOKUP_ROUND_TELEMETRY",
+        "EXO_MLX_RANK_LOCAL_VERIFY_HASHES",
+        "EXO_MLX_WARMUP_OUTPUT_TOKENS",
+        "MLX_JACCL_TP2_HYBRID",
+        "MLX_LM_CACHE_SHA256",
+        "MLX_LM_COMMIT",
+        "MLX_LM_DSPARK_0731_COMMIT",
+        "MLX_LM_DSPARK_COMMIT",
+        "MLX_LM_FACTORIZED_WIRE_COMMIT",
+        "MLX_LM_GATED_DELTA_SHA256",
+        "MLX_LM_GENERATE_SHA256",
+        "MLX_LM_KIMI_K3_DERIVED_BIAS_SHA256",
+        "MLX_LM_KIMI_K3_DSPARK_0731_SHA256",
+        "MLX_LM_KIMI_K3_DSPARK_SHA256",
+        "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE_SHA256",
+        "MLX_LM_KIMI_K3_FUSED_EXPERT_SHA256",
+        "MLX_LM_KIMI_K3_FUSED_ROUTER_SHA256",
+        "MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256",
+        "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256",
+        "MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE_SHA256",
+        "MLX_LM_KIMI_K3_SHA256",
+        "MLX_LM_KIMI_K3_TUNED_GATHER_QMV_SHA256",
+        "MLX_LM_KIMI_K3_W3_PREWORK_SHA256",
+        "MLX_LM_KIMI_K3_WIDTH4_FUSED_EXPERT_SHA256",
+        "MLX_LM_PR",
+        "MLX_LM_SWITCH_LAYERS_SHA256",
+        "MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE",
+        "MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL",
+        "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES",
+        "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE",
+        "MLX_LM_KIMI_K3_ASYNC_DECODE_WIDTH3",
+        "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT",
+        "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3",
+        "MLX_LM_KIMI_K3_COMPILED_DECODE",
+        "MLX_LM_KIMI_K3_DERIVE_AFFINE2_BIAS",
+        "MLX_LM_KIMI_K3_DSPARK_PROPOSER",
+        "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA",
+        "MLX_LM_KIMI_K3_ELIDE_AFFINE2_BIAS",
+        "MLX_LM_KIMI_K3_EXACT_SPECULATIVE_KDA",
+        "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV",
+        "MLX_LM_KIMI_K3_EXPERT_TOP_K",
+        "MLX_LM_KIMI_K3_FACTORIZED_SDPA_PREFILL",
+        "MLX_LM_KIMI_K3_FUSED_ATTNRES_RMS",
+        "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE",
+        "MLX_LM_KIMI_K3_FUSED_EXPERTS",
+        "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH2",
+        "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH4_EXACT",
+        "MLX_LM_KIMI_K3_FUSED_POST_KDA_RMS_SIGMOID_GATE",
+        "MLX_LM_KIMI_K3_FUSED_ROUTED_UP_ADD",
+        "MLX_LM_KIMI_K3_FUSED_ROUTER",
+        "MLX_LM_KIMI_K3_MULTIBANK_MOE_FRONT",
+        "MLX_LM_KIMI_K3_PACKED_KDA_SKINNY",
+        "MLX_LM_KIMI_K3_PACKED_KDA_WIDE",
+        "MLX_LM_KIMI_K3_PACKED_MOE_FRONT",
+        "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_WIDTH8",
+        "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE",
+        "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE_MAX_TOKENS",
+        "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE",
+        "MLX_LM_KIMI_K3_W3_COMPOSITION_RECEIPT",
+        "MLX_LM_KIMI_K3_W3_PREWORK_HISTORY",
+        "MLX_LM_KIMI_K3_WIDTH4_DISPATCH_RECEIPT",
+        "MLX_METAL_K3_AFFINE6_Q4_DISPATCH_RECEIPT",
+        "MLX_METAL_K3_AFFINE6_Q4_QUAD",
+        "MLX_METAL_K3_AFFINE8_Q3_DISPATCH_RECEIPT",
+        "MLX_METAL_K3_AFFINE8_Q3_TRIPLET",
+        "MLX_METAL_K3_AFFINE8_ROWPAIR",
+        "MLX_METAL_K3_PACKED_FRONT_ROWPAIR",
+    }
+    experiment_prefixes = (
+        "EXO_MLX_",
+        "MLX_LM_",
+        "MLX_METAL_K3_",
+        "MLX_JACCL_",
+    )
+    deployment_names = {
+        "EXO_MLX_KIMI_K3_DSPARK_CHECKPOINT",
+        "EXO_MLX_KIMI_K3_DSPARK_CONFIDENCE_JSONL",
+        "EXO_MLX_KIMI_K3_DSPARK_CONFIDENCE_SESSION",
+        "EXO_MLX_KIMI_K3_DSPARK_YARN_CHECKPOINT",
+        "EXO_MLX_RANK_LOCAL_CHECKPOINT",
+        "EXO_MLX_RANK_LOCAL_LOADER",
+        "MLX_JACCL_COORDINATOR",
+        "MLX_JACCL_RING",
+        "MLX_LM_ROOT",
+    }
+    experiment_names = {
+        name for name in os.environ if name.startswith(experiment_prefixes)
+    }
+    unexpected = (
+        experiment_names
+        - common_names
+        - deployment_names
+        - {_LAUNCH_CONTRACT_SHA256_ENV}
+    )
+    if unexpected:
+        raise ValueError(
+            "W3 composition launch contract contains unclassified experiment keys"
+        )
+    launch_map = {
+        name: value
+        for name, value in os.environ.items()
+        if name != _LAUNCH_CONTRACT_SHA256_ENV and name in common_names
+    }
+    if not launch_map:
+        raise ValueError("W3 composition launch contract is empty")
+    if any(
+        not name.isascii()
+        or not value.isascii()
+        or len(name) > 256
+        or len(value) > 16_384
+        for name, value in launch_map.items()
+    ):
+        raise ValueError("W3 composition launch contract is not bounded ASCII")
+    canonical = json.dumps(
+        launch_map,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    actual = hashlib.sha256(canonical).hexdigest()
+    expected = os.environ.get(_LAUNCH_CONTRACT_SHA256_ENV)
+    if (
+        expected is None
+        or len(expected) != 64
+        or any(character not in "0123456789abcdef" for character in expected)
+        or expected != actual
+    ):
+        raise ValueError(
+            "W3 composition launch-contract SHA does not match the complete "
+            "EXO/MLX experiment environment"
+        )
+    return _digest_words(bytes.fromhex(actual))
+
+
+def _packed_front_selector_contract(
+    *,
+    allow_noncanonical_source_test: bool = False,
+) -> _CompositionSelectors:
+    _require_exact_selector(
+        _PACKED_FRONT_EXPECTED_LAYERS_ENV,
+        str(_PACKED_FRONT_EXPECTED_LAYERS),
+    )
+    _require_exact_selector(_KDA_EXPECTED_LAYERS_ENV, str(_KDA_EXPECTED_LAYERS))
+    _require_exact_selector(
+        _DEFERRED_EXPECTED_ROOTS_ENV,
+        str(_DEFERRED_EXPECTED_ROOTS),
+    )
+    _require_exact_selector(_MLX_PACKED_FRONT_RECEIPT_ENV, "1")
+    authoritative = os.environ.get(_MLX_AUTHORITATIVE_PACKED_FRONT_ENV)
+    width3 = os.environ.get(_MLX_AUTHORITATIVE_PACKED_FRONT_WIDTH3_ENV)
+    if authoritative not in {"0", "1"}:
+        raise ValueError(
+            f"{_MLX_AUTHORITATIVE_PACKED_FRONT_ENV} must be exactly 0 or 1 "
+            "in diagnostic mode"
+        )
+    if width3 not in {"0", "1"}:
+        raise ValueError(
+            f"{_MLX_AUTHORITATIVE_PACKED_FRONT_WIDTH3_ENV} must be exactly 0 or 1 "
+            "in diagnostic mode"
+        )
+    if authoritative != width3:
+        raise ValueError(
+            "authoritative packed-front and width-three selectors must be "
+            "jointly disabled or jointly enabled in diagnostic mode"
+        )
+    kda = os.environ.get(_MLX_KDA_PREWORK_ENV)
+    deferred_exo = os.environ.get(_EXO_DEFERRED_WIDTH3_ENV)
+    deferred_mlx = os.environ.get(_MLX_DEFERRED_WIDTH3_ENV)
+    for name, value in (
+        (_MLX_KDA_PREWORK_ENV, kda),
+        (_EXO_DEFERRED_WIDTH3_ENV, deferred_exo),
+        (_MLX_DEFERRED_WIDTH3_ENV, deferred_mlx),
+    ):
+        if value not in {"0", "1"}:
+            raise ValueError(f"{name} must be exactly 0 or 1 in diagnostic mode")
+    if deferred_exo != deferred_mlx:
+        raise ValueError("EXO and MLX-LM deferred width-three selectors must match")
+    packed_enabled = authoritative == "1"
+    kda_enabled = kda == "1"
+    deferred_enabled = deferred_exo == "1"
+    arm_code = (
+        int(packed_enabled) | (int(kda_enabled) << 1) | (int(deferred_enabled) << 2)
+    )
+    canonical = arm_code in {0, 7}
+    if not allow_noncanonical_source_test and not canonical:
+        raise ValueError(
+            "diagnostic runtime requires canonical control 0/0/0 or full "
+            "packed/KDA/deferred candidate 1/1/1"
+        )
+    _require_exact_selector(_MLX_DUPLICATING_PACKED_FRONT_ENV, "0")
+    _require_exact_selector(_MLX_PACKED_FRONT_WIDTH8_ENV, "0")
+    _require_exact_selector(_MLX_MULTIBANK_PACKED_FRONT_ENV, "0")
+    _require_exact_selector(_MLX_COMPILED_DECODE_ENV, "0")
+    _require_exact_selector(_MLX_NATIVE_AFFINE8_Q3_TRIPLET_ENV, "1")
+    _require_exact_selector(_MLX_NATIVE_AFFINE8_Q3_RECEIPT_ENV, "1")
+    _require_exact_selector(_EXO_TAIL_OVERLAP_ENV, "1")
+    _require_exact_selector(_WIDTH4_RECEIPT_ENV, "0")
+    base_selectors = {
+        "EXO_NO_BATCH": "1",
+        "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE": "1",
+        "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE": "1",
+        _MLX_PROJECTED_KV_CACHE_MAX_TOKENS_ENV: str(_PROJECTED_KV_CACHE_MAX_TOKENS),
+        "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES": "laguna8",
+        "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE": "hidden",
+    }
+    for name, expected in base_selectors.items():
+        _require_exact_selector(name, expected)
+    selector_map = {
+        _PACKED_FRONT_DIAGNOSTIC_ENV: 1,
+        _PACKED_FRONT_EXPECTED_LAYERS_ENV: _PACKED_FRONT_EXPECTED_LAYERS,
+        _MLX_PACKED_FRONT_RECEIPT_ENV: 1,
+        _MLX_AUTHORITATIVE_PACKED_FRONT_ENV: int(authoritative),
+        _MLX_AUTHORITATIVE_PACKED_FRONT_WIDTH3_ENV: int(width3),
+        _MLX_KDA_PREWORK_ENV: int(cast(str, kda)),
+        _EXO_DEFERRED_WIDTH3_ENV: int(cast(str, deferred_exo)),
+        _MLX_DEFERRED_WIDTH3_ENV: int(cast(str, deferred_mlx)),
+        _MLX_DUPLICATING_PACKED_FRONT_ENV: 0,
+        _MLX_PACKED_FRONT_WIDTH8_ENV: 0,
+        _MLX_MULTIBANK_PACKED_FRONT_ENV: 0,
+        _MLX_COMPILED_DECODE_ENV: 0,
+        _MLX_NATIVE_AFFINE8_Q3_TRIPLET_ENV: 1,
+        _MLX_NATIVE_AFFINE8_Q3_RECEIPT_ENV: 1,
+        _EXO_TAIL_OVERLAP_ENV: 1,
+        _WIDTH4_RECEIPT_ENV: 0,
+        **base_selectors,
+    }
+    canonical_selector = json.dumps(
+        selector_map,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    digest = hashlib.sha256(canonical_selector).digest()
+    words = tuple(
+        int.from_bytes(digest[offset : offset + 8], "big")
+        & _PACKED_FRONT_SEQUENCE_LIMIT
+        for offset in range(0, 32, 8)
+    )
+    return _CompositionSelectors(
+        packed=packed_enabled,
+        kda=kda_enabled,
+        deferred=deferred_enabled,
+        arm_code=arm_code,
+        canonical=canonical,
+        digest=cast(tuple[int, int, int, int], words),
+        launch_digest=_launch_contract_digest(),
+    )
+
+
+def _canonical_numeric_json(payload: dict[str, object]) -> str:
+    if any(type(value) not in {bool, int} for value in payload.values()):
+        raise TypeError("packed-front marker values must be numeric scalars")
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _parse_canonical_numeric_json(text: str) -> dict[str, object]:
+    value = cast(object, json.loads(text))
+    if not isinstance(value, dict):
+        raise TypeError("packed-front agreement must be scalar numeric JSON")
+    parsed: dict[str, object] = {}
+    for name, item in cast(dict[object, object], value).items():
+        if type(name) is not str or type(item) not in {bool, int}:
+            raise TypeError("packed-front agreement must be scalar numeric JSON")
+        parsed[name] = item
+    canonical = _canonical_numeric_json(parsed)
+    if canonical != text:
+        raise ValueError("packed-front agreement JSON is not canonical")
+    return parsed
+
+
+def _packed_front_request_token(
+    setup_fingerprint: tuple[int, ...],
+    *,
+    phase: int,
+    selector_digest: tuple[int, int, int, int],
+    launch_contract_digest: tuple[int, int, int, int],
+    source_digest: tuple[int, int, int, int],
+    exo_source_digest: tuple[int, int, int, int],
+    native_lib_digest: tuple[int, int, int, int],
+) -> int:
+    if not setup_fingerprint or any(
+        type(value) is not int or not 0 <= value <= 0xFFFFFFFFFFFFFFFF
+        for value in setup_fingerprint
+    ):
+        raise ValueError("packed-front request setup fingerprint is invalid")
+    digest = hashlib.sha256(b"exo-kimi-k3-w3-composition-request/v1\0")
+    digest.update(phase.to_bytes(1, "big"))
+    for value in (
+        *selector_digest,
+        *launch_contract_digest,
+        *source_digest,
+        *exo_source_digest,
+        *native_lib_digest,
+        *setup_fingerprint,
+    ):
+        digest.update(value.to_bytes(8, "big", signed=False))
+    return int.from_bytes(digest.digest()[:8], "big") & _PACKED_FRONT_SEQUENCE_LIMIT
+
+
+class _NumericReceiptDigest:
+    """Domain-separated numeric digest that never retains raw token values."""
+
+    def __init__(self, domain: bytes):
+        self._digest = hashlib.sha256(domain)
+
+    def update(self, *values: int) -> None:
+        for value in values:
+            if type(value) is not int or not 0 <= value <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("W3 composition digest value is invalid")
+            self._digest.update(value.to_bytes(8, "big"))
+
+    def words(self) -> tuple[int, int, int, int]:
+        return _digest_words(self._digest.copy().digest())
+
+
+def _anchor_digest(round_index: int, token: int) -> tuple[int, int, int, int]:
+    if (
+        type(round_index) is not int
+        or round_index < 0
+        or type(token) is not int
+        or not 0 <= token <= 0xFFFFFFFFFFFFFFFF
+    ):
+        raise ValueError("W3 composition anchor fingerprint input is invalid")
+    digest = hashlib.sha256(b"exo-kimi-k3-w3-anchor/v1\0")
+    digest.update(round_index.to_bytes(8, "big"))
+    digest.update(token.to_bytes(8, "big"))
+    return _digest_words(digest.digest())
+
+
+def _claim_composition_receipt_phase(phase: int) -> None:
+    global _COMPOSITION_RECEIPT_ACTIVE_PHASE
+    with _COMPOSITION_RECEIPT_LOCK:
+        if _COMPOSITION_RECEIPT_ACTIVE_PHASE is not None:
+            raise RuntimeError("a W3 composition receipt phase is already active")
+        if phase in _COMPOSITION_RECEIPT_ATTEMPTED_PHASES:
+            raise RuntimeError(
+                "W3 composition receipt phases are process-local one-shot"
+            )
+        if (
+            phase == _PACKED_FRONT_PHASE_API
+            and _PACKED_FRONT_PHASE_ENGINE_STARTUP
+            not in _COMPOSITION_RECEIPT_COMPLETED_PHASES
+        ):
+            raise RuntimeError(
+                "W3 composition API receipt requires a published startup receipt"
+            )
+        _COMPOSITION_RECEIPT_ATTEMPTED_PHASES.add(phase)
+        _COMPOSITION_RECEIPT_ACTIVE_PHASE = phase
+
+
+def _release_composition_receipt_phase(phase: int) -> None:
+    global _COMPOSITION_RECEIPT_ACTIVE_PHASE
+    with _COMPOSITION_RECEIPT_LOCK:
+        if phase == _COMPOSITION_RECEIPT_ACTIVE_PHASE:
+            _COMPOSITION_RECEIPT_ACTIVE_PHASE = None
+
+
+def _record_composition_receipt_publication(
+    phase: int,
+    identity: tuple[int, ...],
+) -> None:
+    global _COMPOSITION_RECEIPT_ACTIVE_PHASE
+    with _COMPOSITION_RECEIPT_LOCK:
+        if phase != _COMPOSITION_RECEIPT_ACTIVE_PHASE:
+            raise RuntimeError("W3 composition receipt phase is not active")
+        if phase in _COMPOSITION_RECEIPT_PUBLISHED_PHASES:
+            raise RuntimeError("W3 composition receipt phase was already published")
+        _COMPOSITION_RECEIPT_PUBLISHED_PHASES.add(phase)
+        _COMPOSITION_RECEIPT_PHASE_IDENTITIES[phase] = identity
+        if phase == _PACKED_FRONT_PHASE_API:
+            _COMPOSITION_RECEIPT_COMPLETED_PHASES.add(phase)
+        _COMPOSITION_RECEIPT_ACTIVE_PHASE = None
+
+
+def _complete_composition_startup_after_warmup() -> None:
+    with _COMPOSITION_RECEIPT_LOCK:
+        phase = _PACKED_FRONT_PHASE_ENGINE_STARTUP
+        if (
+            phase not in _COMPOSITION_RECEIPT_ATTEMPTED_PHASES
+            or phase not in _COMPOSITION_RECEIPT_PUBLISHED_PHASES
+            or phase not in _COMPOSITION_RECEIPT_PHASE_IDENTITIES
+            or phase in _COMPOSITION_RECEIPT_COMPLETED_PHASES
+            or _COMPOSITION_RECEIPT_ACTIVE_PHASE is not None
+        ):
+            raise RuntimeError(
+                "W3 composition startup cannot complete before published warmup close"
+            )
+        _COMPOSITION_RECEIPT_COMPLETED_PHASES.add(phase)
+
+
+def _require_composition_api_identity(identity: tuple[int, ...]) -> None:
+    with _COMPOSITION_RECEIPT_LOCK:
+        startup = _PACKED_FRONT_PHASE_ENGINE_STARTUP
+        if (
+            startup not in _COMPOSITION_RECEIPT_COMPLETED_PHASES
+            or _COMPOSITION_RECEIPT_PHASE_IDENTITIES.get(startup) != identity
+        ):
+            raise RuntimeError(
+                "W3 composition API identity differs from completed startup"
+            )
+
+
+@dataclass
+class _PackedFrontReceiptRequest:
+    model: Model
+    enabled: bool
+    phase: int
+    selectors: _CompositionSelectors | None = None
+    selector_digest: tuple[int, int, int, int] = (0, 0, 0, 0)
+    launch_contract_digest: tuple[int, int, int, int] = (0, 0, 0, 0)
+    api: _PackedFrontReceiptAPI | None = None
+    native_api: _NativeQ3ReceiptAPI | None = None
+    exo_source_digest: tuple[int, int, int, int] = (0, 0, 0, 0)
+    setup_digest: tuple[int, int, int, int] = (0, 0, 0, 0)
+    _native_baseline: tuple[int, int, int, int] | None = None
+    _runtime: KimiK3DSparkRequestRuntime | None = None
+    _handle: tuple[int, int] | None = None
+    _receipt: K3W3CompositionReceipt | None = None
+    _marker: str | None = None
+    _published: bool = False
+    _poisoned: bool = False
+    _stale_events: int = 0
+    _duplicate_events: int = 0
+    _round_records: list[tuple[int, ...]] = field(default_factory=list)
+    _causal_events: list[tuple[int, str, tuple[int, ...]]] = field(default_factory=list)
+    _seen_events: set[tuple[int, str, int]] = field(default_factory=set)
+    _visible_output_tokens: int = 0
+    _decode_begin_cache_offset: int | None = None
+    _expected_anchor_digest: tuple[int, int, int, int] | None = None
+    _tail_prelaunch_submitted: int = 0
+    _tail_prelaunch_used: int = 0
+    _tail_prelaunch_discarded: int = 0
+    _native_fd_closed: bool = False
+    _schedule_digest: _NumericReceiptDigest = field(
+        default_factory=lambda: _NumericReceiptDigest(b"exo-kimi-k3-w3-schedule/v1\0")
+    )
+    _proposal_digest: _NumericReceiptDigest = field(
+        default_factory=lambda: _NumericReceiptDigest(b"exo-kimi-k3-w3-proposal/v1\0")
+    )
+    _acceptance_digest: _NumericReceiptDigest = field(
+        default_factory=lambda: _NumericReceiptDigest(b"exo-kimi-k3-w3-acceptance/v1\0")
+    )
+    _committed_output_digest: _NumericReceiptDigest = field(
+        default_factory=lambda: _NumericReceiptDigest(
+            b"exo-kimi-k3-w3-committed-output/v1\0"
+        )
+    )
+    _visible_output_digest: _NumericReceiptDigest = field(
+        default_factory=lambda: _NumericReceiptDigest(
+            b"exo-kimi-k3-w3-visible-output/v1\0"
+        )
+    )
+    _cache_digest: _NumericReceiptDigest = field(
+        default_factory=lambda: _NumericReceiptDigest(b"exo-kimi-k3-w3-cache/v1\0")
+    )
+    _causal_digest: _NumericReceiptDigest = field(
+        default_factory=lambda: _NumericReceiptDigest(b"exo-kimi-k3-w3-causal/v1\0")
+    )
+
+    @property
+    def candidate(self) -> bool:
+        """Compatibility label for the packed-only donor validator."""
+
+        return self.selectors is not None and self.selectors.arm_code == 7
+
+    @classmethod
+    def from_environment(
+        cls,
+        model: Model,
+        dspark: LoadedKimiK3DSpark | None,
+        *,
+        phase: Literal["engine_startup", "api"],
+    ) -> "_PackedFrontReceiptRequest":
+        if phase not in _PACKED_FRONT_PHASE_CODES:
+            raise ValueError("packed-front receipt phase is invalid")
+        enabled = _strict_env_flag(
+            _PACKED_FRONT_DIAGNOSTIC_ENV,
+            os.environ.get(_PACKED_FRONT_DIAGNOSTIC_ENV, "0"),
+        )
+        phase_code = _PACKED_FRONT_PHASE_CODES[phase]
+        if not enabled:
+            _reject_orphan_composition_receipt_environment()
+            return cls(model=model, enabled=False, phase=phase_code)
+        if dspark is None or int(dspark.verify_width) != 3:
+            raise ValueError(
+                "packed-front diagnostic mode requires Kimi K3 DSpark width three"
+            )
+        _claim_composition_receipt_phase(phase_code)
+        native_api: _NativeQ3ReceiptAPI | None = None
+        try:
+            selectors = _packed_front_selector_contract()
+            exo_source_digest = _exo_source_digest()
+            api = _load_packed_front_receipt_api()
+            native_api = _load_native_q3_receipt_api()
+            identity = (
+                *selectors.digest,
+                *selectors.launch_digest,
+                *api.source_digest,
+                *exo_source_digest,
+                *native_api.lib_digest,
+                *native_api.lib_identity,
+            )
+            if phase_code == _PACKED_FRONT_PHASE_API:
+                _require_composition_api_identity(identity)
+        except BaseException:
+            # The phase remains attempted, so neither malformed startup nor a
+            # failed loader can be retried around the process-global counter
+            # interval. Releasing only the active slot makes the failure state
+            # explicit and lets the API-before-success gate produce its own
+            # deterministic rejection.
+            if native_api is not None:
+                with contextlib.suppress(OSError):
+                    os.close(native_api.lib_fd)
+            _release_composition_receipt_phase(phase_code)
+            raise
+        return cls(
+            model=model,
+            enabled=True,
+            phase=phase_code,
+            selectors=selectors,
+            selector_digest=selectors.digest,
+            launch_contract_digest=selectors.launch_digest,
+            api=api,
+            native_api=native_api,
+            exo_source_digest=exo_source_digest,
+        )
+
+    def _phase_identity(self) -> tuple[int, ...]:
+        if self.api is None or self.native_api is None:
+            raise RuntimeError("W3 composition phase identity is unavailable")
+        return (
+            *self.selector_digest,
+            *self.launch_contract_digest,
+            *self.api.source_digest,
+            *self.exo_source_digest,
+            *self.native_api.lib_digest,
+            *self.native_api.lib_identity,
+        )
+
+    def _close_native_fd(self) -> None:
+        if self.native_api is None or self._native_fd_closed:
+            return
+        self._native_fd_closed = True
+        with contextlib.suppress(OSError):
+            os.close(self.native_api.lib_fd)
+
+    def _native_counts(self) -> tuple[int, int, int, int]:
+        if self.native_api is None:
+            raise RuntimeError("native affine8 Q3 receipt API is unavailable")
+        raw_values = (
+            self.native_api.total(),
+            self.native_api.n4480(),
+            self.native_api.n6144(),
+            self.native_api.n10624(),
+        )
+        if any(type(value) is not int for value in raw_values):
+            raise TypeError("native affine8 Q3 receipt counter is not an integer")
+        values = cast(tuple[int, int, int, int], raw_values)
+        if any(not 0 <= value <= _PACKED_FRONT_COUNTER_LIMIT for value in values):
+            raise ValueError("native affine8 Q3 receipt counter is invalid")
+        if values[0] < sum(values[1:]):
+            raise ValueError("native affine8 Q3 named counters exceed the aggregate")
+        return values
+
+    def _assert_runtime_identity(self) -> None:
+        if self.api is None or self.native_api is None:
+            raise RuntimeError("W3 composition runtime identity is unavailable")
+        if _launch_contract_digest() != self.launch_contract_digest:
+            raise ValueError("W3 composition launch contract changed during request")
+        if _runtime_source_digest() != self.api.source_digest:
+            raise ValueError("W3 composition MLX source changed during request")
+        if _exo_source_digest() != self.exo_source_digest:
+            raise ValueError("W3 composition EXO source changed during request")
+        _assert_native_library_identity(self.native_api)
+
+    def observe_causal_event(
+        self,
+        round_index: int,
+        event: str,
+        values: tuple[int, ...] = (),
+    ) -> None:
+        """Hash an in-memory causal event; this observer never raises."""
+
+        event_codes = {
+            "proposal_agreed": 1,
+            "deferred_roots_validated": 2,
+            "target_graph_agreed": 3,
+            "deferred_root_submitted": 4,
+            "deferred_roots_submitted": 5,
+            "acceptance_agreed": 6,
+            "tail_prelaunch_submitted": 7,
+            "target_commit": 8,
+            "tail_prelaunch_used": 9,
+            "tail_prelaunch_discarded": 10,
+            "ordinary_target_commit": 11,
+            "committed_tokens": 12,
+            "ordinary_anchor_agreed": 13,
+            "proposal_context_agreed": 14,
+        }
+        try:
+            if (
+                type(round_index) is not int
+                or round_index < 0
+                or event not in event_codes
+                or any(
+                    type(value) is not int or not 0 <= value <= 0xFFFFFFFFFFFFFFFF
+                    for value in values
+                )
+            ):
+                raise ValueError("invalid W3 causal event")
+            retained_values = values
+            if event == "proposal_agreed":
+                if len(values) != 3:
+                    raise ValueError("width-three proposal block must contain 3 tokens")
+                if (
+                    self._expected_anchor_digest is None
+                    or _anchor_digest(round_index, values[0])
+                    != self._expected_anchor_digest
+                ):
+                    raise ValueError("width-three proposal anchor is not contiguous")
+                self._proposal_digest.update(
+                    round_index,
+                    len(values),
+                    *values,
+                )
+                retained_values = (len(values),)
+            elif event == "ordinary_anchor_agreed":
+                if (
+                    len(values) != 1
+                    or self._expected_anchor_digest is None
+                    or _anchor_digest(round_index, values[0])
+                    != self._expected_anchor_digest
+                ):
+                    raise ValueError("ordinary target anchor is not contiguous")
+                self._proposal_digest.update(
+                    round_index,
+                    1,
+                    values[0],
+                )
+                retained_values = ()
+            elif event == "committed_tokens":
+                if not values:
+                    raise ValueError("committed token block must not be empty")
+                self._committed_output_digest.update(
+                    round_index,
+                    len(values),
+                    *values,
+                )
+                self._expected_anchor_digest = _anchor_digest(
+                    round_index + 1,
+                    values[-1],
+                )
+                retained_values = (
+                    len(values),
+                    *self._expected_anchor_digest,
+                )
+            elif event in {"tail_prelaunch_submitted", "tail_prelaunch_used"}:
+                if len(values) != 2:
+                    raise ValueError("tail-prelaunch identity is invalid")
+                anchor_round = round_index + int(event == "tail_prelaunch_submitted")
+                retained_values = (
+                    values[0],
+                    *_anchor_digest(anchor_round, values[1]),
+                )
+            elif event == "tail_prelaunch_discarded":
+                if len(values) != 3 or values[0] not in {1, 2}:
+                    raise ValueError("tail-prelaunch discard reason is invalid")
+                self._tail_prelaunch_discarded += 1
+                anchor_round = round_index + int(values[0] == 2)
+                retained_values = (
+                    values[0],
+                    values[1],
+                    *_anchor_digest(anchor_round, values[2]),
+                )
+            elif event == "proposal_context_agreed":
+                if len(values) != 1:
+                    raise ValueError("proposal context offset is invalid")
+            elif event == "acceptance_agreed":
+                if len(values) != 1 or values[0] > 2:
+                    raise ValueError("width-three acceptance is invalid")
+                self._acceptance_digest.update(round_index, values[0])
+            discriminator = (
+                retained_values[0]
+                if event in {"deferred_root_submitted", "tail_prelaunch_discarded"}
+                and retained_values
+                else 0
+            )
+            key = (round_index, event, discriminator)
+            if key in self._seen_events:
+                self._duplicate_events += 1
+                return
+            self._seen_events.add(key)
+            if self._causal_events and round_index < self._causal_events[-1][0]:
+                self._stale_events += 1
+            self._causal_events.append((round_index, event, retained_values))
+            self._causal_digest.update(
+                round_index,
+                event_codes[event],
+                len(retained_values),
+                *retained_values,
+            )
+        except Exception:
+            self._poisoned = True
+
+    def observe_round(
+        self,
+        stats: DSparkRoundTelemetry,
+        *,
+        target_cache_tokens: int | None,
+    ) -> None:
+        """Bind the committed schedule and cache boundary without timings."""
+
+        try:
+            if (
+                stats.round_index != len(self._round_records)
+                or type(target_cache_tokens) is not int
+                or target_cache_tokens < 0
+                or target_cache_tokens > _PROJECTED_KV_CACHE_MAX_TOKENS
+            ):
+                raise ValueError("W3 receipt round/cache sequence is invalid")
+            record = (
+                stats.round_index,
+                stats.proposed,
+                stats.accepted,
+                stats.emitted,
+                int(stats.fallback),
+                int(stats.error is not None),
+                int(stats.prelaunch_submitted),
+                int(stats.prelaunch_used),
+                target_cache_tokens,
+            )
+            if any(type(value) is not int or value < 0 for value in record):
+                raise ValueError("W3 receipt round values are invalid")
+            self._round_records.append(record)
+            self._schedule_digest.update(*record[:-1])
+            self._cache_digest.update(stats.round_index, target_cache_tokens)
+            self._tail_prelaunch_submitted += int(stats.prelaunch_submitted)
+            self._tail_prelaunch_used += int(stats.prelaunch_used)
+        except Exception:
+            self._poisoned = True
+
+    def observe_output_token(self, token: int, *, from_draft: bool) -> None:
+        """Hash an agreed visible token immediately and retain no token value."""
+
+        try:
+            if (
+                type(token) is not int
+                or not 0 <= token <= 0xFFFFFFFFFFFFFFFF
+                or type(from_draft) is not bool
+            ):
+                raise ValueError("W3 receipt output token is invalid")
+            self._visible_output_digest.update(
+                self._visible_output_tokens,
+                token,
+                int(from_draft),
+            )
+            self._visible_output_tokens += 1
+        except Exception:
+            self._poisoned = True
+
+    def begin(
+        self,
+        runtime: KimiK3DSparkRequestRuntime,
+        setup_fingerprint: tuple[int, ...],
+    ) -> None:
+        if not self.enabled:
+            return
+        if (
+            self.api is None
+            or self.native_api is None
+            or self.selectors is None
+            or self._handle is not None
+            or self._receipt is not None
+        ):
+            raise RuntimeError("packed-front receipt begin state is invalid")
+        setup_hasher = hashlib.sha256(b"exo-kimi-k3-w3-setup/v1\0")
+        for word in setup_fingerprint:
+            if type(word) is not int or not 0 <= word <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("W3 composition setup fingerprint is invalid")
+            setup_hasher.update(word.to_bytes(8, "big"))
+        self.setup_digest = _digest_words(setup_hasher.digest())
+        request_token = _packed_front_request_token(
+            setup_fingerprint,
+            phase=self.phase,
+            selector_digest=self.selector_digest,
+            launch_contract_digest=self.launch_contract_digest,
+            source_digest=self.api.source_digest,
+            exo_source_digest=self.exo_source_digest,
+            native_lib_digest=self.native_api.lib_digest,
+        )
+        local_handles: list[tuple[int, int]] = []
+
+        def begin_local() -> str:
+            assert self.api is not None
+            assert self.native_api is not None
+            self._assert_runtime_identity()
+            self.native_api.reset()
+            baseline = self._native_counts()
+            if baseline != (0, 0, 0, 0):
+                raise ValueError("native affine8 Q3 receipt reset is not zero")
+            self._native_baseline = baseline
+            handle = self.api.begin(
+                request_token,
+                self.model,
+                expected_sparse_layers=_PACKED_FRONT_EXPECTED_LAYERS,
+                expected_kda_layers=_KDA_EXPECTED_LAYERS,
+            )
+            if not isinstance(handle, tuple):
+                raise ValueError("MLX-LM packed-front receipt handle is invalid")
+            handle_values = cast(tuple[object, ...], handle)
+            if len(handle_values) != 2:
+                raise ValueError("MLX-LM packed-front receipt handle is invalid")
+            request_sequence_value, request_token_value = handle_values
+            if (
+                type(request_sequence_value) is not int
+                or type(request_token_value) is not int
+                or not 1 <= request_sequence_value <= _PACKED_FRONT_SEQUENCE_LIMIT
+                or request_token_value != request_token
+            ):
+                raise ValueError("MLX-LM packed-front receipt handle is invalid")
+            validated_handle = (request_sequence_value, request_token_value)
+            self._handle = validated_handle
+            local_handles.append(validated_handle)
+            return _canonical_numeric_json(
+                {
+                    "request_sequence": validated_handle[0],
+                    "request_token": validated_handle[1],
+                }
+            )
+
+        agreed = runtime.agree_text("packed-front receipt begin", begin_local)
+        handle_payload = _parse_canonical_numeric_json(agreed)
+        if set(handle_payload) != {"request_sequence", "request_token"}:
+            raise ValueError("packed-front receipt begin agreement schema is invalid")
+        request_sequence = handle_payload["request_sequence"]
+        request_token_value = handle_payload["request_token"]
+        if type(request_sequence) is not int or type(request_token_value) is not int:
+            raise TypeError("packed-front receipt begin agreement values are invalid")
+        agreed_handle = (request_sequence, request_token_value)
+        if local_handles != [agreed_handle]:
+            raise RuntimeError("packed-front receipt begin agreement diverged")
+        runtime.attach_composition_receipt_sink(self)
+        self._runtime = runtime
+
+    def begin_decode(
+        self,
+        runtime: KimiK3DSparkRequestRuntime,
+        *,
+        anchor_token: int,
+    ) -> None:
+        """Bind the post-prefill cache boundary and first rank-agreed anchor."""
+
+        if not self.enabled:
+            return
+        if (
+            runtime is not self._runtime
+            or self._handle is None
+            or self._decode_begin_cache_offset is not None
+            or type(anchor_token) is not int
+            or anchor_token < 0
+        ):
+            raise RuntimeError("W3 composition decode-start state is invalid")
+
+        def local_boundary() -> str:
+            return _canonical_numeric_json(
+                {
+                    "anchor_token": anchor_token,
+                    "target_cache_offset": runtime.target_cache_offset,
+                }
+            )
+
+        agreed = runtime.agree_text("W3 composition decode start", local_boundary)
+        payload = _parse_canonical_numeric_json(agreed)
+        if set(payload) != {"anchor_token", "target_cache_offset"}:
+            raise ValueError("W3 composition decode-start schema is invalid")
+        agreed_anchor = payload["anchor_token"]
+        begin_cache_offset = payload["target_cache_offset"]
+        if (
+            type(agreed_anchor) is not int
+            or agreed_anchor != anchor_token
+            or type(begin_cache_offset) is not int
+            or begin_cache_offset < 0
+            or begin_cache_offset > _PROJECTED_KV_CACHE_MAX_TOKENS
+        ):
+            raise ValueError("W3 composition decode-start agreement diverged")
+        self._expected_anchor_digest = _anchor_digest(0, agreed_anchor)
+        self._decode_begin_cache_offset = begin_cache_offset
+        self._cache_digest.update(
+            _PACKED_FRONT_SEQUENCE_LIMIT,
+            begin_cache_offset,
+        )
+
+    def _validated_marker(
+        self,
+        raw: dict[str, object],
+        telemetry: "_PromptLookupTelemetry",
+        runtime: KimiK3DSparkRequestRuntime,
+    ) -> dict[str, object]:
+        """Validate exact MLX/native/schedule algebra and emit numeric scalars."""
+
+        if set(raw) != set(_PACKED_FRONT_MLX_KEYS):
+            raise ValueError("MLX-LM W3 composition receipt fields are invalid")
+        if (
+            raw["schema"] != _PACKED_FRONT_RECEIPT_SCHEMA
+            or raw["finalized"] is not True
+            or raw["aborted"] is not False
+            or raw["poisoned"] is not False
+            or type(raw["expected_sparse_layers"]) is not int
+            or raw["expected_sparse_layers"] != _PACKED_FRONT_EXPECTED_LAYERS
+            or type(raw["expected_kda_layers"]) is not int
+            or raw["expected_kda_layers"] != _KDA_EXPECTED_LAYERS
+        ):
+            raise ValueError("MLX-LM W3 composition receipt header is invalid")
+        if (
+            self._handle is None
+            or self.selectors is None
+            or self.api is None
+            or self.native_api is None
+        ):
+            raise RuntimeError("W3 composition receipt binding is unavailable")
+        if not self.selectors.canonical or self.selectors.arm_code not in {0, 7}:
+            raise ValueError(
+                "W3 composition receipt requires canonical control or candidate"
+            )
+        raw_sequence = raw["request_sequence"]
+        raw_token = raw["request_token"]
+        if (
+            type(raw_sequence) is not int
+            or not 1 <= raw_sequence <= _PACKED_FRONT_SEQUENCE_LIMIT
+            or raw_sequence != self._handle[0]
+            or type(raw_token) is not int
+            or not 0 <= raw_token <= _PACKED_FRONT_SEQUENCE_LIMIT
+            or raw_token != self._handle[1]
+        ):
+            raise ValueError("MLX-LM W3 composition receipt binding is invalid")
+        self._assert_runtime_identity()
+
+        expected_selector_snapshot: dict[str, object] = {
+            "packed_authoritative_enabled": self.selectors.packed,
+            "packed_width3_enabled": self.selectors.packed,
+            "kda_prework_enabled": self.selectors.kda,
+            "replayssm_speculative_enabled": True,
+            "projected_kv_cache_enabled": True,
+            "projected_kv_cache_max_tokens": _PROJECTED_KV_CACHE_MAX_TOKENS,
+            "async_decode_boundaries": "laguna8",
+            "async_decode_state": "hidden",
+            "async_decode_width3_enabled": self.selectors.deferred,
+            "native_q3_triplet_enabled": True,
+            "native_q3_dispatch_receipt_enabled": True,
+        }
+        for name, expected in expected_selector_snapshot.items():
+            if type(raw[name]) is not type(expected) or raw[name] != expected:
+                raise ValueError(f"MLX-LM W3 selector snapshot {name} drifted")
+
+        counters: dict[str, int] = {}
+        for name in _PACKED_FRONT_COUNTER_FIELDS:
+            value = raw[name]
+            if type(value) is not int or not 0 <= value <= _PACKED_FRONT_COUNTER_LIMIT:
+                raise ValueError(f"MLX-LM W3 receipt counter {name} is invalid")
+            counters[name] = value
+        if counters["helper_calls"] != sum(
+            counters[name]
+            for name in (
+                "gate_disabled_calls",
+                "noncontract_calls",
+                "packed_hits",
+                "unsupported_calls",
+                "packed_dispatch_fallback_calls",
+            )
+        ):
+            raise ValueError("MLX-LM packed helper partition is invalid")
+        if counters["eligible_width1_calls"] != sum(
+            counters[name]
+            for name in (
+                "packed_width1_hits",
+                "width1_unsupported_calls",
+                "width1_dispatch_fallback_calls",
+            )
+        ) or counters["eligible_width3_calls"] != sum(
+            counters[name]
+            for name in (
+                "packed_width3_hits",
+                "width3_unsupported_calls",
+                "width3_dispatch_fallback_calls",
+            )
+        ):
+            raise ValueError("MLX-LM packed eligible-width partition is invalid")
+        aggregate_pairs = (
+            ("packed_hits", "packed_width1_hits", "packed_width3_hits"),
+            (
+                "packed_output_tensors",
+                "packed_width1_output_tensors",
+                "packed_width3_output_tensors",
+            ),
+            ("lazy_installs", "packed_width1_installs", "packed_width3_installs"),
+            (
+                "unsupported_calls",
+                "width1_unsupported_calls",
+                "width3_unsupported_calls",
+            ),
+            (
+                "packed_dispatch_fallback_calls",
+                "width1_dispatch_fallback_calls",
+                "width3_dispatch_fallback_calls",
+            ),
+        )
+        if any(
+            counters[total] != counters[first] + counters[second]
+            for total, first, second in aggregate_pairs
+        ):
+            raise ValueError("MLX-LM packed aggregate partition is invalid")
+        if (
+            counters["kda_admitted_calls"]
+            != counters["kda_success_calls"]
+            + counters["kda_fallback_calls"]
+            + counters["kda_pending_calls"]
+            or counters["kda_helper_calls"]
+            != counters["kda_gate_disabled_calls"]
+            + counters["kda_noncontract_calls"]
+            + counters["kda_admitted_calls"]
+            or counters["kda_pending_calls"] != 0
+        ):
+            raise ValueError("MLX-LM KDA helper partition is invalid")
+
+        if telemetry.fallback_rounds != 0 or telemetry.error_rounds != 0:
+            raise ValueError("W3 diagnostic request had fallback or error rounds")
+        full_rounds = telemetry.full_width_rounds
+        tail_rounds = telemetry.target_width1_rounds
+        if (
+            full_rounds + tail_rounds != telemetry.rounds
+            or len(self._round_records) != telemetry.rounds
+            or any(
+                record[0] != index for index, record in enumerate(self._round_records)
+            )
+        ):
+            raise ValueError("W3 diagnostic round schedule is incomplete")
+        prefill_width1 = telemetry.prefill_width1_chunks
+        prefill_width3 = telemetry.prefill_width3_chunks
+        prefill_noncontract = telemetry.prefill_noncontract_chunks
+        if (
+            min(prefill_width1, prefill_width3, prefill_noncontract) < 0
+            or prefill_width1 not in {0, 1}
+            or prefill_width3 not in {0, 1}
+            or prefill_width1 + prefill_width3 > 1
+        ):
+            raise ValueError("W3 diagnostic prefill geometry is invalid")
+
+        expected_width1 = (tail_rounds + prefill_width1) * _PACKED_FRONT_EXPECTED_LAYERS
+        expected_width3 = (full_rounds + prefill_width3) * _PACKED_FRONT_EXPECTED_LAYERS
+        if self.selectors.packed:
+            zero_packed_failures = (
+                "gate_disabled_calls",
+                "unsupported_calls",
+                "packed_dispatch_fallback_calls",
+                "invalidations",
+                "stale_resets",
+            )
+            if any(counters[name] != 0 for name in zero_packed_failures):
+                raise ValueError("candidate packed receipt contains fallback drift")
+            if (
+                counters["packed_width1_hits"] != expected_width1
+                or counters["eligible_width1_calls"] != expected_width1
+                or counters["packed_width3_hits"] != expected_width3
+                or counters["eligible_width3_calls"] != expected_width3
+                or counters["packed_hits"] != expected_width1 + expected_width3
+                or counters["packed_width1_output_tensors"] != expected_width1 * 4
+                or counters["packed_width3_output_tensors"] != expected_width3 * 4
+                or counters["packed_output_tensors"]
+                != (expected_width1 + expected_width3) * 4
+                or counters["noncontract_calls"]
+                != prefill_noncontract * _PACKED_FRONT_EXPECTED_LAYERS
+            ):
+                raise ValueError("candidate packed W3 hit algebra is invalid")
+            if self.phase == _PACKED_FRONT_PHASE_ENGINE_STARTUP:
+                installs = (
+                    counters["packed_width1_installs"],
+                    counters["packed_width3_installs"],
+                )
+                if (
+                    full_rounds == 0
+                    or counters["pack_count_before"] != 0
+                    or counters["pack_count_after"] != _PACKED_FRONT_EXPECTED_LAYERS
+                    or installs
+                    not in {
+                        (_PACKED_FRONT_EXPECTED_LAYERS, 0),
+                        (0, _PACKED_FRONT_EXPECTED_LAYERS),
+                    }
+                    or (installs[0] > 0 and expected_width1 == 0)
+                    or (installs[1] > 0 and expected_width3 == 0)
+                    or counters["lazy_installs"] != _PACKED_FRONT_EXPECTED_LAYERS
+                ):
+                    raise ValueError("startup did not prove the exact 0-to-92 install")
+            elif (
+                counters["pack_count_before"] != _PACKED_FRONT_EXPECTED_LAYERS
+                or counters["pack_count_after"] != _PACKED_FRONT_EXPECTED_LAYERS
+                or counters["lazy_installs"] != 0
+            ):
+                raise ValueError("API request did not preserve all 92 packed parents")
+        else:
+            expected_helpers = (
+                telemetry.rounds + prefill_width1 + prefill_width3 + prefill_noncontract
+            ) * _PACKED_FRONT_EXPECTED_LAYERS
+            if (
+                counters["helper_calls"] != expected_helpers
+                or counters["gate_disabled_calls"] != expected_helpers
+            ):
+                raise ValueError("control packed gate accounting is invalid")
+            packed_noncontrol_fields = (
+                "eligible_width1_calls",
+                "eligible_width3_calls",
+                "packed_width1_hits",
+                "packed_width3_hits",
+                "packed_hits",
+                "packed_width1_output_tensors",
+                "packed_width3_output_tensors",
+                "packed_output_tensors",
+                "packed_width1_installs",
+                "packed_width3_installs",
+                "lazy_installs",
+                "noncontract_calls",
+                "width1_unsupported_calls",
+                "width3_unsupported_calls",
+                "unsupported_calls",
+                "width1_dispatch_fallback_calls",
+                "width3_dispatch_fallback_calls",
+                "packed_dispatch_fallback_calls",
+                "invalidations",
+                "stale_resets",
+                "pack_count_before",
+                "pack_count_after",
+            )
+            if any(counters[name] != 0 for name in packed_noncontrol_fields):
+                raise ValueError("control packed receipt contains candidate work")
+
+        expected_kda_helpers = (
+            full_rounds + prefill_width3 + prefill_noncontract
+        ) * _KDA_EXPECTED_LAYERS
+        if counters["kda_helper_calls"] != expected_kda_helpers:
+            raise ValueError("KDA helper-call geometry is invalid")
+        if self.selectors.kda:
+            expected_kda_success = full_rounds * _KDA_EXPECTED_LAYERS
+            expected_kda_noncontract = (
+                prefill_width3 + prefill_noncontract
+            ) * _KDA_EXPECTED_LAYERS
+            if (
+                counters["kda_gate_disabled_calls"] != 0
+                or counters["kda_noncontract_calls"] != expected_kda_noncontract
+                or counters["kda_admitted_calls"] != expected_kda_success
+                or counters["kda_success_calls"] != expected_kda_success
+                or counters["kda_fallback_calls"] != 0
+            ):
+                raise ValueError("candidate KDA W3 algebra is invalid")
+        elif counters["kda_gate_disabled_calls"] != expected_kda_helpers or any(
+            counters[name] != 0
+            for name in (
+                "kda_noncontract_calls",
+                "kda_admitted_calls",
+                "kda_success_calls",
+                "kda_fallback_calls",
+            )
+        ):
+            raise ValueError("control KDA gate accounting is invalid")
+
+        deferred = runtime.deferred_async_width3_attestation
+        if self.selectors.deferred:
+            if (
+                deferred.enabled is not True
+                or deferred.validated_rounds != full_rounds
+                or deferred.materialized_rounds != full_rounds
+                or deferred.validated_roots != full_rounds * _DEFERRED_EXPECTED_ROOTS
+                or deferred.submitted_roots != full_rounds * _DEFERRED_EXPECTED_ROOTS
+                or full_rounds <= 0
+                or deferred.first_initial_offset is None
+                or deferred.last_initial_offset is None
+                or deferred.last_final_offset != deferred.last_initial_offset + 3
+            ):
+                raise ValueError("deferred W3 root/materialization algebra is invalid")
+        elif (
+            deferred.enabled
+            or deferred.validated_rounds != 0
+            or deferred.materialized_rounds != 0
+            or deferred.validated_roots != 0
+            or deferred.submitted_roots != 0
+            or deferred.first_initial_offset is not None
+            or deferred.last_initial_offset is not None
+            or deferred.last_final_offset is not None
+        ):
+            raise ValueError("disabled deferred W3 receipt contains work")
+
+        events_by_round: dict[int, list[tuple[str, tuple[int, ...]]]] = {
+            index: [] for index in range(telemetry.rounds)
+        }
+        for round_index, event, values in self._causal_events:
+            if round_index not in events_by_round:
+                raise ValueError("W3 causal event refers to an unknown round")
+            events_by_round[round_index].append((event, values))
+        if (
+            self._decode_begin_cache_offset is None
+            or self._expected_anchor_digest is None
+            or telemetry.rounds <= 0
+            or sum(record[1] for record in self._round_records)
+            != telemetry.drafted_tokens
+            or sum(record[2] for record in self._round_records)
+            != telemetry.accepted_tokens
+            or sum(record[3] for record in self._round_records)
+            != telemetry.committed_tokens
+        ):
+            raise ValueError("W3 decode baseline or telemetry totals are invalid")
+
+        previous_cache = self._decode_begin_cache_offset
+        prior_prelaunch_attestation: tuple[int, ...] | None = None
+        root_batches: list[tuple[int, int, int]] = []
+        for record in self._round_records:
+            round_index, proposed, accepted, emitted = record[:4]
+            prelaunch_submitted = bool(record[6])
+            prelaunch_used = bool(record[7])
+            actual = events_by_round[round_index]
+            if (
+                record[4] != 0
+                or record[5] != 0
+                or record[6] not in {0, 1}
+                or record[7] not in {0, 1}
+                or record[8] > _PROJECTED_KV_CACHE_MAX_TOKENS
+                or (proposed == 2 and not (0 <= accepted <= 2))
+                or (proposed == 2 and emitted != accepted + 1)
+                or (proposed == 0 and (accepted != 0 or emitted != 1))
+                or proposed not in {0, 2}
+            ):
+                raise ValueError("W3 round acceptance/emission algebra is invalid")
+            consumed = accepted + 1 if proposed == 2 else 1
+            if record[8] != previous_cache + consumed:
+                raise ValueError("W3 target-cache schedule is noncontiguous")
+            expected_events: list[tuple[str, tuple[int, ...]]] = []
+            if prior_prelaunch_attestation is not None:
+                expected_events.append(
+                    (
+                        "tail_prelaunch_used",
+                        prior_prelaunch_attestation,
+                    )
+                    if prelaunch_used
+                    else (
+                        "tail_prelaunch_discarded",
+                        (1, *prior_prelaunch_attestation),
+                    )
+                )
+            elif prelaunch_used:
+                raise ValueError("W3 tail prelaunch was used without a submission")
+            if proposed == 2:
+                proposal_context = (
+                    actual[len(expected_events)]
+                    if len(actual) > len(expected_events)
+                    else None
+                )
+                if (
+                    proposal_context is None
+                    or proposal_context[0] != "proposal_context_agreed"
+                    or len(proposal_context[1]) != 1
+                    or proposal_context[1][0] != previous_cache
+                    or (
+                        prelaunch_used
+                        and prior_prelaunch_attestation is not None
+                        and proposal_context[1][0] != prior_prelaunch_attestation[0]
+                    )
+                ):
+                    raise ValueError("W3 proposal context differs from tail handoff")
+                expected_events.append(proposal_context)
+                expected_events.append(("proposal_agreed", (3,)))
+                if self.selectors.deferred:
+                    expected_events.append(
+                        ("deferred_roots_validated", (_DEFERRED_EXPECTED_ROOTS,))
+                    )
+                expected_events.append(("target_graph_agreed", (2,)))
+                if self.selectors.deferred:
+                    expected_events.extend(
+                        (
+                            "deferred_root_submitted",
+                            (ordinal, _DEFERRED_EXPECTED_ROOTS),
+                        )
+                        for ordinal in range(_DEFERRED_EXPECTED_ROOTS)
+                    )
+                    root_batch = (
+                        actual[len(expected_events)]
+                        if len(actual) > len(expected_events)
+                        else None
+                    )
+                    if (
+                        root_batch is None
+                        or root_batch[0] != "deferred_roots_submitted"
+                        or len(root_batch[1]) != 3
+                        or root_batch[1][0] != previous_cache
+                        or root_batch[1][1] != root_batch[1][0] + 3
+                        or root_batch[1][2] != _DEFERRED_EXPECTED_ROOTS
+                        or root_batch[1][1] > _PROJECTED_KV_CACHE_MAX_TOKENS
+                    ):
+                        raise ValueError("deferred root batch order/offset is invalid")
+                    expected_events.append(root_batch)
+                    root_batches.append(cast(tuple[int, int, int], root_batch[1]))
+                expected_events.append(("acceptance_agreed", (accepted,)))
+                committed_event = (
+                    actual[len(expected_events)]
+                    if len(actual) > len(expected_events)
+                    else None
+                )
+                if (
+                    committed_event is None
+                    or committed_event[0] != "committed_tokens"
+                    or len(committed_event[1]) != 5
+                    or committed_event[1][0] != emitted
+                ):
+                    raise ValueError("W3 committed output anchor is invalid")
+                expected_events.append(committed_event)
+                committed_anchor_digest = committed_event[1][1:]
+                current_prelaunch_attestation: tuple[int, ...] | None = None
+                if prelaunch_submitted:
+                    submission = (
+                        actual[len(expected_events)]
+                        if len(actual) > len(expected_events)
+                        else None
+                    )
+                    if (
+                        submission is None
+                        or submission[0] != "tail_prelaunch_submitted"
+                        or len(submission[1]) != 5
+                        or submission[1][0] != record[8]
+                        or submission[1][1:] != committed_anchor_digest
+                    ):
+                        raise ValueError("W3 tail-prelaunch submission is unbound")
+                    current_prelaunch_attestation = submission[1]
+                    expected_events.append(submission)
+                expected_events.append(("target_commit", (accepted + 1,)))
+            else:
+                current_prelaunch_attestation = None
+                expected_events.append(("ordinary_anchor_agreed", ()))
+                committed_event = (
+                    actual[len(expected_events)]
+                    if len(actual) > len(expected_events)
+                    else None
+                )
+                if (
+                    committed_event is None
+                    or committed_event[0] != "committed_tokens"
+                    or len(committed_event[1]) != 5
+                    or committed_event[1][0] != 1
+                ):
+                    raise ValueError("ordinary committed output anchor is invalid")
+                expected_events.append(committed_event)
+                expected_events.append(("ordinary_target_commit", (1,)))
+            if (
+                round_index == telemetry.rounds - 1
+                and current_prelaunch_attestation is not None
+            ):
+                expected_events.append(
+                    (
+                        "tail_prelaunch_discarded",
+                        (2, *current_prelaunch_attestation),
+                    )
+                )
+            if actual != expected_events:
+                raise ValueError("W3 causal event ordering differs from the schedule")
+            previous_cache = record[8]
+            prior_prelaunch_attestation = current_prelaunch_attestation
+
+        submitted_count = sum(record[6] for record in self._round_records)
+        used_count = sum(record[7] for record in self._round_records)
+        if (
+            submitted_count != self._tail_prelaunch_submitted
+            or used_count != self._tail_prelaunch_used
+            or submitted_count
+            != self._tail_prelaunch_used + self._tail_prelaunch_discarded
+            or (
+                telemetry.rounds > 1
+                and full_rounds > 0
+                and (submitted_count == 0 or used_count == 0)
+            )
+        ):
+            raise ValueError("W3 tail-prelaunch causal chain is incomplete")
+        if self.selectors.deferred and (
+            not root_batches
+            or deferred.first_initial_offset != root_batches[0][0]
+            or deferred.last_initial_offset != root_batches[-1][0]
+            or deferred.last_final_offset != root_batches[-1][1]
+        ):
+            raise ValueError("deferred W3 aggregate offsets differ from causal roots")
+
+        if (
+            self._poisoned
+            or self._stale_events != 0
+            or self._duplicate_events != 0
+            or self._visible_output_tokens <= 0
+            or self._visible_output_tokens > telemetry.committed_tokens
+            or runtime.target_cache_offset != previous_cache
+        ):
+            raise ValueError("W3 request-local receipt state is poisoned or incomplete")
+
+        if self.native_api is None or self._native_baseline is None:
+            raise RuntimeError("native affine8 Q3 receipt baseline is unavailable")
+        native_final = self._native_counts()
+        native_delta = tuple(
+            final - baseline
+            for final, baseline in zip(
+                native_final,
+                self._native_baseline,
+                strict=True,
+            )
+        )
+        if any(value < 0 for value in native_delta):
+            raise ValueError("native affine8 Q3 counters decreased")
+        if native_delta[3] != counters["packed_width3_hits"]:
+            raise ValueError(
+                "native affine8 Q3 N10624 dispatches do not equal packed W3 hits"
+            )
+        q3_sparse_layer_calls = (
+            full_rounds + prefill_width3
+        ) * _PACKED_FRONT_EXPECTED_LAYERS
+        expected_native_total = q3_sparse_layer_calls * (
+            3 if self.selectors.packed else 6
+        )
+        expected_native_other = q3_sparse_layer_calls * (
+            2 if self.selectors.packed else 6
+        )
+        native_other = native_delta[0] - sum(native_delta[1:])
+        if (
+            native_delta[0] != expected_native_total
+            or native_delta[1] != 0
+            or native_delta[2] != 0
+            or native_other != expected_native_other
+        ):
+            raise ValueError("native affine8 Q3 aggregate/other algebra is invalid")
+
+        def digest_fields(
+            prefix: str,
+            words: tuple[int, int, int, int],
+        ) -> dict[str, int]:
+            return {f"{prefix}_word_{index}": word for index, word in enumerate(words)}
+
+        deferred_offsets = (
+            deferred.first_initial_offset or 0,
+            deferred.last_initial_offset or 0,
+            deferred.last_final_offset or 0,
+        )
+        marker: dict[str, object] = {
+            "receipt_schema_version": 1,
+            "request_phase": self.phase,
+            "request_sequence": self._handle[0],
+            "request_token": self._handle[1],
+            "finalized": True,
+            "diagnostic_only": True,
+            "rank_agreed": True,
+            "arm_code": self.selectors.arm_code,
+            "canonical_arm": self.selectors.canonical,
+            "packed_enabled": self.selectors.packed,
+            "kda_enabled": self.selectors.kda,
+            "deferred_enabled": self.selectors.deferred,
+            "native_triplet_enabled": True,
+            "tail_overlap_enabled": True,
+            "expected_sparse_layers": _PACKED_FRONT_EXPECTED_LAYERS,
+            "expected_kda_layers": _KDA_EXPECTED_LAYERS,
+            "expected_deferred_roots_per_round": _DEFERRED_EXPECTED_ROOTS,
+            "projected_kv_cache_max_tokens": _PROJECTED_KV_CACHE_MAX_TOKENS,
+            **digest_fields("selector_digest", self.selector_digest),
+            **digest_fields(
+                "launch_contract_digest",
+                self.launch_contract_digest,
+            ),
+            **digest_fields("setup_digest", self.setup_digest),
+            **digest_fields("source_digest", self.api.source_digest),
+            **digest_fields("exo_source_digest", self.exo_source_digest),
+            **digest_fields("native_lib_digest", self.native_api.lib_digest),
+            **{name: counters[name] for name in _PACKED_FRONT_COUNTER_FIELDS},
+            "prefill_width1_chunks": prefill_width1,
+            "prefill_width3_chunks": prefill_width3,
+            "prefill_noncontract_chunks": prefill_noncontract,
+            "target_width1_rounds": tail_rounds,
+            "speculative_full_width_rounds": full_rounds,
+            "proposed_tokens": telemetry.drafted_tokens,
+            "accepted_tokens": telemetry.accepted_tokens,
+            "emitted_tokens": telemetry.committed_tokens,
+            "visible_output_tokens": self._visible_output_tokens,
+            "decode_begin_cache_offset": self._decode_begin_cache_offset,
+            "fallback_rounds": 0,
+            "error_rounds": 0,
+            "receipt_poisoned": False,
+            "stale_events": 0,
+            "duplicate_events": 0,
+            "deferred_validated_rounds": deferred.validated_rounds,
+            "deferred_materialized_rounds": deferred.materialized_rounds,
+            "deferred_validated_roots": deferred.validated_roots,
+            "deferred_submitted_roots": deferred.submitted_roots,
+            "deferred_first_initial_offset": deferred_offsets[0],
+            "deferred_last_initial_offset": deferred_offsets[1],
+            "deferred_last_final_offset": deferred_offsets[2],
+            "tail_prelaunch_submitted": self._tail_prelaunch_submitted,
+            "tail_prelaunch_used": self._tail_prelaunch_used,
+            "tail_prelaunch_discarded": self._tail_prelaunch_discarded,
+            "native_q3_total": native_delta[0],
+            "native_q3_n4480": native_delta[1],
+            "native_q3_n6144": native_delta[2],
+            "native_q3_n10624": native_delta[3],
+            "native_q3_other": native_other,
+            **digest_fields("schedule_digest", self._schedule_digest.words()),
+            **digest_fields("proposal_digest", self._proposal_digest.words()),
+            **digest_fields("acceptance_digest", self._acceptance_digest.words()),
+            **digest_fields(
+                "committed_output_digest",
+                self._committed_output_digest.words(),
+            ),
+            **digest_fields(
+                "visible_output_digest",
+                self._visible_output_digest.words(),
+            ),
+            **digest_fields("cache_digest", self._cache_digest.words()),
+            **digest_fields("causal_digest", self._causal_digest.words()),
+        }
+        if any(type(value) not in {bool, int} for value in marker.values()):
+            raise TypeError("W3 composition marker must contain numeric scalars")
+        return marker
+
+    def finish(
+        self,
+        runtime: KimiK3DSparkRequestRuntime,
+        telemetry: "_PromptLookupTelemetry",
+    ) -> K3W3CompositionReceipt:
+        if not self.enabled or self.api is None or self._handle is None:
+            raise RuntimeError("packed-front receipt finish state is invalid")
+
+        def finish_local() -> str:
+            assert self.api is not None
+            assert self._handle is not None
+            self._assert_runtime_identity()
+            raw = self.api.finish(*self._handle, self.model)
+            if not isinstance(raw, dict):
+                raise TypeError("MLX-LM packed-front receipt must be a mapping")
+            typed_raw: dict[str, object] = {}
+            for name, value in cast(dict[object, object], raw).items():
+                if type(name) is not str:
+                    raise TypeError("MLX-LM packed-front receipt keys must be strings")
+                typed_raw[name] = value
+            marker = self._validated_marker(typed_raw, telemetry, runtime)
+            return _canonical_numeric_json(marker)
+
+        agreed_marker = runtime.agree_text("packed-front receipt", finish_local)
+        marker_payload = _parse_canonical_numeric_json(agreed_marker)
+        receipt = K3W3CompositionReceipt.model_validate(
+            {
+                "schema": _PACKED_FRONT_RECEIPT_SCHEMA,
+                **marker_payload,
+            }
+        )
+        if receipt.model_dump(exclude={"receipt_schema"}) != marker_payload:
+            raise ValueError("packed-front receipt marker changed during validation")
+        self._handle = None
+        runtime.attach_composition_receipt_sink(None)
+        self._runtime = None
+        self._receipt = receipt
+        self._marker = agreed_marker
+        return receipt
+
+    def verify_marker_publication(self) -> None:
+        if self._receipt is None or self._marker is None or self._published:
+            raise RuntimeError("packed-front receipt marker state is invalid")
+        self._assert_runtime_identity()
+
+    def emit_marker(self, *, rank_zero: bool) -> None:
+        self.verify_marker_publication()
+        if rank_zero:
+            logger.info(f"K3_W3_COMPOSITION_RECEIPT {self._marker}")
+        logger.complete()
+
+    def mark_marker_published(self) -> None:
+        if self._receipt is None or self._marker is None or self._published:
+            raise RuntimeError("packed-front receipt marker state is invalid")
+        _record_composition_receipt_publication(
+            self.phase,
+            self._phase_identity(),
+        )
+        self._published = True
+        self._close_native_fd()
+
+    def abort(self) -> None:
+        handle = self._handle
+        self._handle = None
+        runtime = self._runtime
+        self._runtime = None
+        if runtime is not None:
+            with contextlib.suppress(Exception):
+                runtime.attach_composition_receipt_sink(None)
+        _release_composition_receipt_phase(self.phase)
+        self._close_native_fd()
+        if handle is None or self.api is None:
+            return
+        # The pinned MLX-LM abort clears its context in a finally block.
+        # Generator teardown has no later target collective to protect.
+        with contextlib.suppress(Exception):
+            self.api.abort(*handle)
+
+
+def _publish_composition_receipt(
+    runtime: KimiK3DSparkRequestRuntime,
+    receipt: _PackedFrontReceiptRequest,
+) -> None:
+    """Rank-agree every external marker and lifecycle side effect in order."""
+
+    runtime.agree_local_side_effect(
+        "W3 composition marker prepublication verification",
+        receipt.verify_marker_publication,
+    )
+    runtime.agree_local_side_effect(
+        "W3 composition marker publication",
+        lambda: receipt.emit_marker(rank_zero=runtime.collective.rank == 0),
+    )
+    runtime.agree_local_side_effect(
+        "W3 composition marker lifecycle completion",
+        receipt.mark_marker_published,
+    )
 
 
 _DSPARK_ORDINARY_AFTER_CONTEXT_ENV = "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT"
@@ -1024,6 +3232,9 @@ def warmup_inference(
 
     tokens_generated = 0
     final_stats: GenerationStats | None = None
+    composition_warmup_requested = (
+        os.environ.get(_PACKED_FRONT_DIAGNOSTIC_ENV, "0") == "1"
+    )
 
     mx_barrier(group)
 
@@ -1040,6 +3251,7 @@ def warmup_inference(
         group=group,
         dspark=dspark,
         width4_receipt_scope="warmup",
+        _packed_front_receipt_phase="engine_startup",
     ):
         tokens_generated += 1
         if response.stats is not None:
@@ -1096,6 +3308,17 @@ def warmup_inference(
                 )
         else:
             counters = (tokens_generated, 0)
+        if composition_warmup_requested:
+            receipt = (
+                None if final_stats is None else final_stats.k3_w3_composition_receipt
+            )
+            if (
+                receipt is None
+                or receipt.request_phase != _PACKED_FRONT_PHASE_ENGINE_STARTUP
+            ):
+                raise RuntimeError(
+                    "W3 composition warmup has no finalized startup receipt"
+                )
         elapsed = max(time.monotonic() - t, 0.001)
         cadence = min(math.ceil(tokens_generated / elapsed), 100)
         return cadence, counters
@@ -1108,6 +3331,14 @@ def warmup_inference(
     )
 
     mx_barrier(group)
+
+    if composition_warmup_requested:
+        rank_agreed_local_stage(
+            "W3 composition startup lifecycle completion",
+            group,
+            _complete_composition_startup_after_warmup,
+            lambda _completed: "completed",
+        )
 
     if dspark is not None and width4_receipt_log_enabled():
         post_warmup_reset = rank_agreed_local_stage(
@@ -1639,10 +3870,18 @@ def _dspark_mlx_responses(
             max_tokens=max_tokens,
             eos_token_ids=eos_token_ids,
             force_ordinary=force_ordinary,
-            round_observer=telemetry.observe_dspark_round,
+            round_observer=lambda stats: telemetry.observe_dspark_round(
+                stats,
+                target_cache_tokens=runtime.target_cache_offset,
+            ),
         ),
         start=1,
     ):
+        if telemetry.composition_receipt is not None:
+            telemetry.composition_receipt.observe_output_token(
+                decoded.token,
+                from_draft=decoded.from_draft,
+            )
 
         def render_token(decoded: object = decoded) -> str:
             decoded = cast(DSparkDecodedToken, decoded)
@@ -1731,7 +3970,7 @@ def extract_top_logprobs(
     return selected_logprob, top_logprob_items
 
 
-def mlx_generate(
+def _mlx_generate_impl(
     model: Model,
     tokenizer: TokenizerWrapper,
     task: TextGenerationTaskParams,
@@ -1745,6 +3984,7 @@ def mlx_generate(
     dspark: LoadedKimiK3DSpark | None = None,
     width4_receipt_scope: Literal["request", "warmup"] = "request",
     width4_receipt_claim: Width4RequestReceiptClaim | None = None,
+    packed_front_receipt: _PackedFrontReceiptRequest | None = None,
 ) -> Generator[GenerationResponse]:
     if width4_receipt_scope not in {"request", "warmup"}:
         raise ValueError(f"invalid width-four receipt scope: {width4_receipt_scope}")
@@ -1759,6 +3999,14 @@ def mlx_generate(
         raise ValueError("width-four request-admission claim reached disabled receipt")
     if receipt_enabled and dspark is None:
         raise ValueError("enabled width-four receipt requires Kimi K3 DSpark")
+    if packed_front_receipt is None:
+        raise ValueError("packed-front receipt request context is missing")
+    if packed_front_receipt.enabled and (
+        task.use_prefix_cache or kv_prefix_cache is not None
+    ):
+        raise ValueError(
+            "packed-front diagnostic mode requires prefix caching to be disabled"
+        )
     dspark_setup: _DSparkRequestSetup | None = None
     if dspark is not None:
         # A prior uncertain target submission can leave this process's shared
@@ -1801,6 +4049,10 @@ def mlx_generate(
                 f"identity_sha256={selection.identity_sha256}"
             )
         is_pipeline = dspark_setup.is_pipeline
+        if packed_front_receipt.enabled and is_pipeline:
+            raise ValueError(
+                "W3 composition diagnostic requires non-pipeline DSpark TP"
+            )
         prompt_lookup_configuration = dspark_setup.prompt_lookup_configuration
         all_prompt_tokens = dspark_setup.all_prompt_tokens
         min_prefix_hit_length = 1000
@@ -1845,6 +4097,23 @@ def mlx_generate(
         if vision is not None:
             all_prompt_tokens = vision.prompt_tokens
         media_regions = vision.media_regions if vision else []
+
+    prompt_lookup_telemetry = _PromptLookupTelemetry()
+    if dspark_setup is not None:
+        (
+            prompt_lookup_telemetry.prefill_width1_chunks,
+            prompt_lookup_telemetry.prefill_width3_chunks,
+            prompt_lookup_telemetry.prefill_noncontract_chunks,
+        ) = _exact_prefill_chunk_geometry(
+            token_count=len(dspark_setup.all_prompt_tokens) - 1,
+            step_size=dspark_setup.prefill_step_size,
+        )
+        packed_front_receipt.begin(
+            dspark_setup.runtime,
+            dspark_setup.fingerprint,
+        )
+        if packed_front_receipt.enabled:
+            prompt_lookup_telemetry.composition_receipt = packed_front_receipt
 
     # Do not use the prefix cache if we are trying to do benchmarks.
     is_bench = task.bench
@@ -2079,7 +4348,6 @@ def mlx_generate(
         accumulated_text = ""
         generated_text_parts: list[str] = []
         generation_start_time = time.perf_counter()
-        prompt_lookup_telemetry = _PromptLookupTelemetry()
         logger.info("Starting decode")
         # Pipeline prefill and decode share one ordered P2P stream. A collective
         # here can race a sender whose final prefill frame was already received but
@@ -2087,6 +4355,12 @@ def mlx_generate(
         # drains that tail without changing JACCL operation classes.
         if not is_pipeline:
             mx_barrier(group)
+        if dspark_runtime is not None and packed_front_receipt.enabled:
+            assert dspark_setup is not None
+            packed_front_receipt.begin_decode(
+                dspark_runtime,
+                anchor_token=dspark_setup.anchor_token,
+            )
 
         prompt_lookup_kwargs = prompt_lookup_stream_kwargs(
             prompt_lookup_configuration,
@@ -2214,6 +4488,28 @@ def mlx_generate(
             finish_reason = cast(FinishReason | None, raw_finish_reason)
 
             is_done = finish_reason is not None
+            terminal_packed_front_receipt: K3W3CompositionReceipt | None = None
+            composition_terminal_barrier_complete = False
+            if is_done and packed_front_receipt.enabled:
+                if dspark_runtime is None:
+                    raise RuntimeError(
+                        "packed-front diagnostic request lost its DSpark runtime"
+                    )
+                dspark_runtime.agree_local_side_effect(
+                    "packed-front terminal decode close",
+                    decode_outputs.close,
+                )
+                if not is_pipeline:
+                    # Close the global native-counter interval only after the
+                    # terminal distributed boundary. The counters record branch
+                    # entry, but a positive receipt must still prove that no
+                    # later terminal error escaped the interval.
+                    mx_barrier(group)
+                    composition_terminal_barrier_complete = True
+                terminal_packed_front_receipt = packed_front_receipt.finish(
+                    dspark_runtime,
+                    prompt_lookup_telemetry,
+                )
 
             def build_public_response(
                 out: MlxGenerationResponse = out,
@@ -2223,6 +4519,8 @@ def mlx_generate(
                 text: str = text,
                 agreed_token: int = _agreed_token,
                 finish_reason: FinishReason | None = finish_reason,
+                terminal_packed_front_receipt: K3W3CompositionReceipt
+                | None = terminal_packed_front_receipt,
             ) -> GenerationResponse:
                 prompt_lookup_telemetry.observe_visible_token(
                     from_draft=bool(out.from_draft)
@@ -2233,7 +4531,13 @@ def mlx_generate(
                 if is_done:
                     # Resolve the terminal inner generator and its committed
                     # speculative telemetry before serializing public stats.
-                    decode_outputs.close()
+                    if packed_front_receipt.enabled:
+                        if terminal_packed_front_receipt is None:
+                            raise RuntimeError(
+                                "packed-front receipt was not finalized before stats"
+                            )
+                    else:
+                        decode_outputs.close()
                     decode_elapsed_seconds = time.perf_counter() - generation_start_time
                     effective_generation_tps = (
                         completion_tokens / decode_elapsed_seconds
@@ -2266,6 +4570,22 @@ def mlx_generate(
                             prompt_lookup_telemetry.fallback_rounds
                         ),
                         speculative_error_rounds=(prompt_lookup_telemetry.error_rounds),
+                        speculative_full_width_rounds=(
+                            prompt_lookup_telemetry.full_width_rounds
+                        ),
+                        target_width1_rounds=(
+                            prompt_lookup_telemetry.target_width1_rounds
+                        ),
+                        prefill_width1_chunks=(
+                            prompt_lookup_telemetry.prefill_width1_chunks
+                        ),
+                        prefill_width3_chunks=(
+                            prompt_lookup_telemetry.prefill_width3_chunks
+                        ),
+                        prefill_noncontract_chunks=(
+                            prompt_lookup_telemetry.prefill_noncontract_chunks
+                        ),
+                        k3_w3_composition_receipt=terminal_packed_front_receipt,
                     )
                     if not stop_matched and out.finish_reason not in get_args(
                         FinishReason
@@ -2354,7 +4674,12 @@ def mlx_generate(
                 else:
                     on_generation_token()
 
-            if is_done and dspark_runtime is not None and not is_pipeline:
+            if (
+                is_done
+                and dspark_runtime is not None
+                and not is_pipeline
+                and not composition_terminal_barrier_complete
+            ):
                 # Complete the distributed terminal boundary before yielding;
                 # a downstream parser may not resume this generator.
                 mx_barrier(group)
@@ -2426,9 +4751,61 @@ def mlx_generate(
                 # cannot race collection of its own evidence record.
                 logger.complete()
 
+            if is_done and packed_front_receipt.enabled:
+                assert dspark_runtime is not None
+                _publish_composition_receipt(
+                    dspark_runtime,
+                    packed_front_receipt,
+                )
+
             yield response
 
             if is_done:
                 if dspark_runtime is None and not is_pipeline:
                     mx_barrier(group)
                 break
+
+
+def mlx_generate(
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    task: TextGenerationTaskParams,
+    prompt: str,
+    kv_prefix_cache: KVPrefixCache | None,
+    group: mx.distributed.Group | None,
+    on_prefill_progress: Callable[[int, int], None] | None = None,
+    distributed_prompt_progress_callback: Callable[[], None] | None = None,
+    on_generation_token: Callable[[], None] | None = None,
+    vision_processor: VisionProcessor | None = None,
+    dspark: LoadedKimiK3DSpark | None = None,
+    width4_receipt_scope: Literal["request", "warmup"] = "request",
+    width4_receipt_claim: Width4RequestReceiptClaim | None = None,
+    *,
+    _packed_front_receipt_phase: Literal["engine_startup", "api"] = "api",
+) -> Generator[GenerationResponse]:
+    """Generate with an optional fail-closed request-scoped packed-front receipt."""
+
+    packed_front_receipt = _PackedFrontReceiptRequest.from_environment(
+        model,
+        dspark,
+        phase=_packed_front_receipt_phase,
+    )
+    try:
+        yield from _mlx_generate_impl(
+            model=model,
+            tokenizer=tokenizer,
+            task=task,
+            prompt=prompt,
+            kv_prefix_cache=kv_prefix_cache,
+            group=group,
+            on_prefill_progress=on_prefill_progress,
+            distributed_prompt_progress_callback=(distributed_prompt_progress_callback),
+            on_generation_token=on_generation_token,
+            vision_processor=vision_processor,
+            dspark=dspark,
+            width4_receipt_scope=width4_receipt_scope,
+            width4_receipt_claim=width4_receipt_claim,
+            packed_front_receipt=packed_front_receipt,
+        )
+    finally:
+        packed_front_receipt.abort()

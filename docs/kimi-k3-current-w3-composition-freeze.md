@@ -1,73 +1,130 @@
-# Kimi K3 current W3 composition freeze
+# Kimi K3 W3 composition diagnostic receipt freeze
 
-This worktree is an offline, default-off source and test composition. It does
-not promote a performance result and contains no new timing evidence.
+This worktree is an offline, default-off source-and-test freeze for the strict
+`kimi-k3-w3-composition-receipt/v1` diagnostic. It contains no live inference,
+host result, benchmark, or timing evidence. A positive receipt is diagnostic
+evidence only: it does not grant performance credit or promotion eligibility.
 
-## Lineage
+## Lineage and authenticated runtime
 
-- EXO control: `d30cc7b73460ff34d32545b5bc5118555c0716d5`
-- deferred-W3 EXO donor: `c9eb00ef7ddf128197cb0edb8a363a5819df7ded`
-  (replayed locally as `730bcd18`)
-- packed-current loader donor: `4e85055e382a1117fcb5131710308334eaf47eff`
-  (replayed locally as `067b29b0`)
-- composed EXO source/tests freeze: `0e5ab6d30e73ff8942c95178ad7b553c5aa12404`
-- combined MLX-LM HEAD: `72164e3521b8ee68d605963cfd3266a7341279e6`
+- EXO branch: `codex/exo-k3-w3-composition-receipt-v1`
+- frozen combined EXO parent: `893ed966ecc3260a238f42d65cacce7b660bfab6`
+- MLX-LM source commit: `400134d0dd53ffc8e80ca7ae78ab6ecc4687145a`
+- MLX-LM documentation HEAD: `4eee0a094555d5718d820ec63424c61ca9cfe201`
+- MLX-LM tree: `6dd753d318f2c12a5253ba2a1ded4a2658e10d04`
+- native counter implementation: `b2948c83ef59b28afb6c40dc0fb79abcc30ab491`
+- native counter documentation HEAD: `755fe61a66948c106d6eb230cf26c578ac9fc3c9`
 
-The loader authenticates the combined MLX-LM source inventory with these
-composition-critical digests:
+The loader and receipt require these exact source/image identities:
 
 - `models/kimi_k3.py`:
-  `c111751d37a030ec16852b88cb20fb3e2aea537ca458521367fbc5e68b6b110c`
+  `7aff86896e70baf2b986808341b5f292f8c8ecd55d17a9693813cbe25b356c97`
 - `kimi_k3_packed_moe_front.py`:
-  `9dd1d75ca7022cc837165f9eae670df4df36263ef7011ccd989c9f015db9a159`
+  `9be2130bc3afd754d4369882aea571bdc546d62ca1d67b4ba7658641f42e5510`
 - `kimi_k3_w3_prework.py`:
   `f8fcba947dc0e52c335522bd0d152b57679818a64db9edc6e6ba8f58834cb254`
-- EXO loader bridge:
-  `492a3a5f650b02fa668997bc05d23075e9af0e4a8eecb9068decef2c633da072`
+- EXO rank-local loader bridge:
+  `f7059a2d45cffedf7614174e44a326f4f14372951231eac4159094eea8b3e67c`
+- sealed counter-bearing `libmlx.dylib`:
+  `91f742bfa20f3559c2fb85e6b3b5aad7a5b6264e1158d2cfc1a089a35d1b18cd`
 
-The remaining loader and checkpoint pins are inherited unchanged from the EXO
-control, including width four, tail overlap, DSpark checkpoints, native kernels,
-auxiliary modules, and stale-source rejection.
+The native image is opened without following symlinks, authenticated from a
+retained file descriptor, required to be the already-loaded MLX image, and
+rechecked at begin, finish, and publication. EXO and MLX source manifests and
+the rank-common launch contract are independently hashed and rechecked at the
+same boundaries. The startup and API phases must retain the same native inode
+identity as well as the same content digest.
 
-## Selector contract
+## Preregistered two-arm contract
 
-All candidate selectors remain globally default-off. The composed WIDTH3 path
-uses the existing strict deferred pair plus these MLX-LM selectors:
+The protected diagnostic admits exactly two arms:
 
-- `MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT`
-- `MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3`
-- `MLX_LM_KIMI_K3_W3_PREWORK_HISTORY`
-- `MLX_METAL_K3_AFFINE8_Q3_TRIPLET`
+| Arm | Packed W3 | KDA prework | Deferred W3 | Native affine8 Q3 | Tail overlap |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| control | 0 | 0 | 0 | 1 | 1 |
+| candidate | 1 | 1 | 1 | 1 | 1 |
 
-The two authoritative-packed selectors must be `0/0` or `1/1`. Packed WIDTH3
-requires the independent native Q3 triplet selector to be `1`; deferred-only
-and KDA-only configurations remain valid with native Q3 set to `0`. The
-intended controlled A/B contract keeps native Q3 at `1` on both arms while the
-deferred, packed, and KDA composition bits change together. Width-four receipt
-mode remains mutually exclusive with all W3 candidate selectors.
+Native affine8 Q3 dispatch receipt collection is also `1` on both arms. The
+receipt rejects every mixed subset and any native-Q3/tail-overlap drift. This
+is an anti-multiple-comparisons boundary, not a limitation of the underlying
+default-off source: deferred-only, KDA-only, and other native-zero compositions
+remain valid for source/unit testing outside this protected receipt.
 
-Deferred, packed, KDA, and native states are bound into the rank verification
-plan and request/setup fingerprints even when their values are zero. Native Q3
-is also explicit in the checkpoint/source and loaded-model identities, so a
-rank or setup mismatch fails before target graph construction or model calls.
+The launch digest covers an explicit allowlist of rank-common behavioral
+selectors and rejects unknown experiment keys in the protected namespaces.
+Rank-local checkpoint/loader paths, coordinator/ring addresses, roles, secrets,
+and credentials are excluded; deployment attestation must bind those
+separately. `MLX_LM_KIMI_K3_PROJECTED_KV_CACHE_MAX_TOKENS` is required to be
+the canonical decimal `32768`.
 
-## Local verification boundary
+## Receipt proof boundary
 
-The sealed Python 3.13/Metal-capable local environment first ran the focused
-loader, loader bridge, Kimi K3 DSpark, deferred/tail, and greedy integration
-suites:
+Receipt admission is process-local, locked, and one-shot: a successful startup
+receipt must pass the outer rank-agreed warmup validation before one API phase
+is allowed. Failed, aborted, duplicate, concurrent, API-before-startup, and
+identity-mismatched phases fail closed. Marker publication and phase completion
+are rank-agreed side effects. The terminal decode close and Metal barrier occur
+before MLX/native final snapshots.
+
+The final numeric-only marker binds:
+
+- exact MLX raw schema and strict scalar types for 92 sparse and 69 KDA layers;
+- selector, request, setup, launch, EXO source, MLX source, and native identity;
+- phase-local affine8-Q3 total/N4480/N6144/N10624 dispatch deltas;
+- proposal, acceptance, target-committed output, visible output, and cache
+  schedule digests;
+- rank-agreed decode-start cache/anchor state, per-round cache continuity, and
+  the fixed projected-cache capacity;
+- 12 ordered, distinct deferred roots per eligible full round, exact initial
+  and final offsets, and materialization attestation;
+- causal tail-prelaunch submission/use/discard adjacency, context offsets, and
+  one-way anchor fingerprints;
+- fallback, poison, stale, invalidation, duplicate, abort, and cleanup state.
+
+Raw prompt text and raw token IDs are never serialized. Token values are hashed
+immediately into domain-separated request-local chains; only counts and digest
+words enter the marker. The validator derives its algebra from observed full,
+tail, and prefill geometry. It does not hardcode the canary schedule. The
+focused fixture alone checks the canonical 45-full-round totals of 4,140 packed
+W3 hits, 3,105 KDA successes, and 540 deferred roots.
+
+Default-off requests retain no receipt object or marker field. The optional API
+field is omitted when `None`; causal observer calls, receipt-only distinct-root
+validation, and per-root receipt callbacks are gated before the hot loop. This
+source freeze nevertheless makes no byte-identical timing claim. Any future
+performance decision requires telemetry-off A/B/A on the same source.
+
+## External controller obligations
+
+The receipt does not replace deployment controls. A protected run must also:
+
+1. pin the exact expected launch-contract SHA and all rank-specific deployment,
+   topology, core, metallib, JACCL, checkpoint, and process identities;
+2. keep `EXO_NO_BATCH=1` and a sequential process request ledger so unrelated
+   Q3 work cannot enter the process-global reset/snapshot interval;
+3. retain both rank logs, the completed response/lifecycle result, and the
+   exact agreed marker bytes; and
+4. reject stray/incomplete markers and any marker that lacks the matching
+   successful startup-to-API lifecycle.
+
+The Pydantic schema validates structure; it is not a cryptographic
+authentication mechanism for a hand-edited marker. The controller must bind
+the original bilateral evidence bytes.
+
+## Offline verification
+
+The final source was formatted and linted with Ruff, then verified in the
+headless Python 3.13 environment without model loading or Metal execution:
 
 ```text
-303 passed, 9 warnings
+13 passed  # hermetic composition receipt scenarios
+234 passed # existing DSpark, tail-overlap, and loader boundaries
+18 passed  # chat-stream and Responses API serialization boundaries
 ```
 
-The broader `scripts/kimi_k3_tp2/tests`, `src/exo/download/tests`, and
-`src/exo/worker/tests/unittests/test_mlx` boundary then completed with:
-
-```text
-651 passed, 187 deselected, 9 warnings
-```
-
-The warnings are pre-existing test-double cleanup warnings from scenario round
-engines without a `close` method. No network, host, service, live inference,
-benchmark, or timing command was run.
+The receipt scenarios cover default-off/orphan flags, exact selector admission,
+startup/API lifecycle and concurrency, strict MLX schema types, q1/q3 and
+noncontract prefill, control/candidate/subset rejection, canonical schedule
+algebra, rank mismatch, abort/early close, poison/fallback, native counter and
+image identity, begin/finish/publication mutation, root/cache/tail/anchor event
+ordering, terminal visible-token binding, and projected-cache overflow.

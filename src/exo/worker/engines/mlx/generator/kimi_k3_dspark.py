@@ -69,9 +69,7 @@ MLX_DSPARK_PROPOSER_ENV = "MLX_LM_KIMI_K3_DSPARK_PROPOSER"
 MLX_REPLAYSSM_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
 MLX_DSPARK_SEGMENTED_SDPA_ENV = "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"
 MLX_ASYNC_DECODE_WIDTH3_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_WIDTH3"
-MLX_AUTHORITATIVE_PACKED_MOE_FRONT_ENV = (
-    "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT"
-)
+MLX_AUTHORITATIVE_PACKED_MOE_FRONT_ENV = "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT"
 MLX_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV = (
     "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3"
 )
@@ -778,8 +776,7 @@ def kimi_k3_dspark_config(
         authoritative_packed_width3 or w3_prework_history
     ) and verify_width != DSPARK_CONSERVATIVE_VERIFY_WIDTH:
         raise DSparkConfigurationError(
-            "Kimi K3 packed/KDA W3 selectors require "
-            f"{DSPARK_VERIFY_WIDTH_ENV}=3"
+            f"Kimi K3 packed/KDA W3 selectors require {DSPARK_VERIFY_WIDTH_ENV}=3"
         )
     if authoritative_packed_width3 and not native_packed_q3:
         raise DSparkConfigurationError(
@@ -1088,6 +1085,22 @@ class DeferredAsyncWidth3Attestation:
     first_initial_offset: int | None
     last_initial_offset: int | None
     last_final_offset: int | None
+
+
+class K3W3CompositionCausalSink(Protocol):
+    """Privacy-safe request sink for ordered W3 diagnostic events.
+
+    Implementations must not raise. The inference engine deliberately treats
+    this as an observer and the terminal receipt fails closed when an expected
+    event is absent.
+    """
+
+    def observe_causal_event(
+        self,
+        round_index: int,
+        event: str,
+        values: tuple[int, ...] = (),
+    ) -> None: ...
 
 
 def _packed_operation_tag(name: str) -> int:
@@ -1795,6 +1808,7 @@ class KimiK3DSparkRoundEngine:
     terminal_token_ids: tuple[int, ...] = ()
     telemetry_sink: Callable[[DSparkRoundTelemetry], None] | None = None
     confidence_recorder: DSparkConfidenceRecorder | None = None
+    composition_receipt_sink: K3W3CompositionCausalSink | None = None
     clock: Callable[[], float] = time.perf_counter
     _materialization_poison: _DSparkMaterializationPoison = field(
         default_factory=_DSparkMaterializationPoison,
@@ -1866,6 +1880,26 @@ class KimiK3DSparkRoundEngine:
                 self._confidence_observation = None
                 self._capture_round_started = None
 
+    def _observe_causal_event(
+        self,
+        event: str,
+        values: tuple[int, ...] = (),
+        *,
+        round_index: int | None = None,
+    ) -> None:
+        """Record an ordered receipt event without entering control flow."""
+
+        if self.composition_receipt_sink is None:
+            return
+        try:
+            self.composition_receipt_sink.observe_causal_event(
+                self._round_index if round_index is None else round_index,
+                event,
+                values,
+            )
+        except Exception:
+            _log_nonfatal_warning("Kimi K3 W3 composition receipt sink failed")
+
     def _begin_capture_round(self) -> None:
         self._confidence_observation = None
         self._capture_round_started = (
@@ -1932,6 +1966,9 @@ class KimiK3DSparkRoundEngine:
     def _discard_prelaunched(
         self,
         prelaunched: _PrelaunchedDraftRound | None = None,
+        *,
+        receipt_round_index: int | None = None,
+        receipt_reason: int = 1,
     ) -> None:
         """Cancel a prelaunched draft locally; already-enqueued GPU work drains.
 
@@ -1944,6 +1981,16 @@ class KimiK3DSparkRoundEngine:
             self._prelaunched = None
         if prelaunched is None:
             return
+        if self.composition_receipt_sink is not None:
+            self._observe_causal_event(
+                "tail_prelaunch_discarded",
+                (
+                    receipt_reason,
+                    prelaunched.context_offset,
+                    prelaunched.anchor_token,
+                ),
+                round_index=receipt_round_index,
+            )
         try:
             prelaunched.prepared.cancel()
         except Exception:
@@ -1959,6 +2006,11 @@ class KimiK3DSparkRoundEngine:
             # rank-agreed, so every rank observes the same mismatch.
             self._discard_prelaunched(prelaunched)
             return None
+        if self.composition_receipt_sink is not None:
+            self._observe_causal_event(
+                "tail_prelaunch_used",
+                (prelaunched.context_offset, anchor_token),
+            )
         return prelaunched
 
     def _raise_if_collective_poisoned(self) -> None:
@@ -2018,7 +2070,10 @@ class KimiK3DSparkRoundEngine:
     def close(self) -> None:
         """Discard request-local lookahead when its token stream is abandoned."""
 
-        self._discard_prelaunched()
+        self._discard_prelaunched(
+            receipt_round_index=max(0, self._round_index - 1),
+            receipt_reason=2,
+        )
 
     def _cancel_before_fallback(
         self,
@@ -2103,6 +2158,8 @@ class KimiK3DSparkRoundEngine:
                 "Kimi K3 DSpark ordinary fallback anchor disagreed across ranks; "
                 "no target TP graph was built"
             ) from None
+        if self.composition_receipt_sink is not None:
+            self._observe_causal_event("ordinary_anchor_agreed", (agreed_anchor,))
 
         local_plan: OrdinaryDecodePlan | None = None
         local_preflight_error: str | None = None
@@ -2276,8 +2333,10 @@ class KimiK3DSparkRoundEngine:
             raise DSparkDistributedStateError(
                 "Kimi K3 DSpark ordinary fallback token disagreed across ranks"
             ) from None
-
         emitted_tokens = (agreed_token,)
+        if self.composition_receipt_sink is not None:
+            self._observe_causal_event("committed_tokens", emitted_tokens)
+            self._observe_causal_event("ordinary_target_commit", (1,))
 
         telemetry = DSparkRoundTelemetry(
             round_index=self._round_index,
@@ -2689,6 +2748,14 @@ class KimiK3DSparkRoundEngine:
                 f"{_token_sequence_sha256(agreed_block[1:], domain=b'exo-k3-dspark-authoritative-proposal/v1\0')}"
             )
 
+        assert agreed_context_offset is not None
+        if self.composition_receipt_sink is not None:
+            self._observe_causal_event(
+                "proposal_context_agreed",
+                (agreed_context_offset,),
+            )
+            self._observe_causal_event("proposal_agreed", tuple(agreed_block))
+
         target_start = self.clock()
         prepared_target: PreparedTargetVerification | None = None
         target_error: str | None = None
@@ -2785,6 +2852,9 @@ class KimiK3DSparkRoundEngine:
                 error=target_error
                 or "DSpark target graph build disagreed across ranks",
             )
+
+        if self.composition_receipt_sink is not None:
+            self._observe_causal_event("target_graph_agreed", (gamma,))
 
         target_round: TargetRound | None = None
         posterior: TargetPosterior | None = None
@@ -2889,6 +2959,8 @@ class KimiK3DSparkRoundEngine:
             )
 
         accepted, next_anchor_token = agreed_acceptance
+        if self.composition_receipt_sink is not None:
+            self._observe_causal_event("acceptance_agreed", (accepted,))
         assert target_round is not None
         assert posterior is not None
         if local_confidence is not None:
@@ -2903,6 +2975,8 @@ class KimiK3DSparkRoundEngine:
             *agreed_block[1 : accepted + 1],
             next_anchor_token,
         )
+        if self.composition_receipt_sink is not None:
+            self._observe_causal_event("committed_tokens", tuple(emitted_tokens))
 
         # Before the CPU-bound target commit, optionally commit the draft
         # context and submit the next round's proposal graph so the GPU is
@@ -2935,6 +3009,12 @@ class KimiK3DSparkRoundEngine:
             prelaunch_ms = (self.clock() - prelaunch_started) * 1000.0
             if tail is not None:
                 collective_ms += tail.collective_ms
+                if tail.submitted and self.composition_receipt_sink is not None:
+                    assert tail.context_offset is not None
+                    self._observe_causal_event(
+                        "tail_prelaunch_submitted",
+                        (tail.context_offset, tail.next_anchor_token),
+                    )
 
         # Acceptance is collective before either state commit.  The target is
         # authoritative; its consumed input count is anchor + accepted drafts.
@@ -2983,6 +3063,9 @@ class KimiK3DSparkRoundEngine:
                 "Kimi K3 DSpark target commit "
                 f"{outcome}; target state cannot be recovered safely"
             ) from None
+
+        if self.composition_receipt_sink is not None:
+            self._observe_causal_event("target_commit", (accepted + 1,))
 
         draft_commit_error: str | None = None
         draft_commit_ms = 0.0
@@ -4522,6 +4605,7 @@ def _validated_deferred_async_decode_states(
     *,
     expected_width: int,
     enabled: bool,
+    require_distinct: bool = False,
 ) -> tuple[object, ...]:
     """Validate immutable width-three roots without evaluating their graphs."""
 
@@ -4563,17 +4647,22 @@ def _validated_deferred_async_decode_states(
                 f"[1, {expected_width}, {KIMI_K3_TARGET_HIDDEN_SIZE}]"
             )
         roots.append(root)
+    if require_distinct and len({id(root) for root in roots}) != len(roots):
+        raise ValueError("Kimi K3 deferred async boundaries must be 12 distinct roots")
     return tuple(roots)
 
 
 def _submit_deferred_async_decode_states(
     roots: tuple[object, ...],
     async_evaluate: Callable[..., None],
+    on_root_submitted: Callable[[int, int], None] | None = None,
 ) -> None:
     """Submit one post-agreement boundary root per asynchronous evaluation."""
 
-    for root in roots:
+    for ordinal, root in enumerate(roots):
         async_evaluate(root)
+        if on_root_submitted is not None:
+            on_root_submitted(ordinal, len(roots))
 
 
 def _validate_target_logits(logits: object, *, expected_width: int) -> None:
@@ -4702,6 +4791,7 @@ class _BuiltKimiK3TargetForward:
         evaluate: Callable[..., None],
         deferred_async_decode_states: tuple[object, ...] = (),
         async_evaluate: Callable[..., None] = mx.async_eval,
+        on_deferred_root_submitted: Callable[[int, int], None] | None = None,
         on_deferred_materialized: Callable[[int, int, int], None] | None = None,
     ):
         self.forward = forward
@@ -4713,6 +4803,7 @@ class _BuiltKimiK3TargetForward:
         self._evaluate = evaluate
         self._deferred_async_decode_states = deferred_async_decode_states
         self._async_evaluate = async_evaluate
+        self._on_deferred_root_submitted = on_deferred_root_submitted
         self._on_deferred_materialized = on_deferred_materialized
         self._materialized = False
 
@@ -4729,6 +4820,7 @@ class _BuiltKimiK3TargetForward:
             _submit_deferred_async_decode_states(
                 self._deferred_async_decode_states,
                 self._async_evaluate,
+                self._on_deferred_root_submitted,
             )
             self._evaluate(
                 self.forward.logits,
@@ -4870,6 +4962,7 @@ class _BuiltKimiK3CompactTargetPosterior:
         evaluate: Callable[..., None],
         deferred_async_decode_states: tuple[object, ...] = (),
         async_evaluate: Callable[..., None] = mx.async_eval,
+        on_deferred_root_submitted: Callable[[int, int], None] | None = None,
         on_deferred_materialized: Callable[[int, int, int], None] | None = None,
     ):
         self._tokens = tokens
@@ -4880,6 +4973,7 @@ class _BuiltKimiK3CompactTargetPosterior:
         self._evaluate = evaluate
         self._deferred_async_decode_states = deferred_async_decode_states
         self._async_evaluate = async_evaluate
+        self._on_deferred_root_submitted = on_deferred_root_submitted
         self._on_deferred_materialized = on_deferred_materialized
         self._materialized = False
 
@@ -4892,6 +4986,7 @@ class _BuiltKimiK3CompactTargetPosterior:
             _submit_deferred_async_decode_states(
                 self._deferred_async_decode_states,
                 self._async_evaluate,
+                self._on_deferred_root_submitted,
             )
             self._evaluate(
                 self._tokens,
@@ -5008,6 +5103,11 @@ class KimiK3DSparkRequestRuntime:
     _deferred_first_initial_offset: int | None = field(default=None, init=False)
     _deferred_last_initial_offset: int | None = field(default=None, init=False)
     _deferred_last_final_offset: int | None = field(default=None, init=False)
+    _composition_receipt_sink: K3W3CompositionCausalSink | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.loaded.assert_healthy()
@@ -5115,6 +5215,12 @@ class KimiK3DSparkRequestRuntime:
             return
         self._deferred_validated_rounds += 1
         self._deferred_validated_roots += root_count
+        if self._composition_receipt_sink is not None:
+            self._composition_receipt_sink.observe_causal_event(
+                self._deferred_validated_rounds - 1,
+                "deferred_roots_validated",
+                (root_count,),
+            )
 
     def _record_deferred_async_materialized(
         self,
@@ -5130,6 +5236,42 @@ class KimiK3DSparkRequestRuntime:
             self._deferred_first_initial_offset = initial_offset
         self._deferred_last_initial_offset = initial_offset
         self._deferred_last_final_offset = final_offset
+        if self._composition_receipt_sink is not None:
+            self._composition_receipt_sink.observe_causal_event(
+                self._deferred_materialized_rounds - 1,
+                "deferred_roots_submitted",
+                (initial_offset, final_offset, root_count),
+            )
+
+    def _record_deferred_root_submitted(
+        self,
+        ordinal: int,
+        root_count: int,
+    ) -> None:
+        """Record each actual async root submission in tuple order."""
+
+        if self._composition_receipt_sink is not None:
+            self._composition_receipt_sink.observe_causal_event(
+                self._deferred_materialized_rounds,
+                "deferred_root_submitted",
+                (ordinal, root_count),
+            )
+
+    def attach_composition_receipt_sink(
+        self,
+        sink: K3W3CompositionCausalSink | None,
+    ) -> None:
+        """Attach or clear the one request-local diagnostic observer."""
+
+        if sink is not None and self._composition_receipt_sink is not None:
+            raise RuntimeError("Kimi K3 composition receipt sink is already attached")
+        self._composition_receipt_sink = sink
+
+    @property
+    def target_cache_offset(self) -> int:
+        """Expose only the numeric cache boundary for receipt hashing."""
+
+        return _target_cache_offset(self.target_cache)
 
     @property
     def deferred_async_width3_attestation(self) -> DeferredAsyncWidth3Attestation:
@@ -5460,6 +5602,7 @@ class KimiK3DSparkRequestRuntime:
             forward,
             expected_width=width,
             enabled=defer_async_decode_boundaries,
+            require_distinct=self._composition_receipt_sink is not None,
         )
         _validate_target_logits(logits, expected_width=width)
         self._record_deferred_async_build(
@@ -5475,6 +5618,11 @@ class KimiK3DSparkRequestRuntime:
             evaluate=self.evaluate,
             deferred_async_decode_states=deferred_async_decode_states,
             async_evaluate=self.async_evaluate,
+            on_deferred_root_submitted=(
+                self._record_deferred_root_submitted
+                if self._composition_receipt_sink is not None
+                else None
+            ),
             on_deferred_materialized=self._record_deferred_async_materialized,
         )
 
@@ -5821,6 +5969,7 @@ class KimiK3DSparkRequestRuntime:
                 forward,
                 expected_width=len(proposal_block),
                 enabled=plan.deferred_async_width3,
+                require_distinct=self._composition_receipt_sink is not None,
             )
             tokens = _validate_batched_greedy_tokens(
                 forward.tokens,
@@ -5838,6 +5987,11 @@ class KimiK3DSparkRequestRuntime:
                 evaluate=self.evaluate,
                 deferred_async_decode_states=deferred_async_decode_states,
                 async_evaluate=self.async_evaluate,
+                on_deferred_root_submitted=(
+                    self._record_deferred_root_submitted
+                    if self._composition_receipt_sink is not None
+                    else None
+                ),
                 on_deferred_materialized=self._record_deferred_async_materialized,
             )
         forward = self._build_forward_with_taps(
@@ -5979,6 +6133,7 @@ class KimiK3DSparkRequestRuntime:
             terminal_token_ids=self.terminal_token_ids,
             telemetry_sink=telemetry_sink,
             confidence_recorder=recorder,
+            composition_receipt_sink=self._composition_receipt_sink,
             clock=self.clock,
             _materialization_poison=self.loaded.materialization_poison,
         )

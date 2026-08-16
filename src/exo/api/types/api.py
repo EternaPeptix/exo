@@ -3,7 +3,7 @@ from collections.abc import Generator
 from typing import Annotated, Any, Literal, get_args
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
 from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.types.common import CommandId, NodeId
@@ -160,6 +160,150 @@ class ChatCompletionResponse(BaseModel):
     service_tier: str | None = None
 
 
+class K3W3CompositionReceipt(BaseModel):
+    """Numeric-only causal receipt for one diagnostic Kimi K3 W3 request."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        frozen=True,
+        serialize_by_alias=True,
+    )
+
+    receipt_schema: Literal["kimi-k3-w3-composition-receipt/v1"] = Field(alias="schema")
+    receipt_schema_version: Literal[1]
+    request_phase: Literal[1, 2]
+    request_sequence: int
+    request_token: int
+    finalized: Literal[True]
+    diagnostic_only: Literal[True]
+    rank_agreed: Literal[True]
+    arm_code: int
+    canonical_arm: bool
+    packed_enabled: bool
+    kda_enabled: bool
+    deferred_enabled: bool
+    native_triplet_enabled: Literal[True]
+    tail_overlap_enabled: Literal[True]
+    expected_sparse_layers: Literal[92]
+    expected_kda_layers: Literal[69]
+    expected_deferred_roots_per_round: Literal[12]
+    projected_kv_cache_max_tokens: Literal[32768]
+    selector_digest_word_0: int
+    selector_digest_word_1: int
+    selector_digest_word_2: int
+    selector_digest_word_3: int
+    launch_contract_digest_word_0: int
+    launch_contract_digest_word_1: int
+    launch_contract_digest_word_2: int
+    launch_contract_digest_word_3: int
+    setup_digest_word_0: int
+    setup_digest_word_1: int
+    setup_digest_word_2: int
+    setup_digest_word_3: int
+    source_digest_word_0: int
+    source_digest_word_1: int
+    source_digest_word_2: int
+    source_digest_word_3: int
+    exo_source_digest_word_0: int
+    exo_source_digest_word_1: int
+    exo_source_digest_word_2: int
+    exo_source_digest_word_3: int
+    native_lib_digest_word_0: int
+    native_lib_digest_word_1: int
+    native_lib_digest_word_2: int
+    native_lib_digest_word_3: int
+    helper_calls: int
+    eligible_width1_calls: int
+    eligible_width3_calls: int
+    packed_width1_hits: int
+    packed_width3_hits: int
+    packed_hits: int
+    packed_width1_output_tensors: int
+    packed_width3_output_tensors: int
+    packed_output_tensors: int
+    packed_width1_installs: int
+    packed_width3_installs: int
+    lazy_installs: int
+    gate_disabled_calls: int
+    noncontract_calls: int
+    width1_unsupported_calls: int
+    width3_unsupported_calls: int
+    unsupported_calls: int
+    width1_dispatch_fallback_calls: int
+    width3_dispatch_fallback_calls: int
+    packed_dispatch_fallback_calls: int
+    invalidations: int
+    stale_resets: int
+    pack_count_before: int
+    pack_count_after: int
+    kda_helper_calls: int
+    kda_gate_disabled_calls: int
+    kda_noncontract_calls: int
+    kda_admitted_calls: int
+    kda_success_calls: int
+    kda_fallback_calls: int
+    kda_pending_calls: Literal[0]
+    prefill_width1_chunks: int
+    prefill_width3_chunks: int
+    prefill_noncontract_chunks: int
+    target_width1_rounds: int
+    speculative_full_width_rounds: int
+    proposed_tokens: int
+    accepted_tokens: int
+    emitted_tokens: int
+    visible_output_tokens: int
+    decode_begin_cache_offset: int
+    fallback_rounds: Literal[0]
+    error_rounds: Literal[0]
+    receipt_poisoned: Literal[False]
+    stale_events: Literal[0]
+    duplicate_events: Literal[0]
+    deferred_validated_rounds: int
+    deferred_materialized_rounds: int
+    deferred_validated_roots: int
+    deferred_submitted_roots: int
+    deferred_first_initial_offset: int
+    deferred_last_initial_offset: int
+    deferred_last_final_offset: int
+    tail_prelaunch_submitted: int
+    tail_prelaunch_used: int
+    tail_prelaunch_discarded: int
+    native_q3_total: int
+    native_q3_n4480: int
+    native_q3_n6144: int
+    native_q3_n10624: int
+    native_q3_other: int
+    schedule_digest_word_0: int
+    schedule_digest_word_1: int
+    schedule_digest_word_2: int
+    schedule_digest_word_3: int
+    proposal_digest_word_0: int
+    proposal_digest_word_1: int
+    proposal_digest_word_2: int
+    proposal_digest_word_3: int
+    acceptance_digest_word_0: int
+    acceptance_digest_word_1: int
+    acceptance_digest_word_2: int
+    acceptance_digest_word_3: int
+    committed_output_digest_word_0: int
+    committed_output_digest_word_1: int
+    committed_output_digest_word_2: int
+    committed_output_digest_word_3: int
+    visible_output_digest_word_0: int
+    visible_output_digest_word_1: int
+    visible_output_digest_word_2: int
+    visible_output_digest_word_3: int
+    cache_digest_word_0: int
+    cache_digest_word_1: int
+    cache_digest_word_2: int
+    cache_digest_word_3: int
+    causal_digest_word_0: int
+    causal_digest_word_1: int
+    causal_digest_word_2: int
+    causal_digest_word_3: int
+
+
 class GenerationStats(BaseModel):
     prompt_tps: float
     generation_tps: float
@@ -182,6 +326,19 @@ class GenerationStats(BaseModel):
     speculative_committed_tokens: int = 0
     speculative_fallback_rounds: int = 0
     speculative_error_rounds: int = 0
+    speculative_full_width_rounds: int = 0
+    target_width1_rounds: int = 0
+    prefill_width1_chunks: int = 0
+    prefill_width3_chunks: int = 0
+    prefill_noncontract_chunks: int = 0
+    k3_w3_composition_receipt: K3W3CompositionReceipt | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_disabled_composition_receipt(self, handler: Any) -> Any:
+        payload = handler(self)
+        if self.k3_w3_composition_receipt is None and isinstance(payload, dict):
+            payload.pop("k3_w3_composition_receipt", None)
+        return payload
 
 
 class ImageGenerationStats(BaseModel):

@@ -3,7 +3,7 @@ from exo.worker.engines.mlx import rank_local_checkpoint
 
 def test_current_offline_w3_composition_rank_local_loader_hash_is_pinned() -> None:
     assert rank_local_checkpoint.SUPPORTED_LOADER_SHA256 == (
-        "492a3a5f650b02fa668997bc05d23075e9af0e4a8eecb9068decef2c633da072"
+        "f7059a2d45cffedf7614174e44a326f4f14372951231eac4159094eea8b3e67c"
     )
 
 

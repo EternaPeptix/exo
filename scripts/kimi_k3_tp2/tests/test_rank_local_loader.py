@@ -246,14 +246,12 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
 
 
 def test_execution_runtime_pin_matches_offline_w3_composition():
-    assert loader.RUNTIME_MLX_LM_COMMIT == (
-        "72164e3521b8ee68d605963cfd3266a7341279e6"
-    )
+    assert loader.RUNTIME_MLX_LM_COMMIT == ("400134d0dd53ffc8e80ca7ae78ab6ecc4687145a")
     assert loader.MLX_LM_KIMI_K3_SHA256 == (
-        "c111751d37a030ec16852b88cb20fb3e2aea537ca458521367fbc5e68b6b110c"
+        "7aff86896e70baf2b986808341b5f292f8c8ecd55d17a9693813cbe25b356c97"
     )
     assert loader.MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256 == (
-        "9dd1d75ca7022cc837165f9eae670df4df36263ef7011ccd989c9f015db9a159"
+        "9be2130bc3afd754d4369882aea571bdc546d62ca1d67b4ba7658641f42e5510"
     )
     assert loader.MLX_LM_KIMI_K3_W3_PREWORK_SHA256 == (
         "f8fcba947dc0e52c335522bd0d152b57679818a64db9edc6e6ba8f58834cb254"
@@ -299,9 +297,7 @@ def test_previous_591_execution_source_pins_are_rejected():
 
 
 def test_previous_packed_only_execution_source_pin_is_rejected():
-    assert loader.RUNTIME_MLX_LM_COMMIT != (
-        "cf61625caf5aa6dfad5c56eb2d71a02cf4c080ea"
-    )
+    assert loader.RUNTIME_MLX_LM_COMMIT != ("cf61625caf5aa6dfad5c56eb2d71a02cf4c080ea")
     assert loader.MLX_LM_KIMI_K3_SHA256 != (
         "39c59837a4a5d900d40ab8b6bb84201e2feefc9aabb3687a4e623854251d9383"
     )
