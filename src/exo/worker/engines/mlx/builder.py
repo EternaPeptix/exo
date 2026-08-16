@@ -61,6 +61,11 @@ def _dspark_checkpoint_contract(config: KimiK3DSparkConfig) -> dict[str, object]
         payload["packed_agreements"] = True
     if config.deferred_async_width3:
         payload["deferred_async_width3"] = True
+    if config.authoritative_packed_width3:
+        payload["authoritative_packed_width3"] = True
+    if config.w3_prework_history:
+        payload["w3_prework_history"] = True
+    payload["native_packed_q3"] = config.native_packed_q3
     return payload
 
 
@@ -127,6 +132,11 @@ def loaded_dspark_contract(
             payload["packed_agreements"] = True
         if loaded.config.deferred_async_width3:
             payload["deferred_async_width3"] = True
+        if loaded.config.authoritative_packed_width3:
+            payload["authoritative_packed_width3"] = True
+        if loaded.config.w3_prework_history:
+            payload["w3_prework_history"] = True
+        payload["native_packed_q3"] = loaded.config.native_packed_q3
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 

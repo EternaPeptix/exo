@@ -1222,6 +1222,10 @@ def _dspark_setup_fingerprint(
     force_ordinary: bool = False,
     ordinary_after_context: int = 0,
     packed_agreements: bool = False,
+    deferred_async_width3: bool = False,
+    authoritative_packed_width3: bool = False,
+    w3_prework_history: bool = False,
+    native_packed_q3: bool = False,
     eos_token_ids: tuple[int, ...],
     banned_token_ids: tuple[int, ...],
     terminal_token_ids: tuple[int, ...],
@@ -1279,6 +1283,14 @@ def _dspark_setup_fingerprint(
     add_integer(ordinary_after_context, name="ordinary-after-context threshold")
     if packed_agreements:
         digest.update(b"exo-kimi-k3-dspark-packed-agreements/v1\0")
+    digest.update(b"exo-kimi-k3-w3-composition/v1\0")
+    add_integer(int(deferred_async_width3), name="deferred W3 async flag")
+    add_integer(
+        int(authoritative_packed_width3),
+        name="authoritative packed W3 flag",
+    )
+    add_integer(int(w3_prework_history), name="W3 KDA prework flag")
+    add_integer(int(native_packed_q3), name="native packed Q3 flag")
     add_tokens(eos_token_ids, name="EOS tokens")
     add_tokens(banned_token_ids, name="banned tokens")
     add_tokens(terminal_token_ids, name="terminal tokens")
@@ -1545,6 +1557,26 @@ def _prepare_dspark_request_setup(
         force_ordinary=force_ordinary,
         ordinary_after_context=ordinary_after_context,
         packed_agreements=request_dspark.config.packed_agreements,
+        deferred_async_width3=getattr(
+            request_dspark.config,
+            "deferred_async_width3",
+            False,
+        ),
+        authoritative_packed_width3=getattr(
+            request_dspark.config,
+            "authoritative_packed_width3",
+            False,
+        ),
+        w3_prework_history=getattr(
+            request_dspark.config,
+            "w3_prework_history",
+            False,
+        ),
+        native_packed_q3=getattr(
+            request_dspark.config,
+            "native_packed_q3",
+            False,
+        ),
         eos_token_ids=eos_token_ids,
         banned_token_ids=banned_token_ids,
         terminal_token_ids=terminal_token_ids,

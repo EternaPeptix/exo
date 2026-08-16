@@ -37,9 +37,13 @@ from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSPARK_VERIFY_WIDTH_ENV,
     DSPARK_YARN_CHECKPOINT_ENV,
     MLX_ASYNC_DECODE_WIDTH3_ENV,
+    MLX_AUTHORITATIVE_PACKED_MOE_FRONT_ENV,
+    MLX_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV,
     MLX_DSPARK_PROPOSER_ENV,
     MLX_DSPARK_SEGMENTED_SDPA_ENV,
+    MLX_NATIVE_PACKED_MOE_FRONT_WIDTH3_ENV,
     MLX_REPLAYSSM_ENV,
+    MLX_W3_PREWORK_HISTORY_ENV,
     PACKED_AGREEMENT_ROW_WIDTH,
     DSparkCancellationError,
     DSparkConfidenceCaptureConfig,
@@ -311,6 +315,7 @@ def test_deferred_async_width_three_requires_paired_strict_flags(
     )
     assert type(config) is KimiK3DSparkConfig
     assert config.deferred_async_width3 is True
+    assert config.native_packed_q3 is False
 
     environment[DSPARK_VERIFY_WIDTH_ENV] = "8"
     with pytest.raises(DSparkConfigurationError, match="requires.*=3"):
@@ -345,6 +350,125 @@ def test_deferred_async_width_three_requires_paired_strict_flags(
         )
 
 
+def test_packed_kda_w3_selectors_are_strict_rank_plan_inputs(
+    tmp_path: Path,
+) -> None:
+    environment = _enabled_environment(tmp_path, width="3")
+    environment[MLX_AUTHORITATIVE_PACKED_MOE_FRONT_ENV] = "1"
+    with pytest.raises(DSparkConfigurationError, match="must all be 1"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+    environment[MLX_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV] = "1"
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"requires {MLX_NATIVE_PACKED_MOE_FRONT_WIDTH3_ENV}=1",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=environment,
+            checkpoint_validator=lambda _path: None,
+        )
+
+    # Packed WIDTH3 is the only composed donor that requires the native Q3 gate.
+    environment[MLX_NATIVE_PACKED_MOE_FRONT_WIDTH3_ENV] = "1"
+    config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=environment,
+        checkpoint_validator=lambda _path: None,
+    )
+    assert type(config) is KimiK3DSparkConfig
+    assert config.deferred_async_width3 is False
+    assert config.authoritative_packed_width3 is True
+    assert config.w3_prework_history is False
+    assert config.native_packed_q3 is True
+
+    # The accepted control keeps native Q3 on while all composed W3 donors are off.
+    control = _enabled_environment(tmp_path, width="3")
+    control[MLX_NATIVE_PACKED_MOE_FRONT_WIDTH3_ENV] = "1"
+    control_config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=control,
+        checkpoint_validator=lambda _path: None,
+    )
+    assert type(control_config) is KimiK3DSparkConfig
+    assert control_config.authoritative_packed_width3 is False
+    assert control_config.w3_prework_history is False
+    assert control_config.deferred_async_width3 is False
+    assert control_config.native_packed_q3 is True
+
+    deferred_only = _enabled_environment(tmp_path, width="3")
+    deferred_only[DSPARK_DEFERRED_ASYNC_WIDTH3_ENV] = "1"
+    deferred_only[MLX_ASYNC_DECODE_WIDTH3_ENV] = "1"
+    deferred_config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=deferred_only,
+        checkpoint_validator=lambda _path: None,
+    )
+    assert type(deferred_config) is KimiK3DSparkConfig
+    assert deferred_config.deferred_async_width3 is True
+    assert deferred_config.native_packed_q3 is False
+
+    kda_only = _enabled_environment(tmp_path, width="3")
+    kda_only[MLX_W3_PREWORK_HISTORY_ENV] = "1"
+    kda_config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=kda_only,
+        checkpoint_validator=lambda _path: None,
+    )
+    assert type(kda_config) is KimiK3DSparkConfig
+    assert kda_config.w3_prework_history is True
+    assert kda_config.native_packed_q3 is False
+
+    candidate = dict(environment)
+    candidate[MLX_W3_PREWORK_HISTORY_ENV] = "1"
+    candidate[DSPARK_DEFERRED_ASYNC_WIDTH3_ENV] = "1"
+    candidate[MLX_ASYNC_DECODE_WIDTH3_ENV] = "1"
+    candidate_config = kimi_k3_dspark_config(
+        is_pipeline=False,
+        is_batch=False,
+        environ=candidate,
+        checkpoint_validator=lambda _path: None,
+    )
+    assert type(candidate_config) is KimiK3DSparkConfig
+    assert candidate_config.deferred_async_width3 is True
+    assert candidate_config.authoritative_packed_width3 is True
+    assert candidate_config.w3_prework_history is True
+    assert candidate_config.native_packed_q3 is True
+
+    malformed = dict(candidate)
+    malformed[MLX_W3_PREWORK_HISTORY_ENV] = "true"
+    with pytest.raises(
+        DSparkConfigurationError,
+        match=f"{MLX_W3_PREWORK_HISTORY_ENV} must be 0 or 1",
+    ):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=malformed,
+            checkpoint_validator=lambda _path: None,
+        )
+
+    width_four = dict(candidate)
+    width_four[DSPARK_VERIFY_WIDTH_ENV] = "4"
+    with pytest.raises(DSparkConfigurationError, match="requires.*=3"):
+        kimi_k3_dspark_config(
+            is_pipeline=False,
+            is_batch=False,
+            environ=width_four,
+            checkpoint_validator=lambda _path: None,
+        )
+
+
 def test_width_four_receipt_contract_rejects_deferred_width_three(
     tmp_path: Path,
 ) -> None:
@@ -372,6 +496,18 @@ def test_width_four_receipt_contract_rejects_deferred_width_three(
             verify_width=4,
             round_telemetry=False,
             deferred_async_width3=True,
+        )
+
+    with pytest.raises(
+        DSparkConfigurationError,
+        match="packed/KDA W3 composition requires verify width three",
+    ):
+        KimiK3DSparkConfig(
+            checkpoint_path=tmp_path,
+            verify_width=4,
+            round_telemetry=False,
+            authoritative_packed_width3=True,
+            w3_prework_history=True,
         )
 
 
@@ -1113,6 +1249,9 @@ def _config(
     rank_zero_proposal_recovery: bool = False,
     packed_agreements: bool = False,
     deferred_async_width3: bool = False,
+    authoritative_packed_width3: bool = False,
+    w3_prework_history: bool = False,
+    native_packed_q3: bool = False,
 ) -> KimiK3DSparkConfig:
     assert width in (3, 4, 8)
     return KimiK3DSparkConfig(
@@ -1123,6 +1262,9 @@ def _config(
         rank_zero_proposal_recovery=rank_zero_proposal_recovery,
         packed_agreements=packed_agreements,
         deferred_async_width3=deferred_async_width3,
+        authoritative_packed_width3=authoritative_packed_width3,
+        w3_prework_history=w3_prework_history,
+        native_packed_q3=native_packed_q3,
     )
 
 
@@ -1958,6 +2100,34 @@ def test_target_verifier_mode_disagreement_cancels_before_graph_build(
         posterior=(11, 12, 13),
         agreement=agreement,
     )
+
+    result = engine.decode_round(10)
+
+    assert result.emitted_tokens == (999,)
+    assert "target_cancel" in events
+    assert draft.rounds[0].cancelled is True
+    assert "target_build" not in events
+    assert "target_verify" not in events
+
+
+def test_target_verifier_native_q3_disagreement_cancels_before_graph_build(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    agreement = _FakeAgreement(
+        events,
+        agreed_tokens=[10, 0, 5, 0, 0, 5, 0],
+    )
+    engine, draft, target, _collective, _events = _engine(
+        tmp_path,
+        proposals=(11, 12),
+        posterior=(11, 12, 13),
+        agreement=agreement,
+    )
+    target.verification_mode_code = TargetVerificationPlan(
+        "full",
+        native_packed_q3=True,
+    ).agreement_code
 
     result = engine.decode_round(10)
 
@@ -4229,6 +4399,19 @@ def test_deferred_async_flag_is_bound_into_plan_and_prompt_contract(
         ).agreement_code
         == 3
     )
+    assert (
+        TargetVerificationPlan(
+            "full",
+            authoritative_packed_width3=True,
+            w3_prework_history=True,
+            native_packed_q3=True,
+        ).agreement_code
+        == 28
+    )
+    assert (
+        TargetVerificationPlan("full", native_packed_q3=True).agreement_code
+        != TargetVerificationPlan("full", native_packed_q3=False).agreement_code
+    )
 
     control_runtime, _target, _cache, _context = _faithful_request_runtime(
         tmp_path,
@@ -4238,6 +4421,19 @@ def test_deferred_async_flag_is_bound_into_plan_and_prompt_contract(
         tmp_path,
         (11, 12, 13),
         deferred_async_width3=True,
+    )
+    native_control_runtime, _target, _cache, _context = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        native_packed_q3=True,
+    )
+    composed_runtime, _target, _cache, _context = _faithful_request_runtime(
+        tmp_path,
+        (11, 12, 13),
+        deferred_async_width3=True,
+        authoritative_packed_width3=True,
+        w3_prework_history=True,
+        native_packed_q3=True,
     )
     prompt = cast(mx.array, cast(object, _FakePromptArray((1, 2))))
 
@@ -4255,9 +4451,33 @@ def test_deferred_async_flag_is_bound_into_plan_and_prompt_contract(
         stop_sequences=(),
         distributed_progress=False,
     )
+    native_control_tokens, native_control_fingerprint = (
+        native_control_runtime._prompt_contract(
+            prompt,
+            max_tokens=16,
+            prefill_step_size=2,
+            stop_sequences=(),
+            distributed_progress=False,
+        )
+    )
+    composed_tokens, composed_fingerprint = composed_runtime._prompt_contract(
+        prompt,
+        max_tokens=16,
+        prefill_step_size=2,
+        stop_sequences=(),
+        distributed_progress=False,
+    )
 
-    assert control_tokens == candidate_tokens == (1, 2)
+    assert (
+        control_tokens
+        == candidate_tokens
+        == native_control_tokens
+        == composed_tokens
+        == (1, 2)
+    )
     assert control_fingerprint != candidate_fingerprint
+    assert control_fingerprint != native_control_fingerprint
+    assert native_control_fingerprint != composed_fingerprint
 
 
 @pytest.mark.parametrize(
@@ -4933,6 +5153,9 @@ def _faithful_request_runtime(
     compact_greedy: bool = False,
     banned_token_ids: tuple[int, ...] = (),
     deferred_async_width3: bool = False,
+    authoritative_packed_width3: bool = False,
+    w3_prework_history: bool = False,
+    native_packed_q3: bool = False,
     async_evaluate: Callable[..., None] = lambda *_values: None,
 ) -> tuple[
     KimiK3DSparkRequestRuntime,
@@ -4960,6 +5183,9 @@ def _faithful_request_runtime(
             tmp_path,
             3,
             deferred_async_width3=deferred_async_width3,
+            authoritative_packed_width3=authoritative_packed_width3,
+            w3_prework_history=w3_prework_history,
+            native_packed_q3=native_packed_q3,
         ),
         target_model=target,
         drafter=object(),

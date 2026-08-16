@@ -29,10 +29,10 @@ MLX_LM_COMMIT = "7d505c285b801108a52c23353c7fb6af07204717"
 CHECKPOINT_MLX_LM_KIMI_K3_SHA256 = (
     "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
 )
-RUNTIME_MLX_LM_COMMIT = "cf61625caf5aa6dfad5c56eb2d71a02cf4c080ea"
+RUNTIME_MLX_LM_COMMIT = "72164e3521b8ee68d605963cfd3266a7341279e6"
 RUNTIME_MLX_LM_DSPARK_0731_COMMIT = "e041c6ac9296bd9a73bd4c8b1f4f0d4b55b62e35"
 MLX_LM_KIMI_K3_SHA256 = (
-    "39c59837a4a5d900d40ab8b6bb84201e2feefc9aabb3687a4e623854251d9383"
+    "c111751d37a030ec16852b88cb20fb3e2aea537ca458521367fbc5e68b6b110c"
 )
 MLX_LM_CACHE_SHA256 = "a83a454942864d6430b0d8f28c716593be4d9286c2a683083b6708df97e04e78"
 MLX_LM_GENERATE_SHA256 = (
@@ -76,6 +76,9 @@ MLX_LM_KIMI_K3_TUNED_GATHER_QMV_SHA256 = (
 )
 MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256 = (
     "9dd1d75ca7022cc837165f9eae670df4df36263ef7011ccd989c9f015db9a159"
+)
+MLX_LM_KIMI_K3_W3_PREWORK_SHA256 = (
+    "f8fcba947dc0e52c335522bd0d152b57679818a64db9edc6e6ba8f58834cb254"
 )
 SOURCE_CONFIG_SHA256 = (
     "d041003554810a367bb600d18733976bdd21041bb46e75cc1e27c7b15fe034d0"
@@ -389,6 +392,7 @@ def _verify_runtime_source() -> str:
         kimi_k3_packed_moe_front,
         kimi_k3_prefill_route_combine,
         kimi_k3_tuned_gather_qmv,
+        kimi_k3_w3_prework,
         kimi_k3_width4_fused_expert,
         switch_layers,
     )
@@ -438,6 +442,11 @@ def _verify_runtime_source() -> str:
             kimi_k3_packed_moe_front,
             "kimi_k3_packed_moe_front.py",
             MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256,
+        ),
+        (
+            kimi_k3_w3_prework,
+            "kimi_k3_w3_prework.py",
+            MLX_LM_KIMI_K3_W3_PREWORK_SHA256,
         ),
         (
             kimi_k3_prefill_route_combine,

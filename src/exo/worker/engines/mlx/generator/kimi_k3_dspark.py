@@ -69,6 +69,14 @@ MLX_DSPARK_PROPOSER_ENV = "MLX_LM_KIMI_K3_DSPARK_PROPOSER"
 MLX_REPLAYSSM_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
 MLX_DSPARK_SEGMENTED_SDPA_ENV = "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"
 MLX_ASYNC_DECODE_WIDTH3_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_WIDTH3"
+MLX_AUTHORITATIVE_PACKED_MOE_FRONT_ENV = (
+    "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT"
+)
+MLX_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV = (
+    "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3"
+)
+MLX_NATIVE_PACKED_MOE_FRONT_WIDTH3_ENV = "MLX_METAL_K3_AFFINE8_Q3_TRIPLET"
+MLX_W3_PREWORK_HISTORY_ENV = "MLX_LM_KIMI_K3_W3_PREWORK_HISTORY"
 EXO_VOCAB_PARALLEL_GREEDY_ENV = "EXO_MLX_K3_VOCAB_PARALLEL_GREEDY"
 
 RADIXARK_KIMI_K3_DSPARK_MODEL = "RadixArk/Kimi-K3-DSpark"
@@ -244,6 +252,9 @@ class KimiK3DSparkConfig:
     packed_agreements: bool = False
     tail_overlap: bool = False
     deferred_async_width3: bool = False
+    authoritative_packed_width3: bool = False
+    w3_prework_history: bool = False
+    native_packed_q3: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -252,6 +263,17 @@ class KimiK3DSparkConfig:
         ):
             raise DSparkConfigurationError(
                 "Kimi K3 deferred async decode requires verify width three"
+            )
+        if (
+            self.authoritative_packed_width3 or self.w3_prework_history
+        ) and self.verify_width != DSPARK_CONSERVATIVE_VERIFY_WIDTH:
+            raise DSparkConfigurationError(
+                "Kimi K3 packed/KDA W3 composition requires verify width three"
+            )
+        if self.authoritative_packed_width3 and not self.native_packed_q3:
+            raise DSparkConfigurationError(
+                "Kimi K3 authoritative packed W3 requires the native Q3 "
+                "triplet selector"
             )
 
     @property
@@ -311,6 +333,9 @@ class KimiK3DSparkDualConfig:
             "packed_agreements",
             "tail_overlap",
             "deferred_async_width3",
+            "authoritative_packed_width3",
+            "w3_prework_history",
+            "native_packed_q3",
         )
         if any(
             getattr(self.old, name) != getattr(self.yarn, name)
@@ -339,6 +364,18 @@ class KimiK3DSparkDualConfig:
     @property
     def deferred_async_width3(self) -> bool:
         return self.old.deferred_async_width3
+
+    @property
+    def authoritative_packed_width3(self) -> bool:
+        return self.old.authoritative_packed_width3
+
+    @property
+    def w3_prework_history(self) -> bool:
+        return self.old.w3_prework_history
+
+    @property
+    def native_packed_q3(self) -> bool:
+        return self.old.native_packed_q3
 
 
 KimiK3DSparkDeploymentConfig = KimiK3DSparkConfig | KimiK3DSparkDualConfig
@@ -708,6 +745,47 @@ def kimi_k3_dspark_config(
         raise DSparkConfigurationError(
             f"{DSPARK_DEFERRED_ASYNC_WIDTH3_ENV}=1 requires {DSPARK_VERIFY_WIDTH_ENV}=3"
         )
+    packed_width3_selectors = (
+        (
+            MLX_AUTHORITATIVE_PACKED_MOE_FRONT_ENV,
+            _strict_flag(
+                MLX_AUTHORITATIVE_PACKED_MOE_FRONT_ENV,
+                values.get(MLX_AUTHORITATIVE_PACKED_MOE_FRONT_ENV, "0"),
+            ),
+        ),
+        (
+            MLX_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV,
+            _strict_flag(
+                MLX_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV,
+                values.get(MLX_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV, "0"),
+            ),
+        ),
+    )
+    packed_width3_values = tuple(enabled for _, enabled in packed_width3_selectors)
+    if len(set(packed_width3_values)) != 1:
+        names = ", ".join(name for name, _ in packed_width3_selectors)
+        raise DSparkConfigurationError(f"{names} must all be 1 or all be 0")
+    authoritative_packed_width3 = all(packed_width3_values)
+    native_packed_q3 = _strict_flag(
+        MLX_NATIVE_PACKED_MOE_FRONT_WIDTH3_ENV,
+        values.get(MLX_NATIVE_PACKED_MOE_FRONT_WIDTH3_ENV, "0"),
+    )
+    w3_prework_history = _strict_flag(
+        MLX_W3_PREWORK_HISTORY_ENV,
+        values.get(MLX_W3_PREWORK_HISTORY_ENV, "0"),
+    )
+    if (
+        authoritative_packed_width3 or w3_prework_history
+    ) and verify_width != DSPARK_CONSERVATIVE_VERIFY_WIDTH:
+        raise DSparkConfigurationError(
+            "Kimi K3 packed/KDA W3 selectors require "
+            f"{DSPARK_VERIFY_WIDTH_ENV}=3"
+        )
+    if authoritative_packed_width3 and not native_packed_q3:
+        raise DSparkConfigurationError(
+            "Kimi K3 authoritative packed W3 requires "
+            f"{MLX_NATIVE_PACKED_MOE_FRONT_WIDTH3_ENV}=1"
+        )
     revision = RADIXARK_KIMI_K3_DSPARK_REVISION
     config_sha256 = RADIXARK_KIMI_K3_DSPARK_CONFIG_SHA256
     model_bytes = RADIXARK_KIMI_K3_DSPARK_MODEL_BYTES
@@ -731,6 +809,9 @@ def kimi_k3_dspark_config(
         packed_agreements=packed_agreements,
         tail_overlap=tail_overlap,
         deferred_async_width3=deferred_async_width3,
+        authoritative_packed_width3=authoritative_packed_width3,
+        w3_prework_history=w3_prework_history,
+        native_packed_q3=native_packed_q3,
     )
     if not dual_enabled:
         return primary_config
@@ -767,6 +848,9 @@ def kimi_k3_dspark_config(
         packed_agreements=packed_agreements,
         tail_overlap=tail_overlap,
         deferred_async_width3=deferred_async_width3,
+        authoritative_packed_width3=authoritative_packed_width3,
+        w3_prework_history=w3_prework_history,
+        native_packed_q3=native_packed_q3,
     )
     return KimiK3DSparkDualConfig(old=primary_config, yarn=yarn_config)
 
@@ -882,10 +966,19 @@ class TargetVerificationPlan:
 
     mode: Literal["full", "compact"]
     deferred_async_width3: bool = False
+    authoritative_packed_width3: bool = False
+    w3_prework_history: bool = False
+    native_packed_q3: bool = False
 
     @property
     def agreement_code(self) -> int:
-        return int(self.mode == "compact") + 2 * int(self.deferred_async_width3)
+        return (
+            int(self.mode == "compact")
+            + 2 * int(self.deferred_async_width3)
+            + 4 * int(self.authoritative_packed_width3)
+            + 8 * int(self.w3_prework_history)
+            + 16 * int(self.native_packed_q3)
+        )
 
 
 @dataclass(frozen=True)
@@ -5459,6 +5552,12 @@ class KimiK3DSparkRequestRuntime:
             int(self.loaded.config.aux_only_prefill),
             int(self.loaded.config.deferred_async_width3),
         )
+        feature_contract = (
+            *feature_contract,
+            int(self.loaded.config.authoritative_packed_width3),
+            int(self.loaded.config.w3_prework_history),
+            int(self.loaded.config.native_packed_q3),
+        )
         if self.loaded.config.packed_agreements:
             feature_contract = (*feature_contract, 1)
         token_fingerprint = _token_contract_fingerprint(
@@ -5664,6 +5763,11 @@ class KimiK3DSparkRequestRuntime:
         return TargetVerificationPlan(
             "compact" if self.compact_greedy else "full",
             deferred_async_width3=self.loaded.config.deferred_async_width3,
+            authoritative_packed_width3=(
+                self.loaded.config.authoritative_packed_width3
+            ),
+            w3_prework_history=self.loaded.config.w3_prework_history,
+            native_packed_q3=self.loaded.config.native_packed_q3,
         )
 
     def _build_verification(

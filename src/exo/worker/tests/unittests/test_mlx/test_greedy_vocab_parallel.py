@@ -715,6 +715,15 @@ def test_packed_selector_changes_load_contracts_and_off_keeps_legacy_json(
         round_telemetry=False,
         deferred_async_width3=True,
     )
+    composition_config = KimiK3DSparkConfig(
+        checkpoint_path=tmp_path / "draft",
+        verify_width=3,
+        round_telemetry=False,
+        deferred_async_width3=True,
+        authoritative_packed_width3=True,
+        w3_prework_history=True,
+        native_packed_q3=True,
+    )
     expected_legacy_config = json.dumps(
         {
             "checkpoint": str(legacy_config.checkpoint_path),
@@ -722,6 +731,7 @@ def test_packed_selector_changes_load_contracts_and_off_keeps_legacy_json(
             "model_bytes": legacy_config.model_bytes,
             "model_id": legacy_config.model_id,
             "model_sha256": legacy_config.model_sha256,
+            "native_packed_q3": False,
             "rank_zero_proposal_recovery": False,
             "revision": legacy_config.revision,
             "round_telemetry": False,
@@ -741,6 +751,11 @@ def test_packed_selector_changes_load_contracts_and_off_keeps_legacy_json(
         json.loads(dspark_config_contract(deferred_config))["deferred_async_width3"]
         is True
     )
+    composition_payload = json.loads(dspark_config_contract(composition_config))
+    assert composition_payload["deferred_async_width3"] is True
+    assert composition_payload["authoritative_packed_width3"] is True
+    assert composition_payload["w3_prework_history"] is True
+    assert composition_payload["native_packed_q3"] is True
 
     target_model = object()
 
@@ -755,6 +770,7 @@ def test_packed_selector_changes_load_contracts_and_off_keeps_legacy_json(
     expected_legacy_loaded = json.dumps(
         {
             "drafter_class": "builtins.object",
+            "native_packed_q3": False,
             "placement": "replicated",
             "proposer_class": "builtins.object",
             "verify_width": 3,
@@ -783,6 +799,16 @@ def test_packed_selector_changes_load_contracts_and_off_keeps_legacy_json(
     )
     assert deferred_loaded != expected_legacy_loaded
     assert json.loads(deferred_loaded)["deferred_async_width3"] is True
+    composition_loaded = json.loads(
+        loaded_dspark_contract(
+            loaded(composition_config),
+            vision_processor_present=False,
+        )
+    )
+    assert composition_loaded["deferred_async_width3"] is True
+    assert composition_loaded["authoritative_packed_width3"] is True
+    assert composition_loaded["w3_prework_history"] is True
+    assert composition_loaded["native_packed_q3"] is True
 
 
 def _sequential_for_callback_test(cancel_receiver: object) -> SequentialGenerator:
@@ -1455,6 +1481,36 @@ def test_dspark_setup_fingerprint_binds_generation_callback_presence(
         **common,
         generation_progress=False,
         packed_agreements=True,
+    )
+    composition = generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        deferred_async_width3=True,
+        authoritative_packed_width3=True,
+        w3_prework_history=True,
+        native_packed_q3=True,
+    )
+    assert composition != legacy
+    assert composition != generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        deferred_async_width3=True,
+        authoritative_packed_width3=True,
+        w3_prework_history=False,
+        native_packed_q3=True,
+    )
+    assert legacy != generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        native_packed_q3=True,
+    )
+    assert composition != generate_module._dspark_setup_fingerprint(  # type: ignore[arg-type]
+        **common,
+        generation_progress=False,
+        deferred_async_width3=True,
+        authoritative_packed_width3=True,
+        w3_prework_history=True,
+        native_packed_q3=False,
     )
 
 

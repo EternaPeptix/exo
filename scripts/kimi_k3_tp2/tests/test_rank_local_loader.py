@@ -245,15 +245,18 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
     assert result["rank_data_bytes"] == 32
 
 
-def test_execution_runtime_pin_matches_current_q3_full_packed_candidate():
+def test_execution_runtime_pin_matches_offline_w3_composition():
     assert loader.RUNTIME_MLX_LM_COMMIT == (
-        "cf61625caf5aa6dfad5c56eb2d71a02cf4c080ea"
+        "72164e3521b8ee68d605963cfd3266a7341279e6"
     )
     assert loader.MLX_LM_KIMI_K3_SHA256 == (
-        "39c59837a4a5d900d40ab8b6bb84201e2feefc9aabb3687a4e623854251d9383"
+        "c111751d37a030ec16852b88cb20fb3e2aea537ca458521367fbc5e68b6b110c"
     )
     assert loader.MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256 == (
         "9dd1d75ca7022cc837165f9eae670df4df36263ef7011ccd989c9f015db9a159"
+    )
+    assert loader.MLX_LM_KIMI_K3_W3_PREWORK_SHA256 == (
+        "f8fcba947dc0e52c335522bd0d152b57679818a64db9edc6e6ba8f58834cb254"
     )
     assert loader.MLX_LM_KIMI_K3_DSPARK_SHA256 == (
         "be221a4dde09ec97011a961a4f2d7de1f5f0327af706395967166f710f968021"
@@ -293,6 +296,15 @@ def test_previous_591_execution_source_pins_are_rejected():
         "82076bf9c0098f2fc72a0434a5482e72a6e022fc982574f05867dcce32645435",
         "631f3772e09473af42a0f08673e5f41f40282817f8fe2fb23e7e5904c136e7a2",
     }
+
+
+def test_previous_packed_only_execution_source_pin_is_rejected():
+    assert loader.RUNTIME_MLX_LM_COMMIT != (
+        "cf61625caf5aa6dfad5c56eb2d71a02cf4c080ea"
+    )
+    assert loader.MLX_LM_KIMI_K3_SHA256 != (
+        "39c59837a4a5d900d40ab8b6bb84201e2feefc9aabb3687a4e623854251d9383"
+    )
 
 
 def test_manifest_always_hashes_tokenizer_metadata(
@@ -437,6 +449,7 @@ def test_runtime_source_verification_uses_execution_pin(
         "kimi_k3_fused_router": "MLX_LM_KIMI_K3_FUSED_ROUTER_SHA256",
         "kimi_k3_fused_switch_glu": "MLX_LM_KIMI_K3_FUSED_SWITCH_GLU_SHA256",
         "kimi_k3_packed_moe_front": "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256",
+        "kimi_k3_w3_prework": "MLX_LM_KIMI_K3_W3_PREWORK_SHA256",
         "kimi_k3_prefill_route_combine": (
             "MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE_SHA256"
         ),
