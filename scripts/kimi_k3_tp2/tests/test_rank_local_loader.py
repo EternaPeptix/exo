@@ -245,10 +245,15 @@ def test_converter_manifest_is_accepted_by_newer_execution_runtime(
     assert result["rank_data_bytes"] == 32
 
 
-def test_execution_runtime_pin_matches_width_four_candidate():
-    assert loader.RUNTIME_MLX_LM_COMMIT == ("591e11093b55b3b03f7cbc5018cd3b7d47abba4f")
+def test_execution_runtime_pin_matches_current_q3_full_packed_candidate():
+    assert loader.RUNTIME_MLX_LM_COMMIT == (
+        "cf61625caf5aa6dfad5c56eb2d71a02cf4c080ea"
+    )
     assert loader.MLX_LM_KIMI_K3_SHA256 == (
-        "c20fe4020bc2a830403b98a2eacac7f1fa90cc2c5406a6ed3cfd2f1ff7a9107f"
+        "39c59837a4a5d900d40ab8b6bb84201e2feefc9aabb3687a4e623854251d9383"
+    )
+    assert loader.MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256 == (
+        "9dd1d75ca7022cc837165f9eae670df4df36263ef7011ccd989c9f015db9a159"
     )
     assert loader.MLX_LM_KIMI_K3_DSPARK_SHA256 == (
         "be221a4dde09ec97011a961a4f2d7de1f5f0327af706395967166f710f968021"
@@ -275,6 +280,19 @@ def test_execution_runtime_pin_matches_width_four_candidate():
     assert loader.CHECKPOINT_MLX_LM_KIMI_K3_SHA256 == (
         "3dd2e9db585190bca118d5812bcb5b103d1e7c6ec12187b20351992fed7e63cc"
     )
+
+
+def test_previous_591_execution_source_pins_are_rejected():
+    assert loader.RUNTIME_MLX_LM_COMMIT not in {
+        "591e11093b55b3b03f7cbc5018cd3b7d47abba4f",
+    }
+    assert loader.MLX_LM_KIMI_K3_SHA256 not in {
+        "c20fe4020bc2a830403b98a2eacac7f1fa90cc2c5406a6ed3cfd2f1ff7a9107f",
+    }
+    assert loader.MLX_LM_KIMI_K3_PACKED_MOE_FRONT_SHA256 not in {
+        "82076bf9c0098f2fc72a0434a5482e72a6e022fc982574f05867dcce32645435",
+        "631f3772e09473af42a0f08673e5f41f40282817f8fe2fb23e7e5904c136e7a2",
+    }
 
 
 def test_manifest_always_hashes_tokenizer_metadata(

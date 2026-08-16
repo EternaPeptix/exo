@@ -1,9 +1,10 @@
 # Kimi K3 width-four receipt and tail-overlap composition
 
-This branch is an offline, strict-default-off composition candidate. It starts
-from the authenticated width-four C1 source at EXO commit
-`c122d175512d91e01a67b4bf58c6f1803a5eef25` and replays the promoted
-tail-overlap changes, in order:
+This branch is an offline, strict-default-off composition candidate based on
+EXO control `d30cc7b73460ff34d32545b5bc5118555c0716d5`. It retains the
+authenticated width-four C1 source and promoted tail-overlap behavior already
+present at that control; this port changes only current MLX-LM source identity
+and the rank-local loader pin.
 
 1. `691f55fb4b126e0655525e7f7f0eb9f38ad04350` — prelaunch the next draft under
    the target commit;
@@ -12,18 +13,13 @@ tail-overlap changes, in order:
 3. `1b2f75fc91a3e9548fb4090d1538144cc20e6504` — seal the composition tests and
    provenance document.
 
-The authenticated C1 source and promoted tail-overlap tip share merge base
-`4205da9df81dc76895e6d1af08af72c8e09b682e`. All three cherry-picks applied
-without conflicts. The resulting delta relative to `c122d175` is confined to
-the DSpark generator, its focused integration tests, and this document; there
-is no manual reconciliation of the state machines.
-
-The authenticated loader/runtime chain remains byte-identical to `c122d175`:
-the rank-local loader SHA-256 is
-`9f10d5572f43c2dac34a9dfb2969118dad9d42326c36eace28d7b63a80897639`,
-and it continues to pin MLX-LM commit
-`591e11093b55b3b03f7cbc5018cd3b7d47abba4f` and the exact runtime source
-digests documented in `kimi-k3-width4-runtime-pin.md`.
+The authenticated loader/runtime chain now pins current MLX-LM source
+`cf61625caf5aa6dfad5c56eb2d71a02cf4c080ea` and remains byte-stable across all
+W4/tail-overlap/DSpark/native modules. The rank-local loader SHA-256 is
+`d5e532c1c053b8cced19f5e4d80fb41f6e2b5748e5097ea1895a6b9c88477141`,
+and the exact runtime source digests are documented in
+`kimi-k3-width4-runtime-pin.md`. The W3 packed-front selector is not enabled
+globally and is not part of this tail-overlap composition.
 
 ## Selector boundary
 

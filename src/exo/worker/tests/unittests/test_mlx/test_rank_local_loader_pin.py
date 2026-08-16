@@ -16,6 +16,14 @@ def test_checked_in_rank_local_loader_matches_runtime_pin() -> None:
     assert hashlib.sha256(loader.read_bytes()).hexdigest() == (SUPPORTED_LOADER_SHA256)
 
 
+def test_previous_runtime_loader_pins_are_rejected() -> None:
+    assert SUPPORTED_LOADER_SHA256 not in {
+        "9f10d5572f43c2dac34a9dfb2969118dad9d42326c36eace28d7b63a80897639",
+        "3619ab75364182e6fd6e961353943b4965a91ccd53dedc6621527ea16b7fd021",
+        "499c0d013980e0ed4f53433acd7bf5e3a0c9f9bba2138545ae07d210c8cd78eb",
+    }
+
+
 def test_rank_local_metadata_pin_matches_exact_edb511_runtime_inventory() -> None:
     assert set(PINNED_RANK_LOCAL_METADATA_FILES) == {
         "README.md",
