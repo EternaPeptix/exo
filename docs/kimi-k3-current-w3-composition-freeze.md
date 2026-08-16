@@ -57,6 +57,16 @@ and credentials are excluded; deployment attestation must bind those
 separately. `MLX_LM_KIMI_K3_PROJECTED_KV_CACHE_MAX_TOKENS` is required to be
 the canonical decimal `32768`.
 
+The allowlist also admits and authenticates every rank-common performance
+selector used by the accepted 22.517 tok/s width-three control, including the
+width-three fused-expert, MOK-overlap, ReplaySSM-commit, prefill-route, and
+native affine companion selectors. They remain symmetric across control and
+candidate and are bound by the externally pinned launch-contract digest; the
+only protected arm deltas are still packed W3, KDA prework, and deferred W3.
+The historical launcher omitted the inactive Q4 auxiliary-metallib variable,
+and the receipt binds either absence or an explicit value rather than silently
+dropping it from the launch map.
+
 ## Receipt proof boundary
 
 Receipt admission is process-local, locked, and one-shot: a successful startup

@@ -756,6 +756,42 @@ def _scenario_selector_admission(generate_module: ModuleType) -> None:
     digest_rank1 = generate_module._packed_front_selector_contract().launch_digest
     assert digest_rank0 == digest_rank1
 
+    # Keep every non-candidate selector from the accepted 22.517 tok/s W3
+    # control inside the authenticated launch map.  These selectors are
+    # symmetric across protected arms; admitting them is not permission to
+    # vary them.  The historical control launcher omitted the auxiliary Q4
+    # metallib variable, so cover both its absent and explicit-zero forms.
+    production_companions = {
+        "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_COMMIT": "1",
+        "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_EXPECTED_LAYERS": "69",
+        "MLX_LM_KIMI_K3_DUALSOURCE_AFFINE2_PREFILL": "0",
+        "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH3": "1",
+        "MLX_LM_KIMI_K3_MOK_PREFILL_OVERLAP": "1",
+        "MLX_LM_KIMI_K3_MOK_ROUTED_SHARED_OVERLAP": "1",
+        "MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE": "1",
+        "MLX_LM_KIMI_K3_TP2_ABSORBED_VERIFY": "0",
+        "MLX_LM_KIMI_K3_TP2_ABSORBED_VERIFY_MAX_Q": "3",
+        "MLX_METAL_K3_AFFINE2_EXPERT_TASKS": "1",
+        "MLX_METAL_K3_AFFINE2_GATHER_BM8": "1",
+        "MLX_METAL_K3_AFFINE6_Q3_TRIPLET": "0",
+        "MLX_METAL_K3_AFFINE6_Q3_TRIPLET_V2": "1",
+    }
+    _configure_selector_environment(generate_module, packed=0, kda=0, deferred=0)
+    os.environ.update(production_companions)
+    absent_aux_digest = _refresh_launch_sha(generate_module)
+    selectors = generate_module._packed_front_selector_contract()
+    assert selectors.arm_code == 0
+    os.environ["MLX_METAL_K3_AFFINE6_Q4_AUX_METALLIB"] = "0"
+    explicit_aux_digest = _refresh_launch_sha(generate_module)
+    assert explicit_aux_digest != absent_aux_digest
+    assert generate_module._packed_front_selector_contract().arm_code == 0
+    os.environ["MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH3"] = "0"
+    _expect_error(
+        ValueError,
+        "launch-contract SHA",
+        generate_module._packed_front_selector_contract,
+    )
+
     _configure_selector_environment(generate_module, packed=1, kda=1, deferred=1)
     os.environ["EXO_MLX_PREFILL_STEP_SIZE"] = "2048"
     _expect_error(
