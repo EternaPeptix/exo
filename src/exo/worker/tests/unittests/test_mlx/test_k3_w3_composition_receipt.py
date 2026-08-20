@@ -312,6 +312,9 @@ class _FakeRuntime:
         self.agreement_failure: BaseException | None = None
         self.side_effect_calls: list[str] = []
         self.side_effect_failure: str | None = None
+        self.side_effect_post_failure: str | None = None
+        self.poison_reasons: list[str] = []
+        self.rank1_timing = (0, 0)
         self.collective = SimpleNamespace(rank=0)
 
     def agree_text(self, _name: str, operation: Callable[[], str]) -> str:
@@ -331,6 +334,21 @@ class _FakeRuntime:
         if self.side_effect_failure == name:
             raise RuntimeError(f"injected {name} failure")
         operation()
+        if self.side_effect_post_failure == name:
+            raise RuntimeError(f"injected peer {name} failure")
+
+    def poison_materialization(self, reason: str) -> None:
+        self.poison_reasons.append(reason)
+
+    def gather_frontier_timing_evidence(
+        self,
+        local_values: tuple[int, int],
+        *,
+        local_complete: bool,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        if not local_complete:
+            raise RuntimeError("incomplete frontier timing")
+        return local_values, self.rank1_timing
 
 
 def _raw_receipt(
@@ -1117,6 +1135,31 @@ def _scenario_lifecycle(generate_module: ModuleType) -> None:
     startup_identity = startup_fixture.request._phase_identity()
     api_identity = api_fixture.request._phase_identity()
     assert startup_identity != api_identity
+    rank0_fixture = _build_fixture(generate_module, phase=api)
+    rank1_fixture = _build_fixture(generate_module, phase=api)
+    rank1_native = rank1_fixture.request.native_api
+    assert rank1_native is not None
+    rank1_fixture.request.native_api = generate_module._NativeQ3ReceiptAPI(
+        library=rank1_native.library,
+        total=rank1_native.total,
+        n4480=rank1_native.n4480,
+        n6144=rank1_native.n6144,
+        n10624=rank1_native.n10624,
+        reset=rank1_native.reset,
+        lib_path=rank1_native.lib_path,
+        lib_fd=rank1_native.lib_fd,
+        lib_identity=(91, 92, 93, 94, 95, 96, 97, 98, 99),
+        lib_digest=rank1_native.lib_digest,
+    )
+    assert rank0_fixture.request._phase_identity() != (
+        rank1_fixture.request._phase_identity()
+    )
+    assert rank0_fixture.request._rank_common_identity() == (
+        rank1_fixture.request._rank_common_identity()
+    )
+    assert generate_module._packed_front_admission_fingerprint(
+        rank0_fixture.request
+    ) == generate_module._packed_front_admission_fingerprint(rank1_fixture.request)
     _reset_phase_state(generate_module)
     generate_module._claim_composition_receipt_phase(startup)
     generate_module._record_composition_receipt_publication(startup, startup_identity)
@@ -1956,9 +1999,10 @@ def _scenario_finish_abort_and_publication(generate_module: ModuleType) -> None:
         fixture.request.phase in generate_module._COMPOSITION_RECEIPT_PUBLISHED_PHASES
     )
     assert fixture.runtime.side_effect_calls == [
+        "frontier telemetry finalization",
         "W3 composition marker prepublication verification",
-        "W3 composition marker publication",
         "W3 composition marker lifecycle completion",
+        "W3 composition marker publication commit",
     ]
 
     startup_phase = generate_module._PACKED_FRONT_PHASE_ENGINE_STARTUP
@@ -1982,17 +2026,19 @@ def _scenario_finish_abort_and_publication(generate_module: ModuleType) -> None:
     _reset_phase_state(generate_module)
     generate_module._claim_composition_receipt_phase(startup_phase)
     publication_failure.runtime.side_effect_failure = (
-        "W3 composition marker publication"
+        "W3 composition marker lifecycle completion"
     )
     _expect_error(
         RuntimeError,
-        "injected .* publication failure",
+        "injected .* lifecycle completion failure",
         lambda: generate_module._publish_composition_receipt(
             publication_failure.runtime,
             publication_failure.request,
         ),
     )
     assert publication_failure.request._published is False
+    assert publication_failure.request._poisoned is True
+    assert publication_failure.runtime.poison_reasons
     assert not generate_module._COMPOSITION_RECEIPT_PUBLISHED_PHASES
     assert not generate_module._COMPOSITION_RECEIPT_COMPLETED_PHASES
     publication_failure.request.abort()
@@ -2031,6 +2077,8 @@ def _scenario_finish_abort_and_publication(generate_module: ModuleType) -> None:
     finally:
         generate_module._record_composition_receipt_publication = original_record
     assert mark_failure.request._published is False
+    assert mark_failure.request._poisoned is True
+    assert mark_failure.runtime.poison_reasons
     assert not generate_module._COMPOSITION_RECEIPT_PUBLISHED_PHASES
     assert not generate_module._COMPOSITION_RECEIPT_COMPLETED_PHASES
     mark_failure.request.abort()
@@ -2067,17 +2115,29 @@ def _scenario_finish_abort_and_publication(generate_module: ModuleType) -> None:
     finish_index = implementation_source.index(
         "packed_front_receipt.finish", barrier_index
     )
+    timing_index = implementation_source.index(
+        "_capture_terminal_decode_timing(", barrier_index
+    )
     publication_index = implementation_source.index(
         "_publish_composition_receipt(", finish_index
     )
-    assert close_index < barrier_index < finish_index < publication_index
+    yield_index = implementation_source.index("yield response", finish_index)
+    assert (
+        close_index
+        < barrier_index
+        < timing_index
+        < finish_index
+        < yield_index
+        < publication_index
+    )
     publication_source = inspect.getsource(generate_module._publish_composition_receipt)
     verification_stage = publication_source.index(
         "W3 composition marker prepublication verification"
     )
-    emit_stage = publication_source.index("W3 composition marker publication")
     mark_stage = publication_source.index("W3 composition marker lifecycle completion")
-    assert verification_stage < emit_stage < mark_stage
+    commit_stage = publication_source.index("W3 composition marker publication commit")
+    emit_stage = publication_source.index("receipt.emit_marker")
+    assert verification_stage < mark_stage < commit_stage < emit_stage
     assert publication_source.count("runtime.agree_local_side_effect(") == 3
 
 
@@ -2119,8 +2179,108 @@ def _scenario_rank_local_sha256_gather(_generate_module: ModuleType) -> None:
     )
 
 
-def _scenario_frontier_receipt_v4(generate_module: ModuleType) -> None:
-    from exo.api.types import GenerationStats, K3W3CompositionReceiptV4
+def _scenario_rank_agreed_admission_setup(generate_module: ModuleType) -> None:
+    class _Poison:
+        def __init__(self) -> None:
+            self.reasons: list[str] = []
+
+        def poison(self, reason: str) -> None:
+            self.reasons.append(reason)
+
+    class _Agreement:
+        instances: list["_Agreement"] = []
+        mismatch = False
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.calls: list[tuple[str, object]] = []
+            self.instances.append(self)
+
+        def agree_stage_success(self, value: bool) -> bool | None:
+            self.calls.append(("stage", value))
+            return None if self.mismatch else value
+
+        def agree_token(self, value: int) -> int | None:
+            self.calls.append(("token", value))
+            return value
+
+        def activate_packed_agreements(self) -> None:
+            self.calls.append(("activate", True))
+
+    poison = _Poison()
+    dspark = SimpleNamespace(
+        config=SimpleNamespace(rank_zero_proposal_recovery=False),
+        materialization_poison=poison,
+        assert_healthy=lambda: None,
+    )
+    receipt = generate_module._PackedFrontReceiptRequest(
+        model=object(),
+        enabled=False,
+        phase=generate_module._PACKED_FRONT_PHASE_API,
+    )
+    aborted: list[str] = []
+    receipt.abort = lambda: aborted.append("abort")
+    descriptor = generate_module._PackedFrontReceiptRequest.__dict__["from_environment"]
+    original_agreement = generate_module.MlxRankAgreement
+    generate_module.MlxRankAgreement = _Agreement
+    generate_module._PackedFrontReceiptRequest.from_environment = classmethod(
+        lambda _cls, *_args, **_kwargs: receipt
+    )
+    try:
+        admitted = generate_module._rank_agreed_packed_front_admission(
+            object(),
+            dspark,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            phase="api",
+        )
+        assert admitted is receipt
+        assert len(_Agreement.instances[-1].calls) == 6
+        assert aborted == []
+        assert poison.reasons == []
+
+        _Agreement.mismatch = True
+        _expect_error(
+            Exception,
+            "identities disagreed",
+            lambda: generate_module._rank_agreed_packed_front_admission(
+                object(),
+                dspark,
+                SimpleNamespace(),
+                SimpleNamespace(),
+                phase="api",
+            ),
+        )
+        assert len(_Agreement.instances[-1].calls) == 6
+        assert aborted == ["abort"]
+        assert poison.reasons
+    finally:
+        generate_module.MlxRankAgreement = original_agreement
+        generate_module._PackedFrontReceiptRequest.from_environment = descriptor
+
+    setup_failures: list[str] = []
+    agreement = _Agreement()
+    _Agreement.mismatch = False
+    _expect_error(
+        Exception,
+        "failed on every rank",
+        lambda: generate_module._rank_agreed_dspark_setup(
+            agreement,
+            lambda: (_ for _ in ()).throw(RuntimeError("rank-local reset failure")),
+            on_failure=setup_failures.append,
+        ),
+    )
+    assert setup_failures == [
+        "failed on every rank: RuntimeError: rank-local reset failure"
+    ]
+    assert len(agreement.calls) == 6
+
+
+def _scenario_frontier_receipt_v5(generate_module: ModuleType) -> None:
+    from exo.api.types import (
+        GenerationStats,
+        K3W3CompositionReceiptV4,
+        K3W3CompositionReceiptV5,
+    )
     from exo.shared.types.memory import Memory
 
     fixture = _build_fixture(generate_module, identity_enabled=True)
@@ -2135,21 +2295,33 @@ def _scenario_frontier_receipt_v4(generate_module: ModuleType) -> None:
     core_sha = hashlib.sha256(b"core").hexdigest()
     rank0_file = hashlib.sha256(b"rank0-file").hexdigest()
     rank1_file = hashlib.sha256(b"rank1-file").hexdigest()
+    rank0_complete = hashlib.sha256(b"rank0-complete").hexdigest()
+    rank1_complete = hashlib.sha256(b"rank1-complete").hexdigest()
     context = object()
     fixture.request._frontier_context = context
+    fixture.request._target_commit_ns = 123_456
+    fixture.request._prelaunch_ns = 23_456
+    fixture.runtime.rank1_timing = (133_456, 33_456)
     original_finalize = generate_module.k3_frontier_telemetry.finalize
     original_poison = generate_module.k3_frontier_telemetry.poison_finalized
+    fake_clock = [110.0]
+    terminal_timing = generate_module._capture_terminal_decode_timing(
+        100.0,
+        160,
+        clock=lambda: fake_clock[0],
+    )
 
     def finalize(_context: object, core: dict[str, object]) -> SimpleNamespace:
         assert _context is context
         assert core["receipt_schema_version"] == 2
+        fake_clock[0] = 999.0
         return SimpleNamespace(
-            request_index=1,
+            request_index=16,
             request_nonce_sha256=nonce,
-            reset_generation=1,
+            reset_generation=16,
             receipt_v2_core_sha256=core_sha,
             request_file_sha256=rank0_file,
-            process_complete_file_sha256=None,
+            process_complete_file_sha256=rank0_complete,
         )
 
     def gather(name: str, digest: str) -> tuple[str, str]:
@@ -2157,8 +2329,8 @@ def _scenario_frontier_receipt_v4(generate_module: ModuleType) -> None:
             assert digest == rank0_file
             return rank0_file, rank1_file
         assert name == "frontier-process-complete"
-        assert digest == "0" * 64
-        return "0" * 64, "0" * 64
+        assert digest == rank0_complete
+        return rank0_complete, rank1_complete
 
     generate_module.k3_frontier_telemetry.finalize = finalize
     generate_module.k3_frontier_telemetry.poison_finalized = lambda _context: None
@@ -2171,11 +2343,22 @@ def _scenario_frontier_receipt_v4(generate_module: ModuleType) -> None:
     finally:
         generate_module.k3_frontier_telemetry.finalize = original_finalize
         generate_module.k3_frontier_telemetry.poison_finalized = original_poison
-    assert isinstance(receipt, K3W3CompositionReceiptV4)
-    assert receipt.receipt_schema == "kimi-k3-w3-composition-receipt/v4"
-    assert receipt.receipt_schema_version == 4
-    assert receipt.frontier_request_index == 1
-    assert receipt.frontier_reset_generation == 1
+    assert isinstance(receipt, K3W3CompositionReceiptV5)
+    assert receipt.receipt_schema == "kimi-k3-w3-composition-receipt/v5"
+    assert receipt.receipt_schema_version == 5
+    assert receipt.frontier_request_index == 16
+    assert receipt.frontier_reset_generation == 16
+    assert terminal_timing.elapsed_seconds == 10.0
+    assert terminal_timing.effective_tps == 16.0
+    assert fake_clock[0] == 999.0
+    assert [row.model_dump() for row in receipt.frontier_round_schedule] == [
+        {"ordinal": 1, "consumed": 2, "width": 2},
+        {"ordinal": 2, "consumed": 2, "width": 2},
+    ]
+    assert receipt.frontier_target_commit_ns == 123_456
+    assert receipt.frontier_prelaunch_ns == 23_456
+    assert receipt.frontier_target_commit_ns_rank1 == 133_456
+    assert receipt.frontier_prelaunch_ns_rank1 == 33_456
     nonce_words = tuple(
         getattr(receipt, f"frontier_request_nonce_digest_word_{index}")
         for index in range(4)
@@ -2187,21 +2370,149 @@ def _scenario_frontier_receipt_v4(generate_module: ModuleType) -> None:
     )
     assert b"".join(word.to_bytes(8, "big") for word in rank1_words).hex() == rank1_file
     assert fixture.request._marker is not None
-    assert '"receipt_schema_version":4' in fixture.request._marker
+    assert '"receipt_schema_version":5' in fixture.request._marker
+    assert '"receipt_schema_version":4' not in fixture.request._marker
     serialized = GenerationStats(
         prompt_tps=1.0,
         generation_tps=2.0,
         prompt_tokens=3,
         generation_tokens=4,
         peak_memory_usage=Memory.from_bytes(5),
+        frontier_round_schedule=receipt.frontier_round_schedule,
+        frontier_target_commit_ns=receipt.frontier_target_commit_ns,
+        frontier_prelaunch_ns=receipt.frontier_prelaunch_ns,
         k3_w3_composition_receipt=receipt,
-    ).model_dump()["k3_w3_composition_receipt"]
-    assert serialized["schema"] == "kimi-k3-w3-composition-receipt/v4"
-    assert serialized["frontier_request_index"] == 1
-    assert "frontier_telemetry_file_digest_rank1_word_3" in serialized
+    ).model_dump()
+    assert serialized["frontier_round_schedule"][0]["ordinal"] == 1
+    assert serialized["frontier_target_commit_ns"] == 123_456
+    assert serialized["frontier_prelaunch_ns"] == 23_456
+    serialized_receipt = serialized["k3_w3_composition_receipt"]
+    assert serialized_receipt["schema"] == "kimi-k3-w3-composition-receipt/v5"
+    assert serialized_receipt["frontier_request_index"] == 16
+    assert "frontier_telemetry_file_digest_rank1_word_3" in serialized_receipt
     assert not any(
-        key.startswith(("process_rss_", "rss_", "metal_")) for key in serialized
+        key.startswith(("process_rss_", "rss_", "metal_")) for key in serialized_receipt
     )
+
+    substituted = receipt.model_dump(mode="json", by_alias=True)
+    substituted["schema"] = "kimi-k3-w3-composition-receipt/v4"
+    substituted["receipt_schema_version"] = 4
+    _expect_error(
+        Exception,
+        "validation error",
+        lambda: K3W3CompositionReceiptV5.model_validate(substituted),
+    )
+    _expect_error(
+        Exception,
+        "validation error",
+        lambda: K3W3CompositionReceiptV4.model_validate(substituted),
+    )
+    schedule_tamper = receipt.model_dump(mode="python", by_alias=True)
+    schedule_tamper["frontier_round_schedule"][0]["consumed"] = 1
+    _expect_error(
+        Exception,
+        "schedule/timing/core join is invalid",
+        lambda: K3W3CompositionReceiptV5.model_validate(schedule_tamper),
+    )
+
+    asymmetric = _build_fixture(generate_module, identity_enabled=True)
+    asymmetric.request.api = generate_module._PackedFrontReceiptAPI(
+        begin=lambda *_args, **_kwargs: (11, 29),
+        finish=lambda *_args, **_kwargs: dict(asymmetric.raw),
+        abort=lambda *_args: None,
+        commit_telemetry=asymmetric.request.api.commit_telemetry,
+        source_digest=asymmetric.request.api.source_digest,
+    )
+    asymmetric_context = object()
+    asymmetric.request._frontier_context = asymmetric_context
+    asymmetric.runtime.side_effect_post_failure = "frontier telemetry finalization"
+    digest_gathers: list[str] = []
+    asymmetric.runtime.collective = SimpleNamespace(
+        rank=0,
+        gather_rank_local_sha256=lambda name, _digest: digest_gathers.append(name),
+    )
+    poisoned_contexts: list[object] = []
+
+    def asymmetric_finalize(
+        _context: object,
+        _core: dict[str, object],
+    ) -> SimpleNamespace:
+        assert _context is asymmetric_context
+        return SimpleNamespace(
+            request_index=16,
+            request_nonce_sha256=nonce,
+            reset_generation=16,
+            receipt_v2_core_sha256=core_sha,
+            request_file_sha256=rank0_file,
+            process_complete_file_sha256=rank0_complete,
+        )
+
+    generate_module.k3_frontier_telemetry.finalize = asymmetric_finalize
+    generate_module.k3_frontier_telemetry.poison_finalized = (
+        lambda poisoned: poisoned_contexts.append(poisoned)
+    )
+    try:
+        _expect_error(
+            RuntimeError,
+            "injected peer frontier telemetry finalization failure",
+            lambda: asymmetric.request.finish(
+                asymmetric.runtime,
+                asymmetric.telemetry,
+            ),
+        )
+    finally:
+        generate_module.k3_frontier_telemetry.finalize = original_finalize
+        generate_module.k3_frontier_telemetry.poison_finalized = original_poison
+    assert poisoned_contexts == [asymmetric_context]
+    assert asymmetric.runtime.poison_reasons
+    assert digest_gathers == []
+
+
+def _scenario_exo_source_identity_forwarding_files(
+    generate_module: ModuleType,
+) -> None:
+    expected_forwarding_files = {
+        "exo.master.main": "src/exo/master/main.py",
+        "exo.shared.types.commands": "src/exo/shared/types/commands.py",
+        "exo.shared.types.tasks": "src/exo/shared/types/tasks.py",
+        "exo.worker.main": "src/exo/worker/main.py",
+        "exo.worker.plan": "src/exo/worker/plan.py",
+        "exo.worker.runner": "src/exo/worker/runner/runner.py",
+        "exo.worker.batch_generator": (
+            "src/exo/worker/runner/llm_inference/batch_generator.py"
+        ),
+    }
+    configured = dict(generate_module._EXO_SOURCE_RELATIVE_PATHS)
+    assert {
+        name: configured.get(name) for name in expected_forwarding_files
+    } == expected_forwarding_files
+
+    original_hash = generate_module._regular_file_sha256
+
+    def stable_hash(path: Path, *, identity: str) -> bytes:
+        return hashlib.sha256(f"{identity}\0{path}".encode()).digest()
+
+    generate_module._regular_file_sha256 = stable_hash
+    try:
+        baseline = generate_module._exo_source_digest()
+        for name, relative_path in expected_forwarding_files.items():
+            target_suffix = os.sep + relative_path.replace("/", os.sep)
+
+            def drifted_hash(
+                path: Path,
+                *,
+                identity: str,
+                _target_suffix: str = target_suffix,
+            ) -> bytes:
+                value = stable_hash(path, identity=identity)
+                if str(path).endswith(_target_suffix):
+                    return hashlib.sha256(value + b"drift").digest()
+                return value
+
+            generate_module._regular_file_sha256 = drifted_hash
+            assert generate_module._exo_source_digest() != baseline, name
+    finally:
+        generate_module._regular_file_sha256 = original_hash
 
 
 _SCENARIOS: dict[str, Callable[[ModuleType], None]] = {
@@ -2209,13 +2520,17 @@ _SCENARIOS: dict[str, Callable[[ModuleType], None]] = {
     "canonical-totals": _scenario_canonical_totals,
     "causal-fail-closed": _scenario_causal_fail_closed,
     "finish-abort-publication": _scenario_finish_abort_and_publication,
-    "frontier-receipt-v4": _scenario_frontier_receipt_v4,
+    "frontier-receipt-v5": _scenario_frontier_receipt_v5,
+    "exo-source-identity-forwarding-files": (
+        _scenario_exo_source_identity_forwarding_files
+    ),
     "identity-mutation": _scenario_identity_mutation,
     "identity-commit-telemetry": _scenario_identity_commit_telemetry,
     "lifecycle": _scenario_lifecycle,
     "native-counter-algebra": _scenario_native_counter_algebra,
     "native-image-identity": _scenario_native_image_identity,
     "prefill-geometry": _scenario_prefill_geometry,
+    "rank-agreed-admission-setup": _scenario_rank_agreed_admission_setup,
     "rank-local-sha256-gather": _scenario_rank_local_sha256_gather,
     "schema-default-wire": _scenario_schema_and_default_wire,
     "selector-admission": _scenario_selector_admission,

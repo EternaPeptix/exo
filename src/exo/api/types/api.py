@@ -3,7 +3,14 @@ from collections.abc import Generator
 from typing import Annotated, Any, Literal, get_args
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.types.common import CommandId, NodeId
@@ -356,6 +363,77 @@ class K3W3CompositionReceiptV4(K3W3CompositionReceipt):
     frontier_process_complete_digest_rank1_word_3: int
 
 
+class K3W3RoundScheduleEntry(BaseModel):
+    """Prompt-safe ordered speculative decision for one committed round."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    ordinal: int
+    consumed: int
+    width: Literal[0, 2]
+
+    @model_validator(mode="after")
+    def _validate_consumed_width(self) -> "K3W3RoundScheduleEntry":
+        if self.ordinal < 1 or self.consumed < 0 or self.consumed > self.width:
+            raise ValueError("Kimi K3 ordered round schedule algebra is invalid")
+        return self
+
+
+class K3W3CompositionReceiptV5(K3W3CompositionReceiptV4):
+    """Reviewed v4 telemetry plus ordered schedule and integer timing."""
+
+    receipt_schema: Literal["kimi-k3-w3-composition-receipt/v5"] = Field(alias="schema")
+    receipt_schema_version: Literal[5]
+    frontier_round_schedule: tuple[K3W3RoundScheduleEntry, ...]
+    # The unsuffixed pair is rank zero, which owns the public HTTP response.
+    # Rank one remains explicit so the receipt never collapses rank-local time.
+    frontier_target_commit_ns: int
+    frontier_prelaunch_ns: int
+    frontier_target_commit_ns_rank1: int
+    frontier_prelaunch_ns_rank1: int
+
+    @model_validator(mode="after")
+    def _validate_frontier_schedule_and_timing(self) -> "K3W3CompositionReceiptV5":
+        width2_rows = sum(row.width == 2 for row in self.frontier_round_schedule)
+        width0_rows = sum(row.width == 0 for row in self.frontier_round_schedule)
+        full_accept_rows = sum(
+            row.width == 2 and row.consumed == 2 for row in self.frontier_round_schedule
+        )
+        partial_accept_rows = width2_rows - full_accept_rows
+        if (
+            not self.frontier_round_schedule
+            or len(self.frontier_round_schedule) > 32768
+            or any(
+                row.ordinal != ordinal
+                for ordinal, row in enumerate(self.frontier_round_schedule, 1)
+            )
+            or any(
+                type(value) is not int or not 0 <= value <= 10_000_000_000_000
+                for value in (
+                    self.frontier_target_commit_ns,
+                    self.frontier_prelaunch_ns,
+                    self.frontier_target_commit_ns_rank1,
+                    self.frontier_prelaunch_ns_rank1,
+                )
+            )
+            or len(self.frontier_round_schedule)
+            != self.speculative_full_width_rounds + self.target_width1_rounds
+            or width2_rows != self.speculative_full_width_rounds
+            or width0_rows != self.target_width1_rounds
+            or sum(row.width for row in self.frontier_round_schedule)
+            != self.proposed_tokens
+            or sum(row.consumed for row in self.frontier_round_schedule)
+            != self.accepted_tokens
+            or full_accept_rows != self.speculative_full_accept_rounds
+            or partial_accept_rows != self.speculative_partial_accept_rounds
+            or self.emitted_tokens
+            != len(self.frontier_round_schedule)
+            + sum(row.consumed for row in self.frontier_round_schedule)
+        ):
+            raise ValueError("Kimi K3 frontier v5 schedule/timing/core join is invalid")
+        return self
+
+
 class GenerationStats(BaseModel):
     prompt_tps: float
     generation_tps: float
@@ -383,15 +461,28 @@ class GenerationStats(BaseModel):
     prefill_width1_chunks: int = 0
     prefill_width3_chunks: int = 0
     prefill_noncontract_chunks: int = 0
+    frontier_round_schedule: tuple[K3W3RoundScheduleEntry, ...] | None = None
+    frontier_target_commit_ns: int | None = None
+    frontier_prelaunch_ns: int | None = None
     k3_w3_composition_receipt: (
-        K3W3CompositionReceipt | K3W3CompositionReceiptV4 | None
+        K3W3CompositionReceipt
+        | K3W3CompositionReceiptV4
+        | K3W3CompositionReceiptV5
+        | None
     ) = None
 
     @model_serializer(mode="wrap")
     def _serialize_without_disabled_composition_receipt(self, handler: Any) -> Any:
         payload = handler(self)
-        if self.k3_w3_composition_receipt is None and isinstance(payload, dict):
-            payload.pop("k3_w3_composition_receipt", None)
+        if isinstance(payload, dict):
+            if self.k3_w3_composition_receipt is None:
+                payload.pop("k3_w3_composition_receipt", None)
+            if self.frontier_round_schedule is None:
+                payload.pop("frontier_round_schedule", None)
+            if self.frontier_target_commit_ns is None:
+                payload.pop("frontier_target_commit_ns", None)
+            if self.frontier_prelaunch_ns is None:
+                payload.pop("frontier_prelaunch_ns", None)
         return payload
 
 

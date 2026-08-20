@@ -141,6 +141,9 @@ class TelemetryCase(unittest.TestCase):
         self.mod.observe_metal(context)
         evidence = self.mod.finalize(context, _core(index + 1, 10_000 + index))
         assert evidence is not None
+        self.assertEqual(context.publication_state, "finalized-unpublished")
+        self.mod.mark_published(context)
+        self.assertEqual(context.publication_state, "published")
         return evidence
 
 
@@ -245,6 +248,31 @@ class TestSequenceAndEvidence(TelemetryCase):
             self.mod.finalize(context, _core(2, 10_001))
         self.assertFalse((self.directory / "request-01-rank0.json").exists())
 
+    def test_finalized_unpublished_abort_poison_cannot_be_ignored(self) -> None:
+        self._enable()
+        context = self._claim(1)
+        assert context is not None
+        self.mod.capture_reset_baseline(context)
+        evidence = self.mod.finalize(context, _core(2, 10_001))
+        self.assertIsNotNone(evidence)
+        self.assertEqual(context.publication_state, "finalized-unpublished")
+        self.mod.abort(context)
+        self.assertEqual(context.publication_state, "poisoned")
+        with self.assertRaisesRegex(RuntimeError, "overlap, replay, or sequence gap"):
+            self._claim(2)
+
+    def test_published_context_allows_exact_next_claim(self) -> None:
+        self._enable()
+        context = self._claim(1)
+        assert context is not None
+        self.mod.capture_reset_baseline(context)
+        self.assertIsNotNone(self.mod.finalize(context, _core(2, 10_001)))
+        self.mod.mark_published(context)
+        self.mod.abort(context)
+        second = self._claim(2)
+        self.assertIsNotNone(second)
+        self.mod.abort(second)
+
     def test_o_excl_collision_fails_closed_without_overwrite(self) -> None:
         self._enable()
         context = self._claim(1)
@@ -256,6 +284,80 @@ class TestSequenceAndEvidence(TelemetryCase):
         with self.assertRaises(FileExistsError):
             self.mod.finalize(context, _core(2, 10_001))
         self.assertEqual(target.read_bytes(), b"owned")
+
+    def test_post_create_failure_unlinks_authenticated_inode(self) -> None:
+        self._enable()
+        context = self._claim(1)
+        assert context is not None
+        self.mod.capture_reset_baseline(context)
+        original_inventory = self.mod._require_exact_inventory_fd
+        calls = 0
+
+        def fail_after_create(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected post-create inventory failure")
+            return original_inventory(*args, **kwargs)
+
+        directory_fsyncs: list[int] = []
+        original_fsync = self.mod.os.fsync
+
+        def observe_fsync(fd: int) -> None:
+            info = os.fstat(fd)
+            if pathlib.Path(self.directory).stat().st_ino == info.st_ino:
+                directory_fsyncs.append(fd)
+            original_fsync(fd)
+
+        with (
+            mock.patch.object(
+                self.mod,
+                "_require_exact_inventory_fd",
+                side_effect=fail_after_create,
+            ),
+            mock.patch.object(self.mod.os, "fsync", side_effect=observe_fsync),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "injected post-create inventory failure",
+            ),
+        ):
+            self.mod.finalize(context, _core(2, 10_001))
+        stale = self.directory / "request-01-rank0.json"
+        self.assertFalse(stale.exists())
+        self.assertTrue(directory_fsyncs)
+        with self.assertRaisesRegex(RuntimeError, "overlap, replay, or sequence gap"):
+            self._claim(2)
+
+    def test_replaced_name_is_never_unlinked_by_failed_writer(self) -> None:
+        self._enable()
+        context = self._claim(1)
+        assert context is not None
+        self.mod.capture_reset_baseline(context)
+        target = self.directory / "request-01-rank0.json"
+        displaced = self.directory / "created-but-displaced.json"
+        original_open = self.mod.os.open
+        name_opens = 0
+
+        def replace_before_reopen(path, flags, *args, **kwargs):
+            nonlocal name_opens
+            if path == target.name:
+                name_opens += 1
+                if name_opens == 2:
+                    target.rename(displaced)
+                    target.write_bytes(b"replacement")
+                    target.chmod(0o600)
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(self.mod.os, "open", side_effect=replace_before_reopen),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "cleanup failed|inode is invalid|sequence|verification failed",
+            ),
+        ):
+            self.mod.finalize(context, _core(2, 10_001))
+        self.assertEqual(target.read_bytes(), b"replacement")
+        self.assertTrue(displaced.exists())
 
     def test_sixteen_requests_publish_one_same_process_aggregate(self) -> None:
         self._enable()
@@ -291,6 +393,24 @@ class TestSequenceAndEvidence(TelemetryCase):
             evidence.process_complete_file_sha256,
         )
         self.assertEqual(len(list(self.directory.iterdir())), 17)
+
+    def test_request_sixteen_marker_failure_poison_after_process_file(self) -> None:
+        self._enable()
+        for index in range(1, 16):
+            self._finish(index)
+        context = self._claim(16)
+        assert context is not None
+        self.mod.capture_reset_baseline(context)
+        evidence = self.mod.finalize(context, _core(17, 10_016))
+        assert evidence is not None
+        self.assertIsNotNone(evidence.process_complete_file_sha256)
+        self.assertTrue((self.directory / "process-complete-rank0.json").exists())
+        self.mod.abort(context)
+        self.assertEqual(context.publication_state, "poisoned")
+        with self.assertRaisesRegex(RuntimeError, "publication state is invalid"):
+            self.mod.mark_published(context)
+        with self.assertRaisesRegex(RuntimeError, "overlap, replay, or sequence gap"):
+            self._claim(16)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from exo.api.types import (
     GenerationStats,
     K3W3CompositionReceipt,
     K3W3CompositionReceiptV4,
+    K3W3CompositionReceiptV5,
     PromptTokensDetails,
     TopLogprobItem,
     Usage,
@@ -172,6 +173,41 @@ class _DSparkRequestSetup:
     fingerprint: tuple[int, ...]
     verify_width: int
     receipt_session_id: str | None
+
+
+@dataclass(frozen=True)
+class _TerminalDecodeTiming:
+    elapsed_seconds: float
+    effective_tps: float
+
+
+def _capture_terminal_decode_timing(
+    started_at: float,
+    completion_tokens: int,
+    *,
+    clock: Callable[[], float] = time.perf_counter,
+) -> _TerminalDecodeTiming:
+    """Close authoritative compute timing before any diagnostic receipt I/O."""
+
+    ended_at = clock()
+    if (
+        isinstance(started_at, bool)
+        or not isinstance(started_at, (int, float))
+        or not math.isfinite(float(started_at))
+        or isinstance(ended_at, bool)
+        or not isinstance(ended_at, (int, float))
+        or not math.isfinite(float(ended_at))
+        or type(completion_tokens) is not int
+        or completion_tokens <= 0
+    ):
+        raise ValueError("terminal decode timing inputs are invalid")
+    elapsed = float(ended_at) - float(started_at)
+    if elapsed < 0.0:
+        raise ValueError("terminal decode clock moved backwards")
+    return _TerminalDecodeTiming(
+        elapsed_seconds=elapsed,
+        effective_tps=(completion_tokens / elapsed if elapsed > 0.0 else 0.0),
+    )
 
 
 @dataclass
@@ -644,23 +680,47 @@ def _runtime_source_digest() -> tuple[int, int, int, int]:
     return _digest_words(digest.digest())
 
 
+_EXO_SOURCE_RELATIVE_PATHS = (
+    ("exo.generate", "src/exo/worker/engines/mlx/generator/generate.py"),
+    (
+        "exo.kimi_k3_dspark",
+        "src/exo/worker/engines/mlx/generator/kimi_k3_dspark.py",
+    ),
+    (
+        "exo.k3_frontier_telemetry",
+        "src/exo/worker/engines/mlx/generator/k3_frontier_telemetry.py",
+    ),
+    ("exo.builder", "src/exo/worker/engines/mlx/builder.py"),
+    ("exo.api.main", "src/exo/api/main.py"),
+    ("exo.api.chat_adapter", "src/exo/api/adapters/chat_completions.py"),
+    ("exo.api.types.api", "src/exo/api/types/api.py"),
+    ("exo.api.types.init", "src/exo/api/types/__init__.py"),
+    ("exo.master.main", "src/exo/master/main.py"),
+    ("exo.shared.types.commands", "src/exo/shared/types/commands.py"),
+    ("exo.shared.types.tasks", "src/exo/shared/types/tasks.py"),
+    (
+        "exo.text_generation_types",
+        "src/exo/shared/types/text_generation.py",
+    ),
+    ("exo.worker.main", "src/exo/worker/main.py"),
+    ("exo.worker.plan", "src/exo/worker/plan.py"),
+    ("exo.worker.runner", "src/exo/worker/runner/runner.py"),
+    (
+        "exo.worker.batch_generator",
+        "src/exo/worker/runner/llm_inference/batch_generator.py",
+    ),
+    (
+        "exo.rank_local_checkpoint",
+        "src/exo/worker/engines/mlx/rank_local_checkpoint.py",
+    ),
+)
+
+
 def _exo_source_digest() -> tuple[int, int, int, int]:
     """Bind the EXO validator, causal observer, schema, and loader bridge."""
 
     generate_path = Path(__file__)
     repository = generate_path.resolve(strict=True).parents[6]
-    api_module = importlib.import_module("exo.api.types.api")
-    api_init_module = importlib.import_module("exo.api.types")
-    rank_local_module = importlib.import_module(
-        "exo.worker.engines.mlx.rank_local_checkpoint"
-    )
-
-    def module_path(module: object, name: str) -> Path:
-        raw_path = getattr(module, "__file__", None)
-        if type(raw_path) is not str:
-            raise RuntimeError(f"{name} has no filesystem identity")
-        return Path(raw_path)
-
     configured_loader = os.environ.get("EXO_MLX_RANK_LOCAL_LOADER")
     loader_path = (
         Path(configured_loader)
@@ -669,27 +729,10 @@ def _exo_source_digest() -> tuple[int, int, int, int]:
     )
 
     module_paths = {
-        "exo.generate": generate_path,
-        "exo.kimi_k3_dspark": generate_path.with_name("kimi_k3_dspark.py"),
-        "exo.k3_frontier_telemetry": generate_path.with_name(
-            "k3_frontier_telemetry.py"
-        ),
-        "exo.builder": generate_path.parent.parent / "builder.py",
-        "exo.api.main": generate_path.parents[4] / "api" / "main.py",
-        "exo.api.chat_adapter": (
-            generate_path.parents[4] / "api" / "adapters" / "chat_completions.py"
-        ),
-        "exo.text_generation_types": (
-            generate_path.parents[4] / "shared" / "types" / "text_generation.py"
-        ),
-        "exo.api.types.api": module_path(api_module, "exo.api.types.api"),
-        "exo.api.types.init": module_path(api_init_module, "exo.api.types"),
-        "exo.rank_local_checkpoint": module_path(
-            rank_local_module,
-            "exo.worker.engines.mlx.rank_local_checkpoint",
-        ),
-        "scripts.rank_local_loader": loader_path,
+        name: repository / relative_path
+        for name, relative_path in _EXO_SOURCE_RELATIVE_PATHS
     }
+    module_paths["scripts.rank_local_loader"] = loader_path
     digest = hashlib.sha256(b"exo-kimi-k3-w3-exo-source/v1\0")
     for name, path in module_paths.items():
         digest.update(name.encode("ascii"))
@@ -1235,6 +1278,70 @@ def _parse_canonical_numeric_json(text: str) -> dict[str, object]:
     return parsed
 
 
+def _validated_frontier_v5_payload(payload: dict[str, object]) -> dict[str, object]:
+    schedule = payload.get("frontier_round_schedule")
+    if (
+        payload.get("receipt_schema_version") != 5
+        or payload.get("frontier_telemetry_schema_version") != 4
+        or type(schedule) not in {list, tuple}
+        or not 1 <= len(cast(list[object] | tuple[object, ...], schedule)) <= 32768
+    ):
+        raise ValueError("frontier receipt v5 schema/schedule is invalid")
+    normalized_schedule: list[dict[str, int]] = []
+    for ordinal, raw_row in enumerate(
+        cast(list[object] | tuple[object, ...], schedule),
+        1,
+    ):
+        if type(raw_row) is not dict:
+            raise TypeError("frontier receipt v5 schedule row must be a mapping")
+        row = cast(dict[object, object], raw_row)
+        if (
+            set(row) != {"ordinal", "consumed", "width"}
+            or row.get("ordinal") != ordinal
+            or type(row.get("consumed")) is not int
+            or type(row.get("width")) is not int
+            or row["width"] not in {0, 2}
+            or cast(int, row["consumed"]) < 0
+            or cast(int, row["consumed"]) > cast(int, row["width"])
+        ):
+            raise ValueError("frontier receipt v5 schedule algebra is invalid")
+        normalized_schedule.append(
+            {
+                "ordinal": ordinal,
+                "consumed": cast(int, row["consumed"]),
+                "width": cast(int, row["width"]),
+            }
+        )
+    # Pydantic's strict/frozen v5 contract intentionally requires a tuple.
+    # JSON agreement naturally decodes arrays as lists, so cross that boundary
+    # explicitly before model validation while retaining canonical JSON output.
+    parsed = {**payload, "frontier_round_schedule": tuple(normalized_schedule)}
+    if any(
+        name != "frontier_round_schedule" and type(value) not in {bool, int}
+        for name, value in parsed.items()
+    ):
+        raise TypeError("frontier receipt v5 values must be numeric or schedule rows")
+    return parsed
+
+
+def _canonical_frontier_v5_json(payload: dict[str, object]) -> str:
+    return json.dumps(
+        _validated_frontier_v5_payload(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _parse_canonical_frontier_v5_json(text: str) -> dict[str, object]:
+    value = cast(object, json.loads(text))
+    if type(value) is not dict:
+        raise TypeError("frontier receipt v5 agreement must be a mapping")
+    parsed = _validated_frontier_v5_payload(cast(dict[str, object], value))
+    if _canonical_frontier_v5_json(parsed) != text:
+        raise ValueError("frontier receipt v5 agreement JSON is not canonical")
+    return parsed
+
+
 def _packed_front_request_token(
     setup_fingerprint: tuple[int, ...],
     *,
@@ -1396,9 +1503,15 @@ class _PackedFrontReceiptRequest:
     _replayssm_final: _BatchedReplaySSMTelemetrySnapshot | None = None
     _runtime: KimiK3DSparkRequestRuntime | None = None
     _handle: tuple[int, int] | None = None
-    _receipt: K3W3CompositionReceipt | K3W3CompositionReceiptV4 | None = None
+    _receipt: (
+        K3W3CompositionReceipt
+        | K3W3CompositionReceiptV4
+        | K3W3CompositionReceiptV5
+        | None
+    ) = None
     _frontier_context: k3_frontier_telemetry.FrontierTelemetryContext | None = None
     _marker: str | None = None
+    _lifecycle_completed: bool = False
     _published: bool = False
     _poisoned: bool = False
     _stale_events: int = 0
@@ -1412,6 +1525,8 @@ class _PackedFrontReceiptRequest:
     _tail_prelaunch_submitted: int = 0
     _tail_prelaunch_used: int = 0
     _tail_prelaunch_discarded: int = 0
+    _target_commit_ns: int = 0
+    _prelaunch_ns: int = 0
     _native_fd_closed: bool = False
     _schedule_digest: _NumericReceiptDigest = field(
         default_factory=lambda: _NumericReceiptDigest(b"exo-kimi-k3-w3-schedule/v1\0")
@@ -1549,6 +1664,19 @@ class _PackedFrontReceiptRequest:
             *self.exo_source_digest,
             *self.native_api.lib_digest,
             *self.native_api.lib_identity,
+        )
+
+    def _rank_common_identity(self) -> tuple[int, ...]:
+        """Return only content/contract identity that must agree across hosts."""
+
+        if self.api is None or self.native_api is None:
+            raise RuntimeError("W3 composition rank-common identity is unavailable")
+        return (
+            *self.selector_digest,
+            *self.launch_contract_digest,
+            *self.api.source_digest,
+            *self.exo_source_digest,
+            *self.native_api.lib_digest,
         )
 
     def capture_frontier_reset_baseline(self) -> None:
@@ -1748,11 +1876,29 @@ class _PackedFrontReceiptRequest:
             )
             if any(type(value) is not int or value < 0 for value in record):
                 raise ValueError("W3 receipt round values are invalid")
+            timing_values = (stats.target_commit_ms, stats.prelaunch_ms)
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+                for value in timing_values
+            ):
+                raise ValueError("W3 receipt timing must be finite and non-negative")
+            target_commit_ns = round(float(stats.target_commit_ms) * 1_000_000.0)
+            prelaunch_ns = round(float(stats.prelaunch_ms) * 1_000_000.0)
+            if (
+                self._target_commit_ns + target_commit_ns > 10_000_000_000_000
+                or self._prelaunch_ns + prelaunch_ns > 10_000_000_000_000
+            ):
+                raise ValueError("W3 receipt timing exceeds its numeric bound")
             self._round_records.append(record)
             self._schedule_digest.update(*record[:-1])
             self._cache_digest.update(stats.round_index, target_cache_tokens)
             self._tail_prelaunch_submitted += int(stats.prelaunch_submitted)
             self._tail_prelaunch_used += int(stats.prelaunch_used)
+            self._target_commit_ns += target_commit_ns
+            self._prelaunch_ns += prelaunch_ns
         except Exception:
             self._poisoned = True
 
@@ -2618,7 +2764,7 @@ class _PackedFrontReceiptRequest:
         self,
         runtime: KimiK3DSparkRequestRuntime,
         telemetry: "_PromptLookupTelemetry",
-    ) -> K3W3CompositionReceipt | K3W3CompositionReceiptV4:
+    ) -> K3W3CompositionReceipt | K3W3CompositionReceiptV4 | K3W3CompositionReceiptV5:
         if not self.enabled or self.api is None or self._handle is None:
             raise RuntimeError("packed-front receipt finish state is invalid")
 
@@ -2647,11 +2793,37 @@ class _PackedFrontReceiptRequest:
         )
         if core_receipt.model_dump(exclude={"receipt_schema"}) != core_marker_payload:
             raise ValueError("packed-front receipt marker changed during validation")
-        evidence = k3_frontier_telemetry.finalize(
-            self._frontier_context,
-            core_marker_payload,
-        )
-        receipt: K3W3CompositionReceipt | K3W3CompositionReceiptV4 = core_receipt
+        evidence: k3_frontier_telemetry.FrontierTelemetryEvidence | None = None
+
+        def finalize_frontier_evidence() -> None:
+            nonlocal evidence
+            evidence = k3_frontier_telemetry.finalize(
+                self._frontier_context,
+                core_marker_payload,
+            )
+
+        try:
+            runtime.agree_local_side_effect(
+                "frontier telemetry finalization",
+                finalize_frontier_evidence,
+            )
+        except BaseException:
+            k3_frontier_telemetry.poison_finalized(self._frontier_context)
+            runtime.poison_materialization(
+                "frontier telemetry finalization failed or differed across ranks"
+            )
+            raise
+        if self._frontier_context is not None and evidence is None:
+            k3_frontier_telemetry.poison_finalized(self._frontier_context)
+            runtime.poison_materialization(
+                "frontier telemetry finalization returned no evidence"
+            )
+            raise RuntimeError(
+                "enabled frontier telemetry produced no rank-local evidence"
+            )
+        receipt: (
+            K3W3CompositionReceipt | K3W3CompositionReceiptV4 | K3W3CompositionReceiptV5
+        ) = core_receipt
         agreed_marker = agreed_core_marker
         if evidence is not None:
             try:
@@ -2710,42 +2882,96 @@ class _PackedFrontReceiptRequest:
                         completion_digests[1],
                     ),
                 }
-                agreed_marker = runtime.agree_text(
-                    "frontier receipt v4",
-                    lambda: _canonical_numeric_json(v4_payload),
+                schedule = tuple(
+                    {
+                        "ordinal": ordinal,
+                        "consumed": record[2],
+                        "width": record[1],
+                    }
+                    for ordinal, record in enumerate(self._round_records, 1)
                 )
-                marker_payload = _parse_canonical_numeric_json(agreed_marker)
-                receipt = K3W3CompositionReceiptV4.model_validate(
+                timing_rows = runtime.gather_frontier_timing_evidence(
+                    (self._target_commit_ns, self._prelaunch_ns),
+                    local_complete=(
+                        not self._poisoned
+                        and len(schedule) == telemetry.rounds
+                        and telemetry.rounds > 0
+                    ),
+                )
+                v5_payload = {
+                    **v4_payload,
+                    "receipt_schema_version": 5,
+                    "frontier_round_schedule": schedule,
+                    "frontier_target_commit_ns": timing_rows[0][0],
+                    "frontier_prelaunch_ns": timing_rows[0][1],
+                    "frontier_target_commit_ns_rank1": timing_rows[1][0],
+                    "frontier_prelaunch_ns_rank1": timing_rows[1][1],
+                }
+                agreed_marker = runtime.agree_text(
+                    "frontier receipt v5",
+                    lambda: _canonical_frontier_v5_json(v5_payload),
+                )
+                marker_payload = _parse_canonical_frontier_v5_json(agreed_marker)
+                receipt = K3W3CompositionReceiptV5.model_validate(
                     {
                         "schema": k3_frontier_telemetry.MARKER_SCHEMA,
                         **marker_payload,
                     }
                 )
-                if receipt.model_dump(exclude={"receipt_schema"}) != marker_payload:
-                    raise ValueError("frontier receipt v4 changed during validation")
+                if (
+                    _canonical_frontier_v5_json(
+                        receipt.model_dump(
+                            mode="python",
+                            exclude={"receipt_schema"},
+                        )
+                    )
+                    != agreed_marker
+                ):
+                    raise ValueError("frontier receipt v5 changed during validation")
             except BaseException:
                 k3_frontier_telemetry.poison_finalized(self._frontier_context)
+                runtime.poison_materialization(
+                    "frontier receipt v5 join failed or differed across ranks"
+                )
                 raise
         self._handle = None
         runtime.attach_composition_receipt_sink(None)
-        self._runtime = None
         self._receipt = receipt
         self._marker = agreed_marker
         return receipt
 
     def verify_marker_publication(self) -> None:
-        if self._receipt is None or self._marker is None or self._published:
+        if (
+            self._receipt is None
+            or self._marker is None
+            or self._published
+            or self._poisoned
+            or self._lifecycle_completed
+        ):
             raise RuntimeError("packed-front receipt marker state is invalid")
         self._assert_runtime_identity()
 
     def emit_marker(self, *, rank_zero: bool) -> None:
-        self.verify_marker_publication()
+        if (
+            self._receipt is None
+            or self._marker is None
+            or not self._published
+            or self._poisoned
+            or not self._lifecycle_completed
+        ):
+            raise RuntimeError("packed-front committed marker state is invalid")
         if rank_zero:
             logger.info(f"K3_W3_COMPOSITION_RECEIPT {self._marker}")
         logger.complete()
 
-    def mark_marker_published(self) -> None:
-        if self._receipt is None or self._marker is None or self._published:
+    def complete_marker_lifecycle(self) -> None:
+        if (
+            self._receipt is None
+            or self._marker is None
+            or self._published
+            or self._poisoned
+            or self._lifecycle_completed
+        ):
             raise RuntimeError("packed-front receipt marker state is invalid")
         if self._frontier_context is None:
             _record_composition_receipt_publication(
@@ -2758,14 +2984,44 @@ class _PackedFrontReceiptRequest:
                 self._phase_identity(),
                 frontier_multi_request=True,
             )
+        self._lifecycle_completed = True
+
+    def commit_marker_published(self) -> None:
+        if (
+            self._receipt is None
+            or self._marker is None
+            or self._published
+            or self._poisoned
+            or not self._lifecycle_completed
+        ):
+            raise RuntimeError("packed-front receipt publication commit is invalid")
+        k3_frontier_telemetry.mark_published(self._frontier_context)
         self._published = True
+        self._runtime = None
         self._close_native_fd()
+
+    def poison_publication_failure(
+        self,
+        runtime: KimiK3DSparkRequestRuntime,
+        reason: str,
+    ) -> None:
+        """Irrevocably poison an emitted/finalized receipt that did not commit."""
+
+        self._published = False
+        self._poisoned = True
+        k3_frontier_telemetry.poison_finalized(self._frontier_context)
+        runtime.poison_materialization(reason)
 
     def abort(self) -> None:
         handle = self._handle
         self._handle = None
         runtime = self._runtime
         self._runtime = None
+        if runtime is not None and self._receipt is not None and not self._published:
+            self.poison_publication_failure(
+                runtime,
+                "composition receipt finalized but publication did not commit",
+            )
         if runtime is not None:
             with contextlib.suppress(Exception):
                 runtime.attach_composition_receipt_sink(None)
@@ -2786,18 +3042,30 @@ def _publish_composition_receipt(
 ) -> None:
     """Rank-agree every external marker and lifecycle side effect in order."""
 
-    runtime.agree_local_side_effect(
-        "W3 composition marker prepublication verification",
-        receipt.verify_marker_publication,
-    )
-    runtime.agree_local_side_effect(
-        "W3 composition marker publication",
-        lambda: receipt.emit_marker(rank_zero=runtime.collective.rank == 0),
-    )
-    runtime.agree_local_side_effect(
-        "W3 composition marker lifecycle completion",
-        receipt.mark_marker_published,
-    )
+    try:
+        runtime.agree_local_side_effect(
+            "W3 composition marker prepublication verification",
+            receipt.verify_marker_publication,
+        )
+        runtime.agree_local_side_effect(
+            "W3 composition marker lifecycle completion",
+            receipt.complete_marker_lifecycle,
+        )
+        runtime.agree_local_side_effect(
+            "W3 composition marker publication commit",
+            receipt.commit_marker_published,
+        )
+        # Every bilateral failure point is complete before rank zero writes the
+        # irreversible public marker.  There is intentionally no peer
+        # collective after this write: a visible marker proves the response
+        # enqueue plus all lifecycle/telemetry commits already succeeded.
+        receipt.emit_marker(rank_zero=runtime.collective.rank == 0)
+    except BaseException:
+        receipt.poison_publication_failure(
+            runtime,
+            "composition receipt publication failed or differed across ranks",
+        )
+        raise
 
 
 _DSPARK_ORDINARY_AFTER_CONTEXT_ENV = "EXO_MLX_KIMI_K3_DSPARK_ORDINARY_AFTER_CONTEXT"
@@ -3932,9 +4200,122 @@ def _dspark_setup_error_fingerprint(error: str | None) -> int:
     ) or 1
 
 
+def _packed_front_admission_fingerprint(
+    receipt: _PackedFrontReceiptRequest,
+) -> tuple[int, int, int, int]:
+    """Bind the common receipt identity and sanitized executor request claim."""
+
+    digest = hashlib.sha256(b"exo-kimi-k3-packed-front-admission/v1\0")
+    for value in (int(receipt.enabled), receipt.phase):
+        digest.update(value.to_bytes(8, "big"))
+    if receipt.enabled:
+        for value in receipt._rank_common_identity():
+            if type(value) is not int or not 0 <= value <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("packed-front admission identity is invalid")
+            digest.update(value.to_bytes(8, "big"))
+    context = receipt._frontier_context
+    digest.update(int(context is not None).to_bytes(1, "big"))
+    if context is not None:
+        for value in (
+            context.request_index,
+            context.reset_generation,
+            context.world_size,
+        ):
+            digest.update(value.to_bytes(8, "big"))
+        digest.update(bytes.fromhex(context.request_nonce_sha256))
+        digest.update(bytes.fromhex(context.session_sha256))
+    raw = digest.digest()
+    return tuple(
+        int.from_bytes(raw[offset : offset + 4], "big") & 0x7FFFFFFF
+        for offset in range(0, 16, 4)
+    )
+
+
+def _poison_failed_packed_front_request(
+    dspark: LoadedKimiK3DSpark,
+    receipt: _PackedFrontReceiptRequest | None,
+    reason: str,
+) -> None:
+    """Non-collective convergence cleanup after an already-agreed failure."""
+
+    if receipt is not None:
+        with contextlib.suppress(BaseException):
+            receipt.abort()
+    k3_frontier_telemetry.poison_sequence(
+        None if receipt is None else receipt._frontier_context
+    )
+    dspark.materialization_poison.poison(reason)
+
+
+def _rank_agreed_packed_front_admission(
+    model: Model,
+    dspark: LoadedKimiK3DSpark,
+    task: TextGenerationTaskParams,
+    group: mx.distributed.Group,
+    *,
+    phase: Literal["engine_startup", "api"],
+) -> _PackedFrontReceiptRequest:
+    """Run every failure-prone receipt claim/load before setup in one join."""
+
+    agreement = MlxRankAgreement(
+        group,
+        rank_zero_proposal_recovery=dspark.config.rank_zero_proposal_recovery,
+    )
+    receipt: _PackedFrontReceiptRequest | None = None
+    local_error: str | None = None
+    local_fingerprint = (0, 0, 0, 0)
+    try:
+        dspark.assert_healthy()
+        receipt = _PackedFrontReceiptRequest.from_environment(
+            model,
+            dspark,
+            task,
+            group,
+            phase=phase,
+        )
+        local_fingerprint = _packed_front_admission_fingerprint(receipt)
+    except BaseException as error:  # noqa: BLE001 - ranks must still converge
+        local_error = f"{type(error).__name__}: {error}"
+
+    try:
+        outcome = agreement.agree_stage_success(local_error is None)
+        error_fingerprint = agreement.agree_token(
+            _dspark_setup_error_fingerprint(local_error)
+        )
+        fingerprint_agreement = tuple(
+            agreement.agree_token(word) for word in local_fingerprint
+        )
+    except BaseException as error:  # noqa: BLE001 - peers must still converge
+        _poison_failed_packed_front_request(
+            dspark,
+            receipt,
+            f"packed-front admission agreement failed: {type(error).__name__}",
+        )
+        raise
+
+    if (
+        outcome is not True
+        or error_fingerprint != 0
+        or fingerprint_agreement != local_fingerprint
+        or receipt is None
+    ):
+        detail = (
+            f"failed on every rank: {local_error}"
+            if outcome is False and local_error is not None
+            else "outcomes or receipt/request identities disagreed across ranks"
+        )
+        _poison_failed_packed_front_request(dspark, receipt, detail)
+        raise DSparkDistributedStateError(
+            f"Kimi K3 packed-front admission {detail}; request setup was not entered"
+        ) from None
+    return receipt
+
+
 def _rank_agreed_dspark_setup(
     agreement: MlxRankAgreement,
     operation: Callable[[], _DSparkRequestSetup],
+    *,
+    on_failure: Callable[[str], None],
 ) -> _DSparkRequestSetup:
     """Run local setup, then fixed-order agree success and its full contract."""
 
@@ -3942,17 +4323,21 @@ def _rank_agreed_dspark_setup(
     local_error: str | None = None
     try:
         result = operation()
-    except Exception as error:
+    except BaseException as error:  # noqa: BLE001 - peers must still converge
         local_error = f"{type(error).__name__}: {error}"
 
-    outcome = agreement.agree_stage_success(local_error is None)
-    error_fingerprint = agreement.agree_token(
-        _dspark_setup_error_fingerprint(local_error)
-    )
-    local_fingerprint = result.fingerprint if result is not None else (0, 0, 0, 0)
-    fingerprint_agreement = tuple(
-        agreement.agree_token(word) for word in local_fingerprint
-    )
+    try:
+        outcome = agreement.agree_stage_success(local_error is None)
+        error_fingerprint = agreement.agree_token(
+            _dspark_setup_error_fingerprint(local_error)
+        )
+        local_fingerprint = result.fingerprint if result is not None else (0, 0, 0, 0)
+        fingerprint_agreement = tuple(
+            agreement.agree_token(word) for word in local_fingerprint
+        )
+    except BaseException as error:  # noqa: BLE001 - peers must fail together
+        on_failure(f"setup agreement failed: {type(error).__name__}")
+        raise
 
     if (
         outcome is not True
@@ -3964,6 +4349,7 @@ def _rank_agreed_dspark_setup(
             if outcome is False and local_error is not None
             else "outcomes or request controls disagreed across ranks"
         )
+        on_failure(detail)
         raise DSparkDistributedStateError(
             f"Kimi K3 DSpark setup {detail}; no target TP graph was built"
         ) from None
@@ -3971,6 +4357,38 @@ def _rank_agreed_dspark_setup(
     if agreed_result.packed_agreements:
         agreement.activate_packed_agreements()
     return agreed_result
+
+
+def _validate_generation_receipt_admission(
+    *,
+    width4_receipt_scope: Literal["request", "warmup"],
+    width4_receipt_claim: Width4RequestReceiptClaim | None,
+    packed_front_receipt: _PackedFrontReceiptRequest,
+    task: TextGenerationTaskParams,
+    kv_prefix_cache: KVPrefixCache | None,
+    dspark: LoadedKimiK3DSpark | None,
+) -> None:
+    """Validate rank-local receipt controls inside the setup agreement."""
+
+    if width4_receipt_scope not in {"request", "warmup"}:
+        raise ValueError(f"invalid width-four receipt scope: {width4_receipt_scope}")
+    if width4_receipt_scope == "warmup" and width4_receipt_claim is not None:
+        raise ValueError("width-four warmup cannot carry a request-admission claim")
+    receipt_enabled = width4_receipt_scope == "request" and width4_receipt_log_enabled()
+    if receipt_enabled and width4_receipt_claim is None:
+        raise ValueError(
+            "enabled width-four receipt requires a service-admission claim"
+        )
+    if not receipt_enabled and width4_receipt_claim is not None:
+        raise ValueError("width-four request-admission claim reached disabled receipt")
+    if receipt_enabled and dspark is None:
+        raise ValueError("enabled width-four receipt requires Kimi K3 DSpark")
+    if packed_front_receipt.enabled and (
+        task.use_prefix_cache or kv_prefix_cache is not None
+    ):
+        raise ValueError(
+            "packed-front diagnostic mode requires prefix caching to be disabled"
+        )
 
 
 def _prepare_dspark_request_setup(
@@ -3986,13 +4404,25 @@ def _prepare_dspark_request_setup(
     agreement: MlxRankAgreement,
     generation_progress: bool,
     width4_receipt_scope: Literal["request", "warmup"],
+    width4_receipt_claim: Width4RequestReceiptClaim | None,
     packed_front_receipt: _PackedFrontReceiptRequest,
 ) -> _DSparkRequestSetup:
     """Build all failure-prone local request state without entering TP graphs."""
 
+    _validate_generation_receipt_admission(
+        width4_receipt_scope=width4_receipt_scope,
+        width4_receipt_claim=width4_receipt_claim,
+        packed_front_receipt=packed_front_receipt,
+        task=task,
+        kv_prefix_cache=kv_prefix_cache,
+        dspark=dspark,
+    )
+    dspark.assert_healthy()
     mx.reset_peak_memory()
     packed_front_receipt.capture_frontier_reset_baseline()
     is_pipeline = _has_pipeline_communication_layer(model)
+    if packed_front_receipt.enabled and is_pipeline:
+        raise ValueError("W3 composition diagnostic requires non-pipeline DSpark TP")
     prompt_lookup_configuration = prompt_lookup_config(
         is_pipeline=is_pipeline,
         is_batch=False,
@@ -4327,32 +4757,10 @@ def _mlx_generate_impl(
     width4_receipt_claim: Width4RequestReceiptClaim | None = None,
     packed_front_receipt: _PackedFrontReceiptRequest | None = None,
 ) -> Generator[GenerationResponse]:
-    if width4_receipt_scope not in {"request", "warmup"}:
-        raise ValueError(f"invalid width-four receipt scope: {width4_receipt_scope}")
-    if width4_receipt_scope == "warmup" and width4_receipt_claim is not None:
-        raise ValueError("width-four warmup cannot carry a request-admission claim")
-    receipt_enabled = width4_receipt_scope == "request" and width4_receipt_log_enabled()
-    if receipt_enabled and width4_receipt_claim is None:
-        raise ValueError(
-            "enabled width-four receipt requires a service-admission claim"
-        )
-    if not receipt_enabled and width4_receipt_claim is not None:
-        raise ValueError("width-four request-admission claim reached disabled receipt")
-    if receipt_enabled and dspark is None:
-        raise ValueError("enabled width-four receipt requires Kimi K3 DSpark")
     if packed_front_receipt is None:
         raise ValueError("packed-front receipt request context is missing")
-    if packed_front_receipt.enabled and (
-        task.use_prefix_cache or kv_prefix_cache is not None
-    ):
-        raise ValueError(
-            "packed-front diagnostic mode requires prefix caching to be disabled"
-        )
     dspark_setup: _DSparkRequestSetup | None = None
     if dspark is not None:
-        # A prior uncertain target submission can leave this process's shared
-        # Metal/JACCL stream unsafe. Reject locally before any setup agreement.
-        dspark.assert_healthy()
         if group is None:
             raise DSparkDistributedStateError(
                 "Kimi K3 DSpark setup requires a tensor-parallel group"
@@ -4375,7 +4783,13 @@ def _mlx_generate_impl(
                 agreement=agreement,
                 generation_progress=on_generation_token is not None,
                 width4_receipt_scope=width4_receipt_scope,
+                width4_receipt_claim=width4_receipt_claim,
                 packed_front_receipt=packed_front_receipt,
+            ),
+            on_failure=lambda reason: _poison_failed_packed_front_request(
+                dspark,
+                packed_front_receipt,
+                f"Kimi K3 DSpark setup {reason}",
             ),
         )
         selection = dspark_setup.proposer_selection
@@ -4391,16 +4805,20 @@ def _mlx_generate_impl(
                 f"identity_sha256={selection.identity_sha256}"
             )
         is_pipeline = dspark_setup.is_pipeline
-        if packed_front_receipt.enabled and is_pipeline:
-            raise ValueError(
-                "W3 composition diagnostic requires non-pipeline DSpark TP"
-            )
         prompt_lookup_configuration = dspark_setup.prompt_lookup_configuration
         all_prompt_tokens = dspark_setup.all_prompt_tokens
         min_prefix_hit_length = 1000
         vision: VisionResult | None = None
         media_regions: list[MediaRegion] = []
     else:
+        _validate_generation_receipt_admission(
+            width4_receipt_scope=width4_receipt_scope,
+            width4_receipt_claim=width4_receipt_claim,
+            packed_front_receipt=packed_front_receipt,
+            task=task,
+            kv_prefix_cache=kv_prefix_cache,
+            dspark=None,
+        )
         # Ensure that generation stats only contains this request's peak memory.
         mx.reset_peak_memory()
         is_pipeline = _has_pipeline_communication_layer(model)
@@ -4830,7 +5248,13 @@ def _mlx_generate_impl(
             finish_reason = cast(FinishReason | None, raw_finish_reason)
 
             is_done = finish_reason is not None
-            terminal_packed_front_receipt: K3W3CompositionReceipt | None = None
+            terminal_packed_front_receipt: (
+                K3W3CompositionReceipt
+                | K3W3CompositionReceiptV4
+                | K3W3CompositionReceiptV5
+                | None
+            ) = None
+            terminal_decode_timing: _TerminalDecodeTiming | None = None
             composition_terminal_barrier_complete = False
             if is_done and packed_front_receipt.enabled:
                 if dspark_runtime is None:
@@ -4848,6 +5272,10 @@ def _mlx_generate_impl(
                     # later terminal error escaped the interval.
                     mx_barrier(group)
                     composition_terminal_barrier_complete = True
+                terminal_decode_timing = _capture_terminal_decode_timing(
+                    generation_start_time,
+                    completion_tokens,
+                )
                 terminal_packed_front_receipt = packed_front_receipt.finish(
                     dspark_runtime,
                     prompt_lookup_telemetry,
@@ -4862,7 +5290,11 @@ def _mlx_generate_impl(
                 agreed_token: int = _agreed_token,
                 finish_reason: FinishReason | None = finish_reason,
                 terminal_packed_front_receipt: K3W3CompositionReceipt
+                | K3W3CompositionReceiptV4
+                | K3W3CompositionReceiptV5
                 | None = terminal_packed_front_receipt,
+                terminal_decode_timing: _TerminalDecodeTiming
+                | None = terminal_decode_timing,
             ) -> GenerationResponse:
                 prompt_lookup_telemetry.observe_visible_token(
                     from_draft=bool(out.from_draft)
@@ -4878,13 +5310,25 @@ def _mlx_generate_impl(
                             raise RuntimeError(
                                 "packed-front receipt was not finalized before stats"
                             )
+                        if terminal_decode_timing is None:
+                            raise RuntimeError(
+                                "packed-front decode timing was not closed before receipt"
+                            )
                     else:
                         decode_outputs.close()
-                    decode_elapsed_seconds = time.perf_counter() - generation_start_time
-                    effective_generation_tps = (
-                        completion_tokens / decode_elapsed_seconds
-                        if decode_elapsed_seconds > 0
-                        else 0.0
+                        terminal_decode_timing = _capture_terminal_decode_timing(
+                            generation_start_time,
+                            completion_tokens,
+                        )
+                    decode_elapsed_seconds = terminal_decode_timing.elapsed_seconds
+                    effective_generation_tps = terminal_decode_timing.effective_tps
+                    frontier_v5_receipt = (
+                        terminal_packed_front_receipt
+                        if isinstance(
+                            terminal_packed_front_receipt,
+                            K3W3CompositionReceiptV5,
+                        )
+                        else None
                     )
                     prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
                     if prefix_hit_length > 0:
@@ -4926,6 +5370,21 @@ def _mlx_generate_impl(
                         ),
                         prefill_noncontract_chunks=(
                             prompt_lookup_telemetry.prefill_noncontract_chunks
+                        ),
+                        frontier_round_schedule=(
+                            frontier_v5_receipt.frontier_round_schedule
+                            if frontier_v5_receipt is not None
+                            else None
+                        ),
+                        frontier_target_commit_ns=(
+                            frontier_v5_receipt.frontier_target_commit_ns
+                            if frontier_v5_receipt is not None
+                            else None
+                        ),
+                        frontier_prelaunch_ns=(
+                            frontier_v5_receipt.frontier_prelaunch_ns
+                            if frontier_v5_receipt is not None
+                            else None
                         ),
                         k3_w3_composition_receipt=terminal_packed_front_receipt,
                     )
@@ -5093,16 +5552,19 @@ def _mlx_generate_impl(
                 # cannot race collection of its own evidence record.
                 logger.complete()
 
-            if is_done and packed_front_receipt.enabled:
-                assert dspark_runtime is not None
-                _publish_composition_receipt(
-                    dspark_runtime,
-                    packed_front_receipt,
-                )
-
             yield response
 
             if is_done:
+                if packed_front_receipt.enabled:
+                    assert dspark_runtime is not None
+                    # SequentialGenerator resumes this generator only after its
+                    # outer rank-agreed parser/event publication succeeds.  A
+                    # parser/channel failure therefore tears down and poisons
+                    # the finalized receipt without ever emitting its marker.
+                    _publish_composition_receipt(
+                        dspark_runtime,
+                        packed_front_receipt,
+                    )
                 if dspark_runtime is None and not is_pipeline:
                     mx_barrier(group)
                 break
@@ -5127,13 +5589,26 @@ def mlx_generate(
 ) -> Generator[GenerationResponse]:
     """Generate with an optional fail-closed request-scoped packed-front receipt."""
 
-    packed_front_receipt = _PackedFrontReceiptRequest.from_environment(
-        model,
-        dspark,
-        task,
-        group,
-        phase=_packed_front_receipt_phase,
-    )
+    if dspark is not None:
+        if group is None:
+            raise DSparkDistributedStateError(
+                "Kimi K3 DSpark admission requires a tensor-parallel group"
+            )
+        packed_front_receipt = _rank_agreed_packed_front_admission(
+            model,
+            dspark,
+            task,
+            group,
+            phase=_packed_front_receipt_phase,
+        )
+    else:
+        packed_front_receipt = _PackedFrontReceiptRequest.from_environment(
+            model,
+            dspark,
+            task,
+            group,
+            phase=_packed_front_receipt_phase,
+        )
     try:
         yield from _mlx_generate_impl(
             model=model,

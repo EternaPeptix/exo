@@ -16,7 +16,10 @@ from exo.shared.types.events import ChunkGenerated
 from exo.shared.types.tasks import TaskId, TaskStatus, TextGeneration
 from exo.shared.types.text_generation import InputMessage, TextGenerationTaskParams
 from exo.shared.types.worker.instances import InstanceId
-from exo.shared.types.worker.runner_response import ModelLoadingResponse
+from exo.shared.types.worker.runner_response import (
+    FinishedResponse,
+    ModelLoadingResponse,
+)
 from exo.worker.engines.mlx import utils_mlx
 from exo.worker.engines.mlx.builder import (
     MlxBuilder,
@@ -1158,10 +1161,13 @@ def _activate_dspark_response(
     generator_events: list[str] = []
 
     def responses():
-        generator_events.append("next response")
-        yield cast(object, SimpleNamespace(finish_reason=finish_reason))
-        generator_events.append("next response")
-        yield cast(object, SimpleNamespace(finish_reason=None))
+        try:
+            generator_events.append("next response")
+            yield cast(object, SimpleNamespace(finish_reason=finish_reason))
+            generator_events.append("next response")
+            yield cast(object, SimpleNamespace(finish_reason=None))
+        finally:
+            generator_events.append("generator closed")
 
     generator._active = cast(
         object,
@@ -1212,6 +1218,83 @@ def test_dspark_parser_stage_publishes_once_without_runner_duplicate(
     assert sent[0].chunk is chunk
 
 
+def test_terminal_receipt_marker_waits_for_rank_agreed_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    sent: list[object] = []
+    generator = _dspark_sequential(
+        sender=SimpleNamespace(send=sent.append, send_nowait=sent.append)
+    )
+    task = _fake_dspark_task()
+    chunk = TokenChunk(
+        model=generator.model_id,
+        text="x",
+        token_id=7,
+        usage=None,
+    )
+
+    def terminal_response():
+        events.append("terminal response")
+        yield cast(object, SimpleNamespace(finish_reason="stop"))
+        events.append("receipt marker")
+
+    generator._active = cast(
+        object,
+        (
+            task,
+            terminal_response(),
+            GeneratorQueue(),
+            iter((chunk, None)),
+        ),
+    )
+    monkeypatch.setattr(utils_mlx, "mx_any", lambda _value, _group: False)
+
+    assert list(generator.step()) == []
+    assert events == ["terminal response"]
+    assert len(sent) == 1
+    assert isinstance(sent[0], ChunkGenerated)
+
+    completed = list(generator.step())
+    assert events == ["terminal response", "receipt marker"]
+    assert len(completed) == 1
+    assert completed[0][0] == task.task_id
+    assert isinstance(completed[0][1], FinishedResponse)
+
+
+def test_sequential_close_synchronously_closes_active_generator() -> None:
+    events: list[str] = []
+    generator = _dspark_sequential(
+        sender=SimpleNamespace(
+            send=lambda _event: None, send_nowait=lambda _event: None
+        )
+    )
+    task = _fake_dspark_task()
+
+    def active_response():
+        try:
+            yield cast(object, SimpleNamespace(finish_reason=None))
+        finally:
+            events.append("generator closed")
+
+    response_generator = active_response()
+    next(response_generator)
+    generator._active = cast(
+        object,
+        (
+            task,
+            response_generator,
+            GeneratorQueue(),
+            iter(()),
+        ),
+    )
+
+    generator.close()
+
+    assert generator._active is None
+    assert events == ["generator closed"]
+
+
 @pytest.mark.parametrize("publish_error", [WouldBlock, ClosedResourceError])
 @pytest.mark.parametrize("finish_reason", [None, "stop"])
 def test_dspark_publication_failure_fail_stops_before_next_response(
@@ -1257,7 +1340,7 @@ def test_dspark_publication_failure_fail_stops_before_next_response(
         generator.step()
 
     assert flags == [True]
-    assert generator_events == ["next response"]
+    assert generator_events == ["next response", "generator closed"]
     assert generator._active is None
     assert sent == []
 
@@ -1298,7 +1381,7 @@ def test_dspark_peer_parser_failure_prevents_next_response(
     with pytest.raises(RuntimeError, match="peer parser failed"):
         generator.step()
 
-    assert generator_events == ["next response"]
+    assert generator_events == ["next response", "generator closed"]
     assert generator._active is None
     assert len(sent) == 2
     assert sent[0].chunk is chunk

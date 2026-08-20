@@ -292,8 +292,17 @@ class SequentialGenerator(Engine):
                 self._start_next()
 
         except Exception as e:
-            self._send_error(task, e)
+            close_error: Exception | None = None
+            try:
+                gen.close()
+            except Exception as error:
+                close_error = error
             self._active = None
+            self._send_error(task, close_error or e)
+            if close_error is not None:
+                raise RuntimeError(
+                    "Kimi K3 DSpark generator cleanup failed"
+                ) from close_error
             raise
 
         return filter(
@@ -465,9 +474,15 @@ class SequentialGenerator(Engine):
         )
 
     def close(self) -> None:
-        if isinstance(self.dspark, LoadedMlxDSparkDual):
-            self.dspark.close()
-        del self.model, self.tokenizer, self.group, self.dspark
+        active = self._active
+        self._active = None
+        try:
+            if active is not None:
+                active[1].close()
+        finally:
+            if isinstance(self.dspark, LoadedMlxDSparkDual):
+                self.dspark.close()
+            del self.model, self.tokenizer, self.group, self.dspark
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
         cache = run_prefill_for_request(

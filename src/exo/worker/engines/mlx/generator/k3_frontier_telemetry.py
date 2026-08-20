@@ -18,6 +18,7 @@ MLX exposes no residency high-water counter.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -27,14 +28,14 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Protocol, cast
+from typing import Literal, Mapping, Protocol, cast
 
 ENABLE_ENV = "EXO_MLX_KIMI_K3_FRONTIER_TELEMETRY_V4"
 DIRECTORY_ENV = "EXO_MLX_KIMI_K3_FRONTIER_TELEMETRY_DIR"
 SESSION_SHA256_ENV = "EXO_MLX_KIMI_K3_FRONTIER_TELEMETRY_SESSION_SHA256"
 SCHEMA = "kimi-k3-frontier-request-telemetry/v4"
 PROCESS_SCHEMA = "kimi-k3-frontier-process-telemetry/v4"
-MARKER_SCHEMA = "kimi-k3-w3-composition-receipt/v4"
+MARKER_SCHEMA = "kimi-k3-w3-composition-receipt/v5"
 CORE_SCHEMA = "kimi-k3-w3-composition-receipt/v2"
 EXPECTED_REQUESTS = 16
 RSS_SAMPLE_INTERVAL_SECONDS = 0.010
@@ -167,7 +168,12 @@ class FrontierTelemetryContext:
     mx_module: _MxMemory
     process: _ProcessMemory
     reset_captured: bool = False
-    finalized: bool = False
+    publication_state: Literal[
+        "active",
+        "finalized-unpublished",
+        "published",
+        "poisoned",
+    ] = "active"
     baseline: _MemorySample | None = None
     rss_observed_peak_bytes: int = 0
     rss_lifetime_highwater_after_bytes: int = 0
@@ -181,6 +187,17 @@ class FrontierTelemetryContext:
     _sampler_stop: threading.Event = field(default_factory=threading.Event)
     _sampler: threading.Thread | None = None
 
+    @property
+    def finalized(self) -> bool:
+        return self.publication_state in {
+            "finalized-unpublished",
+            "published",
+        }
+
+    @property
+    def published(self) -> bool:
+        return self.publication_state == "published"
+
 
 @dataclass(frozen=True)
 class FrontierTelemetryEvidence:
@@ -191,6 +208,16 @@ class FrontierTelemetryEvidence:
     receipt_v2_core_sha256: str
     request_file_sha256: str
     process_complete_file_sha256: str | None
+
+
+@dataclass(frozen=True)
+class _CreatedEvidenceInode:
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    nlink: int
+    size: int
 
 
 _state_lock = threading.Lock()
@@ -423,6 +450,8 @@ def _poison(context: FrontierTelemetryContext | None = None) -> None:
     global _active, _poisoned
     with _state_lock:
         _poisoned = True
+        if context is not None:
+            context.publication_state = "poisoned"
         if context is not None and _active is context:
             _active = None
 
@@ -659,6 +688,120 @@ def _verify_directory(context: FrontierTelemetryContext) -> int:
     return directory_fd
 
 
+def _created_evidence_inode(info: os.stat_result) -> _CreatedEvidenceInode:
+    return _CreatedEvidenceInode(
+        device=info.st_dev,
+        inode=info.st_ino,
+        mode=info.st_mode,
+        uid=info.st_uid,
+        nlink=info.st_nlink,
+        size=info.st_size,
+    )
+
+
+def _require_created_inode(
+    info: os.stat_result,
+    created: _CreatedEvidenceInode,
+    *,
+    expected_size: int,
+    allow_size_growth: bool = False,
+) -> None:
+    if (
+        (info.st_dev, info.st_ino) != (created.device, created.inode)
+        or not stat.S_ISREG(info.st_mode)
+        or not stat.S_ISREG(created.mode)
+        or info.st_mode != created.mode
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_uid != created.uid
+        or info.st_uid != os.getuid()
+        or info.st_nlink != created.nlink
+        or created.nlink != 1
+        or (
+            created.size != expected_size
+            and not (allow_size_growth and created.size == 0)
+        )
+        or info.st_size != expected_size
+    ):
+        raise RuntimeError("frontier telemetry evidence inode is invalid")
+
+
+def _unlink_authenticated_created(
+    directory_fd: int,
+    name: str,
+    created: _CreatedEvidenceInode,
+    authenticated_fd: int,
+) -> bool:
+    """Remove only a name that still resolves to the authenticated inode.
+
+    Keep the original descriptor live across the dirfd-relative name checks,
+    unlink, and link-count transition.  A name already substituted before the
+    final checks is retained and returns ``False`` so the caller can poison the
+    sequence.  POSIX has no regular-file unlink-by-fd operation, so the two
+    checks immediately before ``unlinkat`` are the narrowest available fence;
+    the private 0700 evidence directory is part of this contract.
+    """
+
+    read_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        read_flags |= os.O_NOFOLLOW
+    try:
+        file_fd = os.open(name, read_flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return False
+    try:
+        authenticated = os.fstat(authenticated_fd)
+        opened = os.fstat(file_fd)
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        try:
+            _require_created_inode(
+                authenticated,
+                created,
+                expected_size=created.size,
+            )
+            _require_created_inode(
+                opened,
+                created,
+                expected_size=created.size,
+            )
+            _require_created_inode(
+                named,
+                created,
+                expected_size=created.size,
+            )
+        except RuntimeError:
+            return False
+        # Persist the authenticated pre-unlink directory state, then repeat
+        # both descriptor and name validation directly at the unlink boundary.
+        os.fsync(directory_fd)
+        _require_created_inode(
+            os.fstat(authenticated_fd),
+            created,
+            expected_size=created.size,
+        )
+        _require_created_inode(
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False),
+            created,
+            expected_size=created.size,
+        )
+        os.unlink(name, dir_fd=directory_fd)
+        unlinked = os.fstat(authenticated_fd)
+        if (
+            (unlinked.st_dev, unlinked.st_ino) != (created.device, created.inode)
+            or not stat.S_ISREG(unlinked.st_mode)
+            or unlinked.st_mode != created.mode
+            or unlinked.st_uid != created.uid
+            or unlinked.st_size != created.size
+            or unlinked.st_nlink != 0
+        ):
+            raise RuntimeError(
+                "frontier telemetry evidence unlink transition is invalid"
+            )
+        os.fsync(directory_fd)
+        return True
+    finally:
+        os.close(file_fd)
+
+
 def _write_o_excl(
     context: FrontierTelemetryContext,
     name: str,
@@ -676,6 +819,7 @@ def _write_o_excl(
         flags |= os.O_NOFOLLOW
     file_fd: int | None = None
     check_fd: int | None = None
+    created: _CreatedEvidenceInode | None = None
     try:
         # The intended name may have appeared after claim.  It is the only
         # optional entry here so O_EXCL itself remains the collision authority;
@@ -686,6 +830,9 @@ def _write_o_excl(
             optional_names=frozenset({name}),
         )
         file_fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        created_info = os.fstat(file_fd)
+        created = _created_evidence_inode(created_info)
+        _require_created_inode(created_info, created, expected_size=0)
         offset = 0
         while offset < len(data):
             written = os.write(file_fd, data[offset:])
@@ -694,16 +841,13 @@ def _write_o_excl(
             offset += written
         os.fsync(file_fd)
         info = os.fstat(file_fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_uid != os.getuid()
-            or info.st_nlink != 1
-            or info.st_size != len(data)
-        ):
-            raise RuntimeError("frontier telemetry evidence inode is invalid")
-        os.close(file_fd)
-        file_fd = None
+        _require_created_inode(
+            info,
+            created,
+            expected_size=len(data),
+            allow_size_growth=True,
+        )
+        created = _created_evidence_inode(info)
         check_flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             check_flags |= os.O_NOFOLLOW
@@ -715,18 +859,47 @@ def _write_o_excl(
                 break
             observed.extend(chunk)
         check = os.fstat(check_fd)
-        if (
-            bytes(observed) != data
-            or hashlib.sha256(observed).hexdigest() != digest
-            or check.st_nlink != 1
-            or stat.S_IMODE(check.st_mode) != 0o600
-        ):
+        if bytes(observed) != data or hashlib.sha256(observed).hexdigest() != digest:
             raise RuntimeError("frontier telemetry evidence verification failed")
+        _require_created_inode(check, created, expected_size=len(data))
         _require_exact_inventory_fd(
             directory_fd,
             {**expected_inventory, name: digest},
         )
         os.fsync(directory_fd)
+    except BaseException as error:
+        # Snapshot the still-open authenticated inode at its current size so a
+        # partial write can be removed without ever trusting the path name.
+        # The original O_EXCL descriptor is deliberately kept live until this
+        # point so cleanup never has to infer ownership from a path alone.
+        authenticated_fd = file_fd if file_fd is not None else check_fd
+        if created is not None and authenticated_fd is not None:
+            with contextlib.suppress(RuntimeError):
+                current = os.fstat(authenticated_fd)
+                _require_created_inode(
+                    current,
+                    created,
+                    expected_size=current.st_size,
+                    allow_size_growth=created.size == 0,
+                )
+                created = _created_evidence_inode(current)
+        if created is not None:
+            try:
+                if authenticated_fd is None or not _unlink_authenticated_created(
+                    directory_fd,
+                    name,
+                    created,
+                    authenticated_fd,
+                ):
+                    raise RuntimeError(
+                        "frontier telemetry evidence name is no longer authenticated"
+                    )
+            except BaseException as cleanup_error:
+                raise RuntimeError(
+                    "frontier telemetry evidence cleanup failed after "
+                    f"{type(error).__name__}"
+                ) from cleanup_error
+        raise
     finally:
         if check_fd is not None:
             os.close(check_fd)
@@ -742,7 +915,6 @@ def finalize(
 ) -> FrontierTelemetryEvidence | None:
     """Close one request, publish immutable rank-local evidence, and return hashes."""
 
-    global _active
     if context is None:
         return None
     try:
@@ -900,8 +1072,7 @@ def finalize(
                 raise RuntimeError("frontier telemetry publication ownership drifted")
             _published[context.request_index] = published_row
             _used_receipt_tokens.add(receipt_token)
-            context.finalized = True
-            _active = None
+            context.publication_state = "finalized-unpublished"
             complete_rows = (
                 [dict(_published[index]) for index in range(1, 17)]
                 if len(_published) == EXPECTED_REQUESTS
@@ -958,9 +1129,9 @@ def finalize(
 
 
 def abort(context: FrontierTelemetryContext | None) -> None:
-    """Poison an attempted request unless immutable evidence was finalized."""
+    """Poison every request that did not complete marker publication."""
 
-    if context is None or context.finalized:
+    if context is None or context.published:
         return
     context._sampler_stop.set()
     sampler = context._sampler
@@ -969,11 +1140,36 @@ def abort(context: FrontierTelemetryContext | None) -> None:
     _poison(context)
 
 
+def mark_published(context: FrontierTelemetryContext | None) -> None:
+    """Commit the post-agreement transition out of finalized-unpublished."""
+
+    global _active, _poisoned
+    if context is None:
+        return
+    with _state_lock:
+        if (
+            _poisoned
+            or _active is not context
+            or context.publication_state != "finalized-unpublished"
+        ):
+            _poisoned = True
+            context.publication_state = "poisoned"
+            raise RuntimeError("frontier telemetry publication state is invalid")
+        context.publication_state = "published"
+        _active = None
+
+
 def poison_finalized(context: FrontierTelemetryContext | None) -> None:
     """Fail the process if a post-file collective or marker join fails."""
 
     if context is not None:
-        _poison()
+        _poison(context)
+
+
+def poison_sequence(context: FrontierTelemetryContext | None = None) -> None:
+    """Irrevocably fail the process-local sequence after a bilateral mismatch."""
+
+    _poison(context)
 
 
 def _reset_state_for_tests() -> None:

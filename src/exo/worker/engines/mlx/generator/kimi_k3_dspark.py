@@ -1039,6 +1039,11 @@ class RankAgreement(Protocol):
 
     def agree_token(self, local_token: int | None) -> int | None: ...
 
+    def gather_rank_rows(
+        self,
+        local_row: tuple[int, ...],
+    ) -> tuple[tuple[int, ...], ...]: ...
+
     def agree_packed(
         self,
         name: str,
@@ -1175,6 +1180,34 @@ class MlxRankAgreement:
         if self._group is not None:
             self._physical_all_gathers += 1
         return self._all_gather_rows(row)
+
+    def gather_rank_rows(
+        self,
+        local_row: tuple[int, ...],
+    ) -> tuple[tuple[int, ...], ...]:
+        """Gather one bounded numeric evidence row in deterministic rank order."""
+
+        if not local_row or len(local_row) > 64:
+            raise ValueError("numeric evidence row must contain 1-64 values")
+        if any(
+            type(value) is not int or not 0 <= value <= 0x7FFFFFFF
+            for value in local_row
+        ):
+            raise ValueError("numeric evidence row values must fit non-negative int32")
+        rows = self._gather_rows(local_row)
+        if (
+            len(rows) != self.size
+            or any(len(row) != len(local_row) for row in rows)
+            or any(
+                type(value) is not int or not 0 <= value <= 0x7FFFFFFF
+                for row in rows
+                for value in row
+            )
+        ):
+            raise DSparkDistributedStateError(
+                "Kimi K3 numeric evidence gather returned invalid rank rows"
+            )
+        return rows
 
     def agree_packed(
         self,
@@ -4275,6 +4308,12 @@ class LoadedMlxDSparkDual:
 
         self._require_loaded(self.old).assert_healthy()
 
+    @property
+    def materialization_poison(self) -> _DSparkMaterializationPoison:
+        """Expose the one poison latch shared by both loaded proposers."""
+
+        return self._require_loaded(self.old).materialization_poison
+
     @staticmethod
     def _require_loaded(loaded: LoadedMlxDSpark | None) -> LoadedMlxDSpark:
         if loaded is None:
@@ -5304,6 +5343,49 @@ class KimiK3DSparkRequestRuntime:
         if sink is not None and self._composition_receipt_sink is not None:
             raise RuntimeError("Kimi K3 composition receipt sink is already attached")
         self._composition_receipt_sink = sink
+
+    def poison_materialization(self, reason: str) -> None:
+        """Fail every later request after a bilateral lifecycle uncertainty."""
+
+        self.loaded.materialization_poison.poison(reason)
+
+    def gather_frontier_timing_evidence(
+        self,
+        local_values: tuple[int, int],
+        *,
+        local_complete: bool,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Gather rank-local target-commit/prelaunch totals as bounded integers."""
+
+        self.loaded.assert_healthy()
+        limit = 10_000_000_000_000
+        valid = (
+            type(local_complete) is bool
+            and local_complete
+            and all(
+                type(value) is int and 0 <= value <= limit for value in local_values
+            )
+        )
+        limbs: list[int] = []
+        for value in local_values if valid else (0, 0):
+            high, low = divmod(value, 1 << 30)
+            limbs.extend((high, low))
+        rows = self.collective.gather_rank_rows((int(valid), *limbs))
+        if len(rows) != 2 or any(len(row) != 5 or row[0] != 1 for row in rows):
+            raise DSparkDistributedStateError(
+                "Kimi K3 frontier timing evidence was invalid on at least one rank"
+            ) from None
+        decoded: list[tuple[int, int]] = []
+        for row in rows:
+            values = tuple(
+                row[index] * (1 << 30) + row[index + 1] for index in range(1, 5, 2)
+            )
+            if any(value > limit for value in values):
+                raise DSparkDistributedStateError(
+                    "Kimi K3 frontier timing evidence exceeded its numeric bound"
+                ) from None
+            decoded.append(cast(tuple[int, int], values))
+        return decoded[0], decoded[1]
 
     @property
     def target_cache_offset(self) -> int:
