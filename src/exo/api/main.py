@@ -211,6 +211,55 @@ from exo.utils.task_group import TaskGroup
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
 _ADVERTISED_MODEL_IDS_ENV = "EXO_ADVERTISED_MODEL_IDS"
+_K3_FRONTIER_INDEX_HEADER = b"x-exo-k3-frontier-request-index"
+_K3_FRONTIER_NONCE_HEADER = b"x-exo-k3-frontier-request-nonce-sha256"
+_LOWER_HEX = frozenset("0123456789abcdef")
+
+
+def _k3_frontier_request_controls(request: Request) -> dict[str, object]:
+    """Parse one exact sanitized header pair without accepting duplicates."""
+
+    index_values: list[bytes] = []
+    nonce_values: list[bytes] = []
+    for raw_name, raw_value in request.scope.get("headers", []):
+        name = bytes(raw_name).lower()
+        if name == _K3_FRONTIER_INDEX_HEADER:
+            index_values.append(bytes(raw_value))
+        elif name == _K3_FRONTIER_NONCE_HEADER:
+            nonce_values.append(bytes(raw_value))
+    if not index_values and not nonce_values:
+        return {
+            "k3_frontier_request_index": None,
+            "k3_frontier_request_nonce_sha256": None,
+        }
+    if len(index_values) != 1 or len(nonce_values) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="frontier request headers must be one exact pair",
+        )
+    try:
+        index_text = index_values[0].decode("ascii")
+        nonce = nonce_values[0].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="frontier request headers must be ASCII",
+        ) from error
+    if (
+        not index_text.isdecimal()
+        or index_text.startswith("0")
+        or not 1 <= int(index_text) <= 16
+        or len(nonce) != 64
+        or any(character not in _LOWER_HEX for character in nonce)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="frontier request headers are invalid",
+        )
+    return {
+        "k3_frontier_request_index": int(index_text),
+        "k3_frontier_request_nonce_sha256": nonce,
+    }
 
 
 def _parse_advertised_model_ids(raw: str | None) -> frozenset[ModelId] | None:
@@ -997,7 +1046,7 @@ class API:
             )
 
     async def bench_chat_completions(
-        self, payload: BenchChatCompletionRequest
+        self, payload: BenchChatCompletionRequest, request: Request
     ) -> BenchChatCompletionResponse | StreamingResponse:
         task_params = await chat_request_to_text_generation(payload)
         validated_model = await self._validate_model_has_instance(
@@ -1010,6 +1059,7 @@ class API:
                 "stream": False,
                 "bench": True,
                 "use_prefix_cache": payload.use_prefix_cache,
+                **_k3_frontier_request_controls(request),
             }
         )
 
@@ -1836,9 +1886,7 @@ class API:
 
     async def get_models(self, status: str | None = Query(default=None)) -> ModelList:
         """Returns list of available models, optionally filtered by being downloaded."""
-        cards = _filter_advertised_model_cards(
-            await model_cards.card_cache.list_all()
-        )
+        cards = _filter_advertised_model_cards(await model_cards.card_cache.list_all())
 
         if status == "downloaded":
             downloaded_model_ids: set[str] = set()

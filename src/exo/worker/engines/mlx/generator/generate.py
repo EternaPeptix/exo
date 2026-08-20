@@ -31,6 +31,7 @@ from exo.api.types import (
     FinishReason,
     GenerationStats,
     K3W3CompositionReceipt,
+    K3W3CompositionReceiptV4,
     PromptTokensDetails,
     TopLogprobItem,
     Usage,
@@ -74,6 +75,7 @@ from exo.worker.engines.mlx.constants import (
     KV_GROUP_SIZE,
     MAX_TOKENS,
 )
+from exo.worker.engines.mlx.generator import k3_frontier_telemetry
 from exo.worker.engines.mlx.generator.kimi_k3_dspark import (
     DSparkConfidenceCaptureConfig,
     DSparkDecodedToken,
@@ -317,6 +319,11 @@ _MLX_MULTIBANK_PACKED_FRONT_ENV = "MLX_LM_KIMI_K3_MULTIBANK_MOE_FRONT"
 _MLX_COMPILED_DECODE_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE"
 _MLX_KDA_PREWORK_ENV = "MLX_LM_KIMI_K3_W3_PREWORK_HISTORY"
 _MLX_PROJECTED_KV_CACHE_MAX_TOKENS_ENV = "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE_MAX_TOKENS"
+_MLX_BATCHED_REPLAYSSM_COMMIT_ENV = "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_COMMIT"
+_MLX_BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV = (
+    "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_EXPECTED_LAYERS"
+)
+_MLX_FULL_ACCEPT_IDENTITY_COMMIT_ENV = "MLX_LM_KIMI_K3_COMMIT_IDENTITY_AT_FULL"
 _EXO_DEFERRED_WIDTH3_ENV = "EXO_MLX_KIMI_K3_DEFERRED_ASYNC_WIDTH3"
 _MLX_DEFERRED_WIDTH3_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_WIDTH3"
 _EXO_TAIL_OVERLAP_ENV = "EXO_MLX_KIMI_K3_DSPARK_TAIL_OVERLAP"
@@ -324,6 +331,8 @@ _MLX_NATIVE_AFFINE8_Q3_TRIPLET_ENV = "MLX_METAL_K3_AFFINE8_Q3_TRIPLET"
 _MLX_NATIVE_AFFINE8_Q3_RECEIPT_ENV = "MLX_METAL_K3_AFFINE8_Q3_DISPATCH_RECEIPT"
 _WIDTH4_RECEIPT_ENV = "EXO_MLX_KIMI_K3_WIDTH4_DISPATCH_RECEIPT_LOG"
 _PACKED_FRONT_RECEIPT_SCHEMA = "kimi-k3-w3-composition-receipt/v1"
+_PACKED_FRONT_MARKER_SCHEMA = "kimi-k3-w3-composition-receipt/v2"
+_BATCHED_REPLAYSSM_TELEMETRY_SCHEMA = "kimi-k3-batched-replayssm-telemetry-v1"
 _PACKED_FRONT_EXPECTED_LAYERS = 92
 _KDA_EXPECTED_LAYERS = 69
 _DEFERRED_EXPECTED_ROOTS = 12
@@ -429,6 +438,19 @@ _PACKED_FRONT_COUNTER_FIELDS = (
     "kda_fallback_calls",
     "kda_pending_calls",
 )
+_BATCHED_REPLAYSSM_COUNTER_FIELDS = (
+    "attempted_prepares",
+    "batched_prepares",
+    "batched_commits",
+    "identity_prepares",
+    "identity_commits",
+    "fallback_prepares",
+    "fallback_commits",
+    "batched_errors",
+    "identity_errors",
+    "layers_batched",
+    "layers_identity_committed",
+)
 
 
 @dataclass(frozen=True)
@@ -436,7 +458,14 @@ class _PackedFrontReceiptAPI:
     begin: Callable[..., object]
     finish: Callable[..., object]
     abort: Callable[[int, int], None]
+    commit_telemetry: Callable[[], object]
     source_digest: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _BatchedReplaySSMTelemetrySnapshot:
+    revision: int
+    counters: tuple[int, ...]
 
 
 class _NativeQ3Getter(Protocol):
@@ -642,7 +671,17 @@ def _exo_source_digest() -> tuple[int, int, int, int]:
     module_paths = {
         "exo.generate": generate_path,
         "exo.kimi_k3_dspark": generate_path.with_name("kimi_k3_dspark.py"),
+        "exo.k3_frontier_telemetry": generate_path.with_name(
+            "k3_frontier_telemetry.py"
+        ),
         "exo.builder": generate_path.parent.parent / "builder.py",
+        "exo.api.main": generate_path.parents[4] / "api" / "main.py",
+        "exo.api.chat_adapter": (
+            generate_path.parents[4] / "api" / "adapters" / "chat_completions.py"
+        ),
+        "exo.text_generation_types": (
+            generate_path.parents[4] / "shared" / "types" / "text_generation.py"
+        ),
         "exo.api.types.api": module_path(api_module, "exo.api.types.api"),
         "exo.api.types.init": module_path(api_init_module, "exo.api.types"),
         "exo.rank_local_checkpoint": module_path(
@@ -750,6 +789,7 @@ def _load_native_q3_receipt_api() -> _NativeQ3ReceiptAPI:
 
 def _load_packed_front_receipt_api() -> _PackedFrontReceiptAPI:
     module = importlib.import_module("mlx_lm.models.kimi_k3_packed_moe_front")
+    model_module = importlib.import_module("mlx_lm.models.kimi_k3")
     if (
         getattr(module, "K3_W3_COMPOSITION_RECEIPT_SCHEMA", None)
         != _PACKED_FRONT_RECEIPT_SCHEMA
@@ -758,13 +798,60 @@ def _load_packed_front_receipt_api() -> _PackedFrontReceiptAPI:
     begin = getattr(module, "begin_k3_w3_composition_receipt", None)
     finish = getattr(module, "finish_k3_w3_composition_receipt", None)
     abort = getattr(module, "abort_k3_w3_composition_receipt", None)
-    if not callable(begin) or not callable(finish) or not callable(abort):
+    commit_telemetry = getattr(
+        model_module,
+        "batched_replayssm_commit_telemetry",
+        None,
+    )
+    if (
+        not callable(begin)
+        or not callable(finish)
+        or not callable(abort)
+        or not callable(commit_telemetry)
+    ):
         raise RuntimeError("MLX-LM W3 composition receipt APIs are unavailable")
     return _PackedFrontReceiptAPI(
         begin=begin,
         finish=finish,
         abort=cast(Callable[[int, int], None], abort),
+        commit_telemetry=cast(Callable[[], object], commit_telemetry),
         source_digest=_runtime_source_digest(),
+    )
+
+
+def _validated_batched_replayssm_telemetry(
+    raw: object,
+) -> _BatchedReplaySSMTelemetrySnapshot:
+    """Validate the exact public MLX-LM counter snapshot without retaining attestations."""
+
+    if type(raw) is not dict:
+        raise TypeError("MLX-LM ReplaySSM telemetry must be a dictionary")
+    payload = cast(dict[object, object], raw)
+    if set(payload) != {"schema", "revision", "counters", "latest_attestation"}:
+        raise ValueError("MLX-LM ReplaySSM telemetry fields are invalid")
+    if payload["schema"] != _BATCHED_REPLAYSSM_TELEMETRY_SCHEMA:
+        raise ValueError("MLX-LM ReplaySSM telemetry schema is invalid")
+    revision = payload["revision"]
+    if type(revision) is not int or not 0 <= revision <= _PACKED_FRONT_SEQUENCE_LIMIT:
+        raise ValueError("MLX-LM ReplaySSM telemetry revision is invalid")
+    raw_counters = payload["counters"]
+    if type(raw_counters) is not dict:
+        raise TypeError("MLX-LM ReplaySSM telemetry counters must be a dictionary")
+    counters = cast(dict[object, object], raw_counters)
+    if set(counters) != set(_BATCHED_REPLAYSSM_COUNTER_FIELDS):
+        raise ValueError("MLX-LM ReplaySSM telemetry counter fields are invalid")
+    values: list[int] = []
+    for name in _BATCHED_REPLAYSSM_COUNTER_FIELDS:
+        value = counters[name]
+        if type(value) is not int or not 0 <= value <= _PACKED_FRONT_COUNTER_LIMIT:
+            raise ValueError(f"MLX-LM ReplaySSM telemetry counter {name} is invalid")
+        values.append(value)
+    latest_attestation = payload["latest_attestation"]
+    if latest_attestation is not None and type(latest_attestation) is not dict:
+        raise TypeError("MLX-LM ReplaySSM latest attestation is invalid")
+    return _BatchedReplaySSMTelemetrySnapshot(
+        revision=revision,
+        counters=tuple(values),
     )
 
 
@@ -780,6 +867,9 @@ def _reject_orphan_composition_receipt_environment() -> None:
         _DEFERRED_EXPECTED_ROOTS_ENV,
         _EXPECTED_LIBMLX_SHA256_ENV,
         _LAUNCH_CONTRACT_SHA256_ENV,
+        k3_frontier_telemetry.ENABLE_ENV,
+        k3_frontier_telemetry.DIRECTORY_ENV,
+        k3_frontier_telemetry.SESSION_SHA256_ENV,
     ):
         if name in os.environ:
             raise ValueError(f"{name} requires {_PACKED_FRONT_DIAGNOSTIC_ENV}=1")
@@ -796,6 +886,7 @@ class _CompositionSelectors:
     packed: bool
     kda: bool
     deferred: bool
+    identity_commit: bool
     arm_code: int
     canonical: bool
     digest: tuple[int, int, int, int]
@@ -835,6 +926,9 @@ def _launch_contract_digest() -> tuple[int, int, int, int]:
         "EXO_MLX_KIMI_K3_W3_COMPOSITION_EXPECTED_SPARSE_LAYERS",
         "EXO_MLX_KIMI_K3_W3_COMPOSITION_LIBMLX_SHA256",
         "EXO_MLX_KIMI_K3_W3_COMPOSITION_RECEIPT",
+        k3_frontier_telemetry.ENABLE_ENV,
+        k3_frontier_telemetry.DIRECTORY_ENV,
+        k3_frontier_telemetry.SESSION_SHA256_ENV,
         "EXO_MLX_KIMI_K3_WIDTH4_DISPATCH_RECEIPT_LOG",
         "EXO_MLX_KIMI_K3_WIDTH4_LIBMLX_SHA256",
         "EXO_MLX_KIMI_K3_WIDTH4_RECEIPT_SESSION_ID",
@@ -881,6 +975,7 @@ def _launch_contract_digest() -> tuple[int, int, int, int]:
         "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3",
         "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_COMMIT",
         "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_EXPECTED_LAYERS",
+        _MLX_FULL_ACCEPT_IDENTITY_COMMIT_ENV,
         "MLX_LM_KIMI_K3_COMPILED_DECODE",
         "MLX_LM_KIMI_K3_DERIVE_AFFINE2_BIAS",
         "MLX_LM_KIMI_K3_DSPARK_PROPOSER",
@@ -1040,6 +1135,13 @@ def _packed_front_selector_contract(
     packed_enabled = authoritative == "1"
     kda_enabled = kda == "1"
     deferred_enabled = deferred_exo == "1"
+    identity_commit_raw = os.environ.get(_MLX_FULL_ACCEPT_IDENTITY_COMMIT_ENV)
+    if identity_commit_raw not in {"0", "1"}:
+        raise ValueError(
+            f"{_MLX_FULL_ACCEPT_IDENTITY_COMMIT_ENV} must be exactly 0 or 1 "
+            "in diagnostic mode"
+        )
+    identity_commit_enabled = identity_commit_raw == "1"
     arm_code = (
         int(packed_enabled) | (int(kda_enabled) << 1) | (int(deferred_enabled) << 2)
     )
@@ -1060,6 +1162,8 @@ def _packed_front_selector_contract(
     base_selectors = {
         "EXO_NO_BATCH": "1",
         "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE": "1",
+        _MLX_BATCHED_REPLAYSSM_COMMIT_ENV: "1",
+        _MLX_BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV: str(_KDA_EXPECTED_LAYERS),
         "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE": "1",
         _MLX_PROJECTED_KV_CACHE_MAX_TOKENS_ENV: str(_PROJECTED_KV_CACHE_MAX_TOKENS),
         "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES": "laguna8",
@@ -1076,6 +1180,7 @@ def _packed_front_selector_contract(
         _MLX_KDA_PREWORK_ENV: int(cast(str, kda)),
         _EXO_DEFERRED_WIDTH3_ENV: int(cast(str, deferred_exo)),
         _MLX_DEFERRED_WIDTH3_ENV: int(cast(str, deferred_mlx)),
+        _MLX_FULL_ACCEPT_IDENTITY_COMMIT_ENV: int(identity_commit_enabled),
         _MLX_DUPLICATING_PACKED_FRONT_ENV: 0,
         _MLX_PACKED_FRONT_WIDTH8_ENV: 0,
         _MLX_MULTIBANK_PACKED_FRONT_ENV: 0,
@@ -1101,6 +1206,7 @@ def _packed_front_selector_contract(
         packed=packed_enabled,
         kda=kda_enabled,
         deferred=deferred_enabled,
+        identity_commit=identity_commit_enabled,
         arm_code=arm_code,
         canonical=canonical,
         digest=cast(tuple[int, int, int, int], words),
@@ -1188,12 +1294,18 @@ def _anchor_digest(round_index: int, token: int) -> tuple[int, int, int, int]:
     return _digest_words(digest.digest())
 
 
-def _claim_composition_receipt_phase(phase: int) -> None:
+def _claim_composition_receipt_phase(
+    phase: int,
+    *,
+    frontier_multi_request: bool = False,
+) -> None:
     global _COMPOSITION_RECEIPT_ACTIVE_PHASE
     with _COMPOSITION_RECEIPT_LOCK:
         if _COMPOSITION_RECEIPT_ACTIVE_PHASE is not None:
             raise RuntimeError("a W3 composition receipt phase is already active")
-        if phase in _COMPOSITION_RECEIPT_ATTEMPTED_PHASES:
+        if phase in _COMPOSITION_RECEIPT_ATTEMPTED_PHASES and not (
+            frontier_multi_request and phase == _PACKED_FRONT_PHASE_API
+        ):
             raise RuntimeError(
                 "W3 composition receipt phases are process-local one-shot"
             )
@@ -1205,7 +1317,8 @@ def _claim_composition_receipt_phase(phase: int) -> None:
             raise RuntimeError(
                 "W3 composition API receipt requires a published startup receipt"
             )
-        _COMPOSITION_RECEIPT_ATTEMPTED_PHASES.add(phase)
+        if not (frontier_multi_request and phase == _PACKED_FRONT_PHASE_API):
+            _COMPOSITION_RECEIPT_ATTEMPTED_PHASES.add(phase)
         _COMPOSITION_RECEIPT_ACTIVE_PHASE = phase
 
 
@@ -1219,17 +1332,22 @@ def _release_composition_receipt_phase(phase: int) -> None:
 def _record_composition_receipt_publication(
     phase: int,
     identity: tuple[int, ...],
+    *,
+    frontier_multi_request: bool = False,
 ) -> None:
     global _COMPOSITION_RECEIPT_ACTIVE_PHASE
     with _COMPOSITION_RECEIPT_LOCK:
         if phase != _COMPOSITION_RECEIPT_ACTIVE_PHASE:
             raise RuntimeError("W3 composition receipt phase is not active")
-        if phase in _COMPOSITION_RECEIPT_PUBLISHED_PHASES:
+        if phase in _COMPOSITION_RECEIPT_PUBLISHED_PHASES and not (
+            frontier_multi_request and phase == _PACKED_FRONT_PHASE_API
+        ):
             raise RuntimeError("W3 composition receipt phase was already published")
-        _COMPOSITION_RECEIPT_PUBLISHED_PHASES.add(phase)
-        _COMPOSITION_RECEIPT_PHASE_IDENTITIES[phase] = identity
-        if phase == _PACKED_FRONT_PHASE_API:
-            _COMPOSITION_RECEIPT_COMPLETED_PHASES.add(phase)
+        if not (frontier_multi_request and phase == _PACKED_FRONT_PHASE_API):
+            _COMPOSITION_RECEIPT_PUBLISHED_PHASES.add(phase)
+            _COMPOSITION_RECEIPT_PHASE_IDENTITIES[phase] = identity
+            if phase == _PACKED_FRONT_PHASE_API:
+                _COMPOSITION_RECEIPT_COMPLETED_PHASES.add(phase)
         _COMPOSITION_RECEIPT_ACTIVE_PHASE = None
 
 
@@ -1274,9 +1392,12 @@ class _PackedFrontReceiptRequest:
     exo_source_digest: tuple[int, int, int, int] = (0, 0, 0, 0)
     setup_digest: tuple[int, int, int, int] = (0, 0, 0, 0)
     _native_baseline: tuple[int, int, int, int] | None = None
+    _replayssm_baseline: _BatchedReplaySSMTelemetrySnapshot | None = None
+    _replayssm_final: _BatchedReplaySSMTelemetrySnapshot | None = None
     _runtime: KimiK3DSparkRequestRuntime | None = None
     _handle: tuple[int, int] | None = None
-    _receipt: K3W3CompositionReceipt | None = None
+    _receipt: K3W3CompositionReceipt | K3W3CompositionReceiptV4 | None = None
+    _frontier_context: k3_frontier_telemetry.FrontierTelemetryContext | None = None
     _marker: str | None = None
     _published: bool = False
     _poisoned: bool = False
@@ -1329,6 +1450,8 @@ class _PackedFrontReceiptRequest:
         cls,
         model: Model,
         dspark: LoadedKimiK3DSpark | None,
+        task: TextGenerationTaskParams | None = None,
+        group: mx.distributed.Group | None = None,
         *,
         phase: Literal["engine_startup", "api"],
     ) -> "_PackedFrontReceiptRequest":
@@ -1339,16 +1462,44 @@ class _PackedFrontReceiptRequest:
             os.environ.get(_PACKED_FRONT_DIAGNOSTIC_ENV, "0"),
         )
         phase_code = _PACKED_FRONT_PHASE_CODES[phase]
+        frontier_request_index = (
+            None if task is None else task.k3_frontier_request_index
+        )
+        frontier_request_nonce_sha256 = (
+            None if task is None else task.k3_frontier_request_nonce_sha256
+        )
         if not enabled:
             _reject_orphan_composition_receipt_environment()
+            k3_frontier_telemetry.reject_orphan_request_fields(
+                frontier_request_index,
+                frontier_request_nonce_sha256,
+            )
             return cls(model=model, enabled=False, phase=phase_code)
         if dspark is None or int(dspark.verify_width) != 3:
             raise ValueError(
                 "packed-front diagnostic mode requires Kimi K3 DSpark width three"
             )
-        _claim_composition_receipt_phase(phase_code)
+        frontier_enabled = k3_frontier_telemetry.enabled()
+        if phase_code == _PACKED_FRONT_PHASE_ENGINE_STARTUP:
+            k3_frontier_telemetry.reject_orphan_request_fields(
+                frontier_request_index,
+                frontier_request_nonce_sha256,
+            )
+        _claim_composition_receipt_phase(
+            phase_code,
+            frontier_multi_request=frontier_enabled,
+        )
         native_api: _NativeQ3ReceiptAPI | None = None
+        frontier_context: k3_frontier_telemetry.FrontierTelemetryContext | None = None
         try:
+            if phase_code == _PACKED_FRONT_PHASE_API:
+                frontier_context = k3_frontier_telemetry.claim(
+                    request_index=frontier_request_index,
+                    request_nonce_sha256=frontier_request_nonce_sha256,
+                    rank=group.rank() if group is not None else 0,
+                    world_size=group.size() if group is not None else 1,
+                    mx_module=mx,
+                )
             selectors = _packed_front_selector_contract()
             exo_source_digest = _exo_source_digest()
             api = _load_packed_front_receipt_api()
@@ -1372,6 +1523,7 @@ class _PackedFrontReceiptRequest:
             if native_api is not None:
                 with contextlib.suppress(OSError):
                     os.close(native_api.lib_fd)
+            k3_frontier_telemetry.abort(frontier_context)
             _release_composition_receipt_phase(phase_code)
             raise
         return cls(
@@ -1384,6 +1536,7 @@ class _PackedFrontReceiptRequest:
             api=api,
             native_api=native_api,
             exo_source_digest=exo_source_digest,
+            _frontier_context=frontier_context,
         )
 
     def _phase_identity(self) -> tuple[int, ...]:
@@ -1397,6 +1550,9 @@ class _PackedFrontReceiptRequest:
             *self.native_api.lib_digest,
             *self.native_api.lib_identity,
         )
+
+    def capture_frontier_reset_baseline(self) -> None:
+        k3_frontier_telemetry.capture_reset_baseline(self._frontier_context)
 
     def _close_native_fd(self) -> None:
         if self.native_api is None or self._native_fd_closed:
@@ -1655,6 +1811,11 @@ class _PackedFrontReceiptRequest:
             assert self.api is not None
             assert self.native_api is not None
             self._assert_runtime_identity()
+            if self._replayssm_baseline is not None:
+                raise RuntimeError("ReplaySSM telemetry baseline is already captured")
+            self._replayssm_baseline = _validated_batched_replayssm_telemetry(
+                self.api.commit_telemetry()
+            )
             self.native_api.reset()
             baseline = self._native_counts()
             if baseline != (0, 0, 0, 0):
@@ -1713,6 +1874,7 @@ class _PackedFrontReceiptRequest:
 
         if not self.enabled:
             return
+        k3_frontier_telemetry.observe_metal(self._frontier_context)
         if (
             runtime is not self._runtime
             or self._handle is None
@@ -1750,6 +1912,33 @@ class _PackedFrontReceiptRequest:
             _PACKED_FRONT_SEQUENCE_LIMIT,
             begin_cache_offset,
         )
+
+    def _capture_replayssm_delta(
+        self,
+    ) -> tuple[_BatchedReplaySSMTelemetrySnapshot, dict[str, int]]:
+        if (
+            self.api is None
+            or self._replayssm_baseline is None
+            or self._replayssm_final is not None
+        ):
+            raise RuntimeError("ReplaySSM telemetry capture state is invalid")
+        final = _validated_batched_replayssm_telemetry(self.api.commit_telemetry())
+        baseline = self._replayssm_baseline
+        if final.revision < baseline.revision:
+            raise ValueError("MLX-LM ReplaySSM telemetry revision decreased")
+        deltas: dict[str, int] = {}
+        for name, before, after in zip(
+            _BATCHED_REPLAYSSM_COUNTER_FIELDS,
+            baseline.counters,
+            final.counters,
+            strict=True,
+        ):
+            delta = after - before
+            if delta < 0:
+                raise ValueError(f"MLX-LM ReplaySSM telemetry counter {name} decreased")
+            deltas[name] = delta
+        self._replayssm_final = final
+        return final, deltas
 
     def _validated_marker(
         self,
@@ -1795,6 +1984,10 @@ class _PackedFrontReceiptRequest:
         ):
             raise ValueError("MLX-LM W3 composition receipt binding is invalid")
         self._assert_runtime_identity()
+        replayssm_final, replayssm_deltas = self._capture_replayssm_delta()
+        replayssm_baseline = self._replayssm_baseline
+        if replayssm_baseline is None:
+            raise RuntimeError("ReplaySSM telemetry baseline is unavailable")
 
         expected_selector_snapshot: dict[str, object] = {
             "packed_authoritative_enabled": self.selectors.packed,
@@ -2221,6 +2414,41 @@ class _PackedFrontReceiptRequest:
             previous_cache = record[8]
             prior_prelaunch_attestation = current_prelaunch_attestation
 
+        full_accept_rounds = sum(
+            int(record[1] == 2 and record[2] == 2) for record in self._round_records
+        )
+        partial_full_width_rounds = full_rounds - full_accept_rounds
+        identity_rounds = full_accept_rounds if self.selectors.identity_commit else 0
+        batched_rounds = full_rounds - identity_rounds
+        expected_replayssm_deltas = {
+            "attempted_prepares": full_rounds,
+            "batched_prepares": batched_rounds,
+            "batched_commits": batched_rounds,
+            "identity_prepares": identity_rounds,
+            "identity_commits": identity_rounds,
+            "fallback_prepares": 0,
+            "fallback_commits": 0,
+            "batched_errors": 0,
+            "identity_errors": 0,
+            "layers_batched": batched_rounds * _KDA_EXPECTED_LAYERS,
+            "layers_identity_committed": identity_rounds * _KDA_EXPECTED_LAYERS,
+        }
+        if replayssm_deltas != expected_replayssm_deltas:
+            raise ValueError(
+                "MLX-LM ReplaySSM request-local counter algebra is invalid"
+            )
+        revision_delta = replayssm_final.revision - replayssm_baseline.revision
+        if revision_delta != full_rounds * 2:
+            raise ValueError("MLX-LM ReplaySSM telemetry revision delta is invalid")
+        if self.selectors.identity_commit:
+            if (
+                identity_rounds != full_accept_rounds
+                or batched_rounds != partial_full_width_rounds
+            ):
+                raise ValueError("identity-commit round attribution is invalid")
+        elif identity_rounds != 0 or batched_rounds != full_rounds:
+            raise ValueError("disabled identity-commit receipt contains work")
+
         submitted_count = sum(record[6] for record in self._round_records)
         used_count = sum(record[7] for record in self._round_records)
         if (
@@ -2300,7 +2528,7 @@ class _PackedFrontReceiptRequest:
             deferred.last_final_offset or 0,
         )
         marker: dict[str, object] = {
-            "receipt_schema_version": 1,
+            "receipt_schema_version": 2,
             "request_phase": self.phase,
             "request_sequence": self._handle[0],
             "request_token": self._handle[1],
@@ -2312,6 +2540,7 @@ class _PackedFrontReceiptRequest:
             "packed_enabled": self.selectors.packed,
             "kda_enabled": self.selectors.kda,
             "deferred_enabled": self.selectors.deferred,
+            "identity_commit_enabled": self.selectors.identity_commit,
             "native_triplet_enabled": True,
             "tail_overlap_enabled": True,
             "expected_sparse_layers": _PACKED_FRONT_EXPECTED_LAYERS,
@@ -2333,6 +2562,8 @@ class _PackedFrontReceiptRequest:
             "prefill_noncontract_chunks": prefill_noncontract,
             "target_width1_rounds": tail_rounds,
             "speculative_full_width_rounds": full_rounds,
+            "speculative_full_accept_rounds": full_accept_rounds,
+            "speculative_partial_accept_rounds": partial_full_width_rounds,
             "proposed_tokens": telemetry.drafted_tokens,
             "accepted_tokens": telemetry.accepted_tokens,
             "emitted_tokens": telemetry.committed_tokens,
@@ -2358,6 +2589,13 @@ class _PackedFrontReceiptRequest:
             "native_q3_n6144": native_delta[2],
             "native_q3_n10624": native_delta[3],
             "native_q3_other": native_other,
+            "replayssm_telemetry_revision_before": replayssm_baseline.revision,
+            "replayssm_telemetry_revision_after": replayssm_final.revision,
+            "replayssm_telemetry_revision_delta": revision_delta,
+            **{
+                f"replayssm_{name}_delta": replayssm_deltas[name]
+                for name in _BATCHED_REPLAYSSM_COUNTER_FIELDS
+            },
             **digest_fields("schedule_digest", self._schedule_digest.words()),
             **digest_fields("proposal_digest", self._proposal_digest.words()),
             **digest_fields("acceptance_digest", self._acceptance_digest.words()),
@@ -2380,7 +2618,7 @@ class _PackedFrontReceiptRequest:
         self,
         runtime: KimiK3DSparkRequestRuntime,
         telemetry: "_PromptLookupTelemetry",
-    ) -> K3W3CompositionReceipt:
+    ) -> K3W3CompositionReceipt | K3W3CompositionReceiptV4:
         if not self.enabled or self.api is None or self._handle is None:
             raise RuntimeError("packed-front receipt finish state is invalid")
 
@@ -2399,16 +2637,95 @@ class _PackedFrontReceiptRequest:
             marker = self._validated_marker(typed_raw, telemetry, runtime)
             return _canonical_numeric_json(marker)
 
-        agreed_marker = runtime.agree_text("packed-front receipt", finish_local)
-        marker_payload = _parse_canonical_numeric_json(agreed_marker)
-        receipt = K3W3CompositionReceipt.model_validate(
+        agreed_core_marker = runtime.agree_text("packed-front receipt", finish_local)
+        core_marker_payload = _parse_canonical_numeric_json(agreed_core_marker)
+        core_receipt = K3W3CompositionReceipt.model_validate(
             {
-                "schema": _PACKED_FRONT_RECEIPT_SCHEMA,
-                **marker_payload,
+                "schema": _PACKED_FRONT_MARKER_SCHEMA,
+                **core_marker_payload,
             }
         )
-        if receipt.model_dump(exclude={"receipt_schema"}) != marker_payload:
+        if core_receipt.model_dump(exclude={"receipt_schema"}) != core_marker_payload:
             raise ValueError("packed-front receipt marker changed during validation")
+        evidence = k3_frontier_telemetry.finalize(
+            self._frontier_context,
+            core_marker_payload,
+        )
+        receipt: K3W3CompositionReceipt | K3W3CompositionReceiptV4 = core_receipt
+        agreed_marker = agreed_core_marker
+        if evidence is not None:
+            try:
+                file_digests = runtime.collective.gather_rank_local_sha256(
+                    "frontier-request-file",
+                    evidence.request_file_sha256,
+                )
+                completion_digests = runtime.collective.gather_rank_local_sha256(
+                    "frontier-process-complete",
+                    evidence.process_complete_file_sha256 or ("0" * 64),
+                )
+                if len(file_digests) != 2 or len(completion_digests) != 2:
+                    raise RuntimeError(
+                        "frontier receipt v4 requires two rank-local digests"
+                    )
+
+                def full_digest_fields(prefix: str, digest: str) -> dict[str, int]:
+                    raw = bytes.fromhex(digest)
+                    return {
+                        f"{prefix}_word_{index}": int.from_bytes(
+                            raw[index * 8 : (index + 1) * 8],
+                            "big",
+                        )
+                        for index in range(4)
+                    }
+
+                v4_payload = {
+                    **core_marker_payload,
+                    "receipt_schema_version": 4,
+                    "frontier_telemetry_schema_version": 4,
+                    "frontier_request_limit": 16,
+                    "frontier_request_index": evidence.request_index,
+                    "frontier_reset_generation": evidence.reset_generation,
+                    **full_digest_fields(
+                        "frontier_request_nonce_digest",
+                        evidence.request_nonce_sha256,
+                    ),
+                    **full_digest_fields(
+                        "frontier_receipt_v2_core_digest",
+                        evidence.receipt_v2_core_sha256,
+                    ),
+                    **full_digest_fields(
+                        "frontier_telemetry_file_digest_rank0",
+                        file_digests[0],
+                    ),
+                    **full_digest_fields(
+                        "frontier_telemetry_file_digest_rank1",
+                        file_digests[1],
+                    ),
+                    **full_digest_fields(
+                        "frontier_process_complete_digest_rank0",
+                        completion_digests[0],
+                    ),
+                    **full_digest_fields(
+                        "frontier_process_complete_digest_rank1",
+                        completion_digests[1],
+                    ),
+                }
+                agreed_marker = runtime.agree_text(
+                    "frontier receipt v4",
+                    lambda: _canonical_numeric_json(v4_payload),
+                )
+                marker_payload = _parse_canonical_numeric_json(agreed_marker)
+                receipt = K3W3CompositionReceiptV4.model_validate(
+                    {
+                        "schema": k3_frontier_telemetry.MARKER_SCHEMA,
+                        **marker_payload,
+                    }
+                )
+                if receipt.model_dump(exclude={"receipt_schema"}) != marker_payload:
+                    raise ValueError("frontier receipt v4 changed during validation")
+            except BaseException:
+                k3_frontier_telemetry.poison_finalized(self._frontier_context)
+                raise
         self._handle = None
         runtime.attach_composition_receipt_sink(None)
         self._runtime = None
@@ -2430,10 +2747,17 @@ class _PackedFrontReceiptRequest:
     def mark_marker_published(self) -> None:
         if self._receipt is None or self._marker is None or self._published:
             raise RuntimeError("packed-front receipt marker state is invalid")
-        _record_composition_receipt_publication(
-            self.phase,
-            self._phase_identity(),
-        )
+        if self._frontier_context is None:
+            _record_composition_receipt_publication(
+                self.phase,
+                self._phase_identity(),
+            )
+        else:
+            _record_composition_receipt_publication(
+                self.phase,
+                self._phase_identity(),
+                frontier_multi_request=True,
+            )
         self._published = True
         self._close_native_fd()
 
@@ -2445,6 +2769,7 @@ class _PackedFrontReceiptRequest:
         if runtime is not None:
             with contextlib.suppress(Exception):
                 runtime.attach_composition_receipt_sink(None)
+        k3_frontier_telemetry.abort(self._frontier_context)
         _release_composition_receipt_phase(self.phase)
         self._close_native_fd()
         if handle is None or self.api is None:
@@ -3661,10 +3986,12 @@ def _prepare_dspark_request_setup(
     agreement: MlxRankAgreement,
     generation_progress: bool,
     width4_receipt_scope: Literal["request", "warmup"],
+    packed_front_receipt: _PackedFrontReceiptRequest,
 ) -> _DSparkRequestSetup:
     """Build all failure-prone local request state without entering TP graphs."""
 
     mx.reset_peak_memory()
+    packed_front_receipt.capture_frontier_reset_baseline()
     is_pipeline = _has_pipeline_communication_layer(model)
     prompt_lookup_configuration = prompt_lookup_config(
         is_pipeline=is_pipeline,
@@ -4048,6 +4375,7 @@ def _mlx_generate_impl(
                 agreement=agreement,
                 generation_progress=on_generation_token is not None,
                 width4_receipt_scope=width4_receipt_scope,
+                packed_front_receipt=packed_front_receipt,
             ),
         )
         selection = dspark_setup.proposer_selection
@@ -4802,6 +5130,8 @@ def mlx_generate(
     packed_front_receipt = _PackedFrontReceiptRequest.from_environment(
         model,
         dspark,
+        task,
+        group,
         phase=_packed_front_receipt_phase,
     )
     try:

@@ -292,6 +292,9 @@ def _configure_selector_environment(
         generate_module._WIDTH4_RECEIPT_ENV: "0",
         "EXO_NO_BATCH": "1",
         "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE": "1",
+        generate_module._MLX_BATCHED_REPLAYSSM_COMMIT_ENV: "1",
+        generate_module._MLX_BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV: "69",
+        generate_module._MLX_FULL_ACCEPT_IDENTITY_COMMIT_ENV: "0",
         "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE": "1",
         generate_module._MLX_PROJECTED_KV_CACHE_MAX_TOKENS_ENV: "32768",
         "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES": "laguna8",
@@ -421,6 +424,20 @@ def _raw_receipt(
     }
 
 
+def _replayssm_telemetry_payload(
+    generate_module: ModuleType,
+    *,
+    revision: int,
+    counters: dict[str, int],
+) -> dict[str, object]:
+    return {
+        "schema": generate_module._BATCHED_REPLAYSSM_TELEMETRY_SCHEMA,
+        "revision": revision,
+        "counters": dict(counters),
+        "latest_attestation": None,
+    }
+
+
 def _build_fixture(
     generate_module: ModuleType,
     *,
@@ -432,6 +449,7 @@ def _build_fixture(
     prefill_width3: int = 0,
     prefill_noncontract: int = 0,
     accepted: list[int] | None = None,
+    identity_enabled: bool = False,
     visible_tokens: int | None = None,
     submit_final: bool = False,
 ) -> SimpleNamespace:
@@ -444,6 +462,7 @@ def _build_fixture(
         packed=packed,
         kda=kda,
         deferred=deferred_enabled,
+        identity_commit=identity_enabled,
         arm_code=arm_code,
         canonical=arm_code in {0, 7},
         digest=(1, 2, 3, 4),
@@ -464,10 +483,22 @@ def _build_fixture(
         lib_identity=(),
         lib_digest=(17, 18, 19, 20),
     )
+    replayssm_baseline_counters = {
+        name: index + 3
+        for index, name in enumerate(generate_module._BATCHED_REPLAYSSM_COUNTER_FIELDS)
+    }
+    replayssm_state: dict[str, object] = {
+        "current": _replayssm_telemetry_payload(
+            generate_module,
+            revision=41,
+            counters=replayssm_baseline_counters,
+        )
+    }
     api = generate_module._PackedFrontReceiptAPI(
         begin=lambda *_args, **_kwargs: (11, 29),
         finish=lambda *_args, **_kwargs: {},
         abort=lambda *_args: None,
+        commit_telemetry=lambda: replayssm_state["current"],
         source_digest=(9, 10, 11, 12),
     )
     request = generate_module._PackedFrontReceiptRequest(
@@ -484,6 +515,11 @@ def _build_fixture(
     )
     request._handle = (11, 29)
     request._native_baseline = (0, 0, 0, 0)
+    request._replayssm_baseline = (
+        generate_module._validated_batched_replayssm_telemetry(
+            replayssm_state["current"]
+        )
+    )
     request._assert_runtime_identity = lambda: None
 
     empty_attestation = kimi_k3_dspark.DeferredAsyncWidth3Attestation(
@@ -684,6 +720,31 @@ def _build_fixture(
             "n10624": (full_rounds + prefill_width3) * 92 if packed else 0,
         }
     )
+    full_accept_rounds = sum(int(value == 2) for value in accepted_values)
+    identity_rounds = full_accept_rounds if identity_enabled else 0
+    batched_rounds = full_rounds - identity_rounds
+    replayssm_deltas = {
+        "attempted_prepares": full_rounds,
+        "batched_prepares": batched_rounds,
+        "batched_commits": batched_rounds,
+        "identity_prepares": identity_rounds,
+        "identity_commits": identity_rounds,
+        "fallback_prepares": 0,
+        "fallback_commits": 0,
+        "batched_errors": 0,
+        "identity_errors": 0,
+        "layers_batched": batched_rounds * 69,
+        "layers_identity_committed": identity_rounds * 69,
+    }
+    replayssm_final_counters = {
+        name: replayssm_baseline_counters[name] + replayssm_deltas[name]
+        for name in generate_module._BATCHED_REPLAYSSM_COUNTER_FIELDS
+    }
+    replayssm_state["current"] = _replayssm_telemetry_payload(
+        generate_module,
+        revision=41 + full_rounds * 2,
+        counters=replayssm_final_counters,
+    )
     return SimpleNamespace(
         request=request,
         runtime=runtime,
@@ -691,6 +752,9 @@ def _build_fixture(
         raw=raw,
         native_counts=native_counts,
         committed=tuple(committed),
+        replayssm_state=replayssm_state,
+        replayssm_baseline_counters=replayssm_baseline_counters,
+        replayssm_deltas=replayssm_deltas,
     )
 
 
@@ -703,7 +767,7 @@ def _validate_fixture(generate_module: ModuleType, fixture: SimpleNamespace) -> 
         fixture.runtime,
     )
     receipt = K3W3CompositionReceipt.model_validate(
-        {"schema": generate_module._PACKED_FRONT_RECEIPT_SCHEMA, **marker}
+        {"schema": generate_module._PACKED_FRONT_MARKER_SCHEMA, **marker}
     )
     assert receipt.model_dump(exclude={"receipt_schema"}) == marker
     return receipt
@@ -755,6 +819,53 @@ def _scenario_selector_admission(generate_module: ModuleType) -> None:
     os.environ["EXO_MLX_RANK_LOCAL_CHECKPOINT"] = "/models/rank1"
     digest_rank1 = generate_module._packed_front_selector_contract().launch_digest
     assert digest_rank0 == digest_rank1
+
+    # C1 is rank-common behavior: admit it only inside the authenticated map,
+    # and prove an unrefreshed flip is rejected before a request can start.
+    _configure_selector_environment(generate_module, packed=1, kda=1, deferred=1)
+    os.environ[generate_module._MLX_FULL_ACCEPT_IDENTITY_COMMIT_ENV] = "1"
+    identity_enabled_sha = _refresh_launch_sha(generate_module)
+    identity_enabled = generate_module._packed_front_selector_contract()
+    assert identity_enabled.arm_code == 7
+    assert identity_enabled.identity_commit is True
+    os.environ[generate_module._MLX_FULL_ACCEPT_IDENTITY_COMMIT_ENV] = "0"
+    _expect_error(
+        ValueError,
+        "launch-contract SHA",
+        generate_module._packed_front_selector_contract,
+    )
+    identity_disabled_sha = _refresh_launch_sha(generate_module)
+    assert identity_disabled_sha != identity_enabled_sha
+    identity_disabled = generate_module._packed_front_selector_contract()
+    assert identity_disabled.arm_code == 7
+    assert identity_disabled.identity_commit is False
+
+    _configure_selector_environment(generate_module, packed=1, kda=1, deferred=1)
+    os.environ[generate_module._MLX_FULL_ACCEPT_IDENTITY_COMMIT_ENV] = "true"
+    _refresh_launch_sha(generate_module)
+    _expect_error(
+        ValueError,
+        "must be exactly 0 or 1",
+        generate_module._packed_front_selector_contract,
+    )
+
+    _configure_selector_environment(generate_module, packed=1, kda=1, deferred=1)
+    os.environ[generate_module._MLX_BATCHED_REPLAYSSM_COMMIT_ENV] = "0"
+    _refresh_launch_sha(generate_module)
+    _expect_error(
+        ValueError,
+        "must be exactly 1",
+        generate_module._packed_front_selector_contract,
+    )
+
+    _configure_selector_environment(generate_module, packed=1, kda=1, deferred=1)
+    os.environ[generate_module._MLX_BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV] = "68"
+    _refresh_launch_sha(generate_module)
+    _expect_error(
+        ValueError,
+        "must be exactly 69",
+        generate_module._packed_front_selector_contract,
+    )
 
     # Keep every non-candidate selector from the accepted 22.517 tok/s W3
     # control inside the authenticated launch map.  These selectors are
@@ -1043,6 +1154,8 @@ def _scenario_schema_and_default_wire(generate_module: ModuleType) -> None:
     fixture = _build_fixture(generate_module, visible_tokens=2)
     receipt = _validate_fixture(generate_module, fixture)
     assert isinstance(receipt, K3W3CompositionReceipt)
+    assert receipt.receipt_schema == generate_module._PACKED_FRONT_MARKER_SCHEMA
+    assert receipt.receipt_schema_version == 2
     assert set(fixture.raw) == set(generate_module._PACKED_FRONT_MLX_KEYS)
     assert type(fixture.raw["projected_kv_cache_max_tokens"]) is int
     assert fixture.raw["projected_kv_cache_max_tokens"] == 32768
@@ -1052,13 +1165,25 @@ def _scenario_schema_and_default_wire(generate_module: ModuleType) -> None:
     assert marker["kda_pending_calls"] == 0
     assert marker["visible_output_tokens"] == 2
     assert marker["emitted_tokens"] == len(fixture.committed)
+    assert marker["identity_commit_enabled"] is False
+    assert marker["speculative_full_accept_rounds"] == 2
+    assert marker["speculative_partial_accept_rounds"] == 0
+    assert marker["replayssm_batched_commits_delta"] == 2
+    assert marker["replayssm_identity_commits_delta"] == 0
+    assert marker["replayssm_telemetry_revision_delta"] == 4
     assert tuple(
         marker[f"visible_output_digest_word_{index}"] for index in range(4)
     ) != tuple(marker[f"committed_output_digest_word_{index}"] for index in range(4))
     assert all(
         forbidden not in name
         for name in marker
-        for forbidden in ("timing", "hostname", "prompt_text", "raw_token")
+        for forbidden in (
+            "timing",
+            "hostname",
+            "prompt_text",
+            "raw_token",
+            "attestation",
+        )
     )
 
     wrong_type = _build_fixture(generate_module)
@@ -1132,6 +1257,144 @@ def _scenario_candidate_and_control(generate_module: ModuleType) -> None:
     assert marker["pack_count_before"] == 0
     assert marker["pack_count_after"] == 92
     assert marker["lazy_installs"] == 92
+
+
+def _scenario_identity_commit_telemetry(generate_module: ModuleType) -> None:
+    selector_off = _build_fixture(
+        generate_module,
+        full_rounds=3,
+        accepted=[2, 1, 0],
+        identity_enabled=False,
+    )
+    off_marker = _validate_fixture(generate_module, selector_off).model_dump(
+        exclude={"receipt_schema"}
+    )
+    assert off_marker["identity_commit_enabled"] is False
+    assert off_marker["speculative_full_accept_rounds"] == 1
+    assert off_marker["speculative_partial_accept_rounds"] == 2
+    assert off_marker["replayssm_attempted_prepares_delta"] == 3
+    assert off_marker["replayssm_batched_prepares_delta"] == 3
+    assert off_marker["replayssm_batched_commits_delta"] == 3
+    assert off_marker["replayssm_identity_prepares_delta"] == 0
+    assert off_marker["replayssm_identity_commits_delta"] == 0
+    assert off_marker["replayssm_layers_batched_delta"] == 3 * 69
+    assert off_marker["replayssm_layers_identity_committed_delta"] == 0
+
+    selector_on = _build_fixture(
+        generate_module,
+        full_rounds=3,
+        accepted=[2, 1, 2],
+        identity_enabled=True,
+    )
+    on_payload = selector_on.replayssm_state["current"]
+    assert type(on_payload) is dict
+    on_payload["latest_attestation"] = {
+        "status": "identity_committed",
+        "raw_reference_commit": True,
+    }
+    on_marker = _validate_fixture(generate_module, selector_on).model_dump(
+        exclude={"receipt_schema"}
+    )
+    assert on_marker["identity_commit_enabled"] is True
+    assert on_marker["speculative_full_accept_rounds"] == 2
+    assert on_marker["speculative_partial_accept_rounds"] == 1
+    assert on_marker["replayssm_batched_prepares_delta"] == 1
+    assert on_marker["replayssm_batched_commits_delta"] == 1
+    assert on_marker["replayssm_identity_prepares_delta"] == 2
+    assert on_marker["replayssm_identity_commits_delta"] == 2
+    assert on_marker["replayssm_layers_batched_delta"] == 69
+    assert on_marker["replayssm_layers_identity_committed_delta"] == 2 * 69
+    assert on_marker["replayssm_fallback_prepares_delta"] == 0
+    assert on_marker["replayssm_fallback_commits_delta"] == 0
+    assert on_marker["replayssm_batched_errors_delta"] == 0
+    assert on_marker["replayssm_identity_errors_delta"] == 0
+    assert "latest_attestation" not in on_marker
+    assert all(type(value) in {bool, int} for value in on_marker.values())
+
+    wrong_schema = _build_fixture(generate_module)
+    wrong_schema.replayssm_state["current"]["schema"] = "wrong"
+    _expect_error(
+        ValueError,
+        "telemetry schema is invalid",
+        lambda: _validate_fixture(generate_module, wrong_schema),
+    )
+
+    wrong_top_level = _build_fixture(generate_module)
+    wrong_top_level.replayssm_state["current"]["extra"] = 1
+    _expect_error(
+        ValueError,
+        "telemetry fields are invalid",
+        lambda: _validate_fixture(generate_module, wrong_top_level),
+    )
+
+    wrong_counter_keys = _build_fixture(generate_module)
+    wrong_counter_payload = wrong_counter_keys.replayssm_state["current"]
+    assert type(wrong_counter_payload) is dict
+    wrong_counters = wrong_counter_payload["counters"]
+    assert type(wrong_counters) is dict
+    wrong_counters.pop("identity_errors")
+    _expect_error(
+        ValueError,
+        "counter fields are invalid",
+        lambda: _validate_fixture(generate_module, wrong_counter_keys),
+    )
+
+    bool_counter = _build_fixture(generate_module)
+    bool_payload = bool_counter.replayssm_state["current"]
+    assert type(bool_payload) is dict
+    bool_counters = bool_payload["counters"]
+    assert type(bool_counters) is dict
+    bool_counters["identity_errors"] = False
+    _expect_error(
+        ValueError,
+        "counter identity_errors is invalid",
+        lambda: _validate_fixture(generate_module, bool_counter),
+    )
+
+    decreased_counter = _build_fixture(generate_module)
+    decreased_payload = decreased_counter.replayssm_state["current"]
+    assert type(decreased_payload) is dict
+    decreased_counters = decreased_payload["counters"]
+    assert type(decreased_counters) is dict
+    decreased_counters["identity_errors"] = (
+        decreased_counter.replayssm_baseline_counters["identity_errors"] - 1
+    )
+    _expect_error(
+        ValueError,
+        "counter identity_errors decreased",
+        lambda: _validate_fixture(generate_module, decreased_counter),
+    )
+
+    decreased_revision = _build_fixture(generate_module)
+    decreased_revision.replayssm_state["current"]["revision"] = 40
+    _expect_error(
+        ValueError,
+        "telemetry revision decreased",
+        lambda: _validate_fixture(generate_module, decreased_revision),
+    )
+
+    wrong_identity_count = _build_fixture(
+        generate_module,
+        identity_enabled=True,
+    )
+    wrong_identity_payload = wrong_identity_count.replayssm_state["current"]
+    assert type(wrong_identity_payload) is dict
+    wrong_identity_counters = wrong_identity_payload["counters"]
+    assert type(wrong_identity_counters) is dict
+    wrong_identity_counters["identity_commits"] -= 1
+    _expect_error(
+        ValueError,
+        "request-local counter algebra is invalid",
+        lambda: _validate_fixture(generate_module, wrong_identity_count),
+    )
+
+    wrong_revision_delta = _build_fixture(generate_module)
+    wrong_revision_delta.replayssm_state["current"]["revision"] += 1
+    _expect_error(
+        ValueError,
+        "revision delta is invalid",
+        lambda: _validate_fixture(generate_module, wrong_revision_delta),
+    )
 
 
 def _scenario_prefill_geometry(generate_module: ModuleType) -> None:
@@ -1511,6 +1774,8 @@ def _scenario_identity_mutation(generate_module: ModuleType) -> None:
     begin_fixture.request._handle = None
     begin_fixture.request._receipt = None
     begin_fixture.request._runtime = None
+    begin_fixture.request._replayssm_baseline = None
+    begin_fixture.request._replayssm_final = None
     del begin_fixture.request.__dict__["_assert_runtime_identity"]
     reset_calls: list[str] = []
     begin_calls: list[str] = []
@@ -1530,6 +1795,7 @@ def _scenario_identity_mutation(generate_module: ModuleType) -> None:
         begin=lambda *_args, **_kwargs: begin_calls.append("begin") or (11, 29),
         finish=lambda *_args, **_kwargs: {},
         abort=lambda *_args: None,
+        commit_telemetry=begin_fixture.request.api.commit_telemetry,
         source_digest=begin_fixture.request.api.source_digest,
     )
     state["launch"] = (99, 6, 7, 8)
@@ -1552,6 +1818,8 @@ def _scenario_identity_mutation(generate_module: ModuleType) -> None:
     finish_request._receipt = None
     finish_request._marker = None
     finish_request._runtime = None
+    finish_request._replayssm_baseline = None
+    finish_request._replayssm_final = None
     del finish_request.__dict__["_assert_runtime_identity"]
     finish_calls: list[str] = []
     finish_request.api = generate_module._PackedFrontReceiptAPI(
@@ -1560,6 +1828,7 @@ def _scenario_identity_mutation(generate_module: ModuleType) -> None:
             finish_calls.append("finish") or dict(finish_fixture.raw)
         ),
         abort=lambda *_args: None,
+        commit_telemetry=finish_request.api.commit_telemetry,
         source_digest=finish_request.api.source_digest,
     )
     state.update(
@@ -1666,6 +1935,7 @@ def _scenario_finish_abort_and_publication(generate_module: ModuleType) -> None:
         begin=lambda *_args, **_kwargs: (11, 29),
         finish=lambda *_args, **_kwargs: dict(fixture.raw),
         abort=lambda sequence, token: aborts.append((sequence, token)),
+        commit_telemetry=fixture.request.api.commit_telemetry,
         source_digest=fixture.request.api.source_digest,
     )
     receipt = fixture.request.finish(fixture.runtime, fixture.telemetry)
@@ -1702,6 +1972,7 @@ def _scenario_finish_abort_and_publication(generate_module: ModuleType) -> None:
         begin=lambda *_args, **_kwargs: (11, 29),
         finish=lambda *_args, **_kwargs: dict(publication_failure.raw),
         abort=lambda *_args: None,
+        commit_telemetry=publication_failure.request.api.commit_telemetry,
         source_digest=publication_failure.request.api.source_digest,
     )
     publication_failure.request.finish(
@@ -1736,6 +2007,7 @@ def _scenario_finish_abort_and_publication(generate_module: ModuleType) -> None:
         begin=lambda *_args, **_kwargs: (11, 29),
         finish=lambda *_args, **_kwargs: dict(mark_failure.raw),
         abort=lambda *_args: None,
+        commit_telemetry=mark_failure.request.api.commit_telemetry,
         source_digest=mark_failure.request.api.source_digest,
     )
     mark_failure.request.finish(mark_failure.runtime, mark_failure.telemetry)
@@ -1775,6 +2047,7 @@ def _scenario_finish_abort_and_publication(generate_module: ModuleType) -> None:
         begin=lambda *_args, **_kwargs: (11, 29),
         finish=lambda *_args, **_kwargs: dict(divergent.raw),
         abort=lambda sequence, token: divergent_aborts.append((sequence, token)),
+        commit_telemetry=divergent.request.api.commit_telemetry,
         source_digest=divergent.request.api.source_digest,
     )
     _expect_error(
@@ -1808,16 +2081,142 @@ def _scenario_finish_abort_and_publication(generate_module: ModuleType) -> None:
     assert publication_source.count("runtime.agree_local_side_effect(") == 3
 
 
+def _scenario_rank_local_sha256_gather(_generate_module: ModuleType) -> None:
+    from exo.worker.engines.mlx.generator.kimi_k3_dspark import MlxRankAgreement
+
+    rank0 = hashlib.sha256(b"rank0").hexdigest()
+    rank1 = hashlib.sha256(b"rank1").hexdigest()
+    agreement = MlxRankAgreement(None)
+
+    def two_rank_rows(row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        rank1_raw = bytes.fromhex(rank1)
+        rank1_words = tuple(
+            int.from_bytes(rank1_raw[offset : offset + 2], "big")
+            for offset in range(0, 32, 2)
+        )
+        return row, (row[0], 1, *rank1_words)
+
+    agreement._all_gather_rows = two_rank_rows  # type: ignore[method-assign]
+    agreement._group = SimpleNamespace(  # type: ignore[assignment]
+        rank=lambda: 0,
+        size=lambda: 2,
+    )
+    assert agreement.gather_rank_local_sha256("frontier", rank0) == (rank0, rank1)
+    _expect_error(
+        ValueError,
+        "input is invalid",
+        lambda: agreement.gather_rank_local_sha256("frontier", "A" * 64),
+    )
+
+    def duplicate_rank(row: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        return row, row
+
+    agreement._all_gather_rows = duplicate_rank  # type: ignore[method-assign]
+    _expect_error(
+        RuntimeError,
+        "identity diverged",
+        lambda: agreement.gather_rank_local_sha256("frontier", rank0),
+    )
+
+
+def _scenario_frontier_receipt_v4(generate_module: ModuleType) -> None:
+    from exo.api.types import GenerationStats, K3W3CompositionReceiptV4
+    from exo.shared.types.memory import Memory
+
+    fixture = _build_fixture(generate_module, identity_enabled=True)
+    fixture.request.api = generate_module._PackedFrontReceiptAPI(
+        begin=lambda *_args, **_kwargs: (11, 29),
+        finish=lambda *_args, **_kwargs: dict(fixture.raw),
+        abort=lambda *_args: None,
+        commit_telemetry=fixture.request.api.commit_telemetry,
+        source_digest=fixture.request.api.source_digest,
+    )
+    nonce = hashlib.sha256(b"nonce").hexdigest()
+    core_sha = hashlib.sha256(b"core").hexdigest()
+    rank0_file = hashlib.sha256(b"rank0-file").hexdigest()
+    rank1_file = hashlib.sha256(b"rank1-file").hexdigest()
+    context = object()
+    fixture.request._frontier_context = context
+    original_finalize = generate_module.k3_frontier_telemetry.finalize
+    original_poison = generate_module.k3_frontier_telemetry.poison_finalized
+
+    def finalize(_context: object, core: dict[str, object]) -> SimpleNamespace:
+        assert _context is context
+        assert core["receipt_schema_version"] == 2
+        return SimpleNamespace(
+            request_index=1,
+            request_nonce_sha256=nonce,
+            reset_generation=1,
+            receipt_v2_core_sha256=core_sha,
+            request_file_sha256=rank0_file,
+            process_complete_file_sha256=None,
+        )
+
+    def gather(name: str, digest: str) -> tuple[str, str]:
+        if name == "frontier-request-file":
+            assert digest == rank0_file
+            return rank0_file, rank1_file
+        assert name == "frontier-process-complete"
+        assert digest == "0" * 64
+        return "0" * 64, "0" * 64
+
+    generate_module.k3_frontier_telemetry.finalize = finalize
+    generate_module.k3_frontier_telemetry.poison_finalized = lambda _context: None
+    fixture.runtime.collective = SimpleNamespace(
+        rank=0,
+        gather_rank_local_sha256=gather,
+    )
+    try:
+        receipt = fixture.request.finish(fixture.runtime, fixture.telemetry)
+    finally:
+        generate_module.k3_frontier_telemetry.finalize = original_finalize
+        generate_module.k3_frontier_telemetry.poison_finalized = original_poison
+    assert isinstance(receipt, K3W3CompositionReceiptV4)
+    assert receipt.receipt_schema == "kimi-k3-w3-composition-receipt/v4"
+    assert receipt.receipt_schema_version == 4
+    assert receipt.frontier_request_index == 1
+    assert receipt.frontier_reset_generation == 1
+    nonce_words = tuple(
+        getattr(receipt, f"frontier_request_nonce_digest_word_{index}")
+        for index in range(4)
+    )
+    assert b"".join(word.to_bytes(8, "big") for word in nonce_words).hex() == nonce
+    rank1_words = tuple(
+        getattr(receipt, f"frontier_telemetry_file_digest_rank1_word_{index}")
+        for index in range(4)
+    )
+    assert b"".join(word.to_bytes(8, "big") for word in rank1_words).hex() == rank1_file
+    assert fixture.request._marker is not None
+    assert '"receipt_schema_version":4' in fixture.request._marker
+    serialized = GenerationStats(
+        prompt_tps=1.0,
+        generation_tps=2.0,
+        prompt_tokens=3,
+        generation_tokens=4,
+        peak_memory_usage=Memory.from_bytes(5),
+        k3_w3_composition_receipt=receipt,
+    ).model_dump()["k3_w3_composition_receipt"]
+    assert serialized["schema"] == "kimi-k3-w3-composition-receipt/v4"
+    assert serialized["frontier_request_index"] == 1
+    assert "frontier_telemetry_file_digest_rank1_word_3" in serialized
+    assert not any(
+        key.startswith(("process_rss_", "rss_", "metal_")) for key in serialized
+    )
+
+
 _SCENARIOS: dict[str, Callable[[ModuleType], None]] = {
     "candidate-control": _scenario_candidate_and_control,
     "canonical-totals": _scenario_canonical_totals,
     "causal-fail-closed": _scenario_causal_fail_closed,
     "finish-abort-publication": _scenario_finish_abort_and_publication,
+    "frontier-receipt-v4": _scenario_frontier_receipt_v4,
     "identity-mutation": _scenario_identity_mutation,
+    "identity-commit-telemetry": _scenario_identity_commit_telemetry,
     "lifecycle": _scenario_lifecycle,
     "native-counter-algebra": _scenario_native_counter_algebra,
     "native-image-identity": _scenario_native_image_identity,
     "prefill-geometry": _scenario_prefill_geometry,
+    "rank-local-sha256-gather": _scenario_rank_local_sha256_gather,
     "schema-default-wire": _scenario_schema_and_default_wire,
     "selector-admission": _scenario_selector_admission,
     "strict-off": _scenario_strict_off,
@@ -1832,6 +2231,10 @@ def _run_inner_scenario(name: str) -> None:
         assert (
             generate_module._PACKED_FRONT_RECEIPT_SCHEMA
             == "kimi-k3-w3-composition-receipt/v1"
+        )
+        assert (
+            generate_module._PACKED_FRONT_MARKER_SCHEMA
+            == "kimi-k3-w3-composition-receipt/v2"
         )
         assert generate_module._PACKED_FRONT_EXPECTED_LAYERS == 92
         assert generate_module._KDA_EXPECTED_LAYERS == 69

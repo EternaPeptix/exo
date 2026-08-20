@@ -134,6 +134,12 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
 
     prefill_endpoint: str | None = None
 
+    # Sanitized frontier controls are admitted only by the bench endpoint and
+    # are consumed by the default-off Kimi K3 receipt-v4 path. The executor
+    # supplies a digest, never a raw nonce.
+    k3_frontier_request_index: int | None = None
+    k3_frontier_request_nonce_sha256: str | None = None
+
     def with_card_sampling_defaults(self) -> "TextGenerationTaskParams":
         from exo.shared.models import model_cards
 

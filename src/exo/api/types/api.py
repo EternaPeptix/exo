@@ -170,8 +170,8 @@ class K3W3CompositionReceipt(BaseModel):
         serialize_by_alias=True,
     )
 
-    receipt_schema: Literal["kimi-k3-w3-composition-receipt/v1"] = Field(alias="schema")
-    receipt_schema_version: Literal[1]
+    receipt_schema: Literal["kimi-k3-w3-composition-receipt/v2"] = Field(alias="schema")
+    receipt_schema_version: Literal[2]
     request_phase: Literal[1, 2]
     request_sequence: int
     request_token: int
@@ -183,6 +183,7 @@ class K3W3CompositionReceipt(BaseModel):
     packed_enabled: bool
     kda_enabled: bool
     deferred_enabled: bool
+    identity_commit_enabled: bool
     native_triplet_enabled: Literal[True]
     tail_overlap_enabled: Literal[True]
     expected_sparse_layers: Literal[92]
@@ -249,6 +250,8 @@ class K3W3CompositionReceipt(BaseModel):
     prefill_noncontract_chunks: int
     target_width1_rounds: int
     speculative_full_width_rounds: int
+    speculative_full_accept_rounds: int
+    speculative_partial_accept_rounds: int
     proposed_tokens: int
     accepted_tokens: int
     emitted_tokens: int
@@ -274,6 +277,20 @@ class K3W3CompositionReceipt(BaseModel):
     native_q3_n6144: int
     native_q3_n10624: int
     native_q3_other: int
+    replayssm_telemetry_revision_before: int
+    replayssm_telemetry_revision_after: int
+    replayssm_telemetry_revision_delta: int
+    replayssm_attempted_prepares_delta: int
+    replayssm_batched_prepares_delta: int
+    replayssm_batched_commits_delta: int
+    replayssm_identity_prepares_delta: int
+    replayssm_identity_commits_delta: int
+    replayssm_fallback_prepares_delta: int
+    replayssm_fallback_commits_delta: int
+    replayssm_batched_errors_delta: int
+    replayssm_identity_errors_delta: int
+    replayssm_layers_batched_delta: int
+    replayssm_layers_identity_committed_delta: int
     schedule_digest_word_0: int
     schedule_digest_word_1: int
     schedule_digest_word_2: int
@@ -304,6 +321,41 @@ class K3W3CompositionReceipt(BaseModel):
     causal_digest_word_3: int
 
 
+class K3W3CompositionReceiptV4(K3W3CompositionReceipt):
+    """Receipt-v2 C1 core plus the explicit multi-request v4 evidence join."""
+
+    receipt_schema: Literal["kimi-k3-w3-composition-receipt/v4"] = Field(alias="schema")
+    receipt_schema_version: Literal[4]
+    frontier_telemetry_schema_version: Literal[4]
+    frontier_request_limit: Literal[16]
+    frontier_request_index: int
+    frontier_reset_generation: int
+    frontier_request_nonce_digest_word_0: int
+    frontier_request_nonce_digest_word_1: int
+    frontier_request_nonce_digest_word_2: int
+    frontier_request_nonce_digest_word_3: int
+    frontier_receipt_v2_core_digest_word_0: int
+    frontier_receipt_v2_core_digest_word_1: int
+    frontier_receipt_v2_core_digest_word_2: int
+    frontier_receipt_v2_core_digest_word_3: int
+    frontier_telemetry_file_digest_rank0_word_0: int
+    frontier_telemetry_file_digest_rank0_word_1: int
+    frontier_telemetry_file_digest_rank0_word_2: int
+    frontier_telemetry_file_digest_rank0_word_3: int
+    frontier_telemetry_file_digest_rank1_word_0: int
+    frontier_telemetry_file_digest_rank1_word_1: int
+    frontier_telemetry_file_digest_rank1_word_2: int
+    frontier_telemetry_file_digest_rank1_word_3: int
+    frontier_process_complete_digest_rank0_word_0: int
+    frontier_process_complete_digest_rank0_word_1: int
+    frontier_process_complete_digest_rank0_word_2: int
+    frontier_process_complete_digest_rank0_word_3: int
+    frontier_process_complete_digest_rank1_word_0: int
+    frontier_process_complete_digest_rank1_word_1: int
+    frontier_process_complete_digest_rank1_word_2: int
+    frontier_process_complete_digest_rank1_word_3: int
+
+
 class GenerationStats(BaseModel):
     prompt_tps: float
     generation_tps: float
@@ -331,7 +383,9 @@ class GenerationStats(BaseModel):
     prefill_width1_chunks: int = 0
     prefill_width3_chunks: int = 0
     prefill_noncontract_chunks: int = 0
-    k3_w3_composition_receipt: K3W3CompositionReceipt | None = None
+    k3_w3_composition_receipt: (
+        K3W3CompositionReceipt | K3W3CompositionReceiptV4 | None
+    ) = None
 
     @model_serializer(mode="wrap")
     def _serialize_without_disabled_composition_receipt(self, handler: Any) -> Any:

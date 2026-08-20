@@ -39,6 +39,7 @@ from .api import ImageSize as ImageSize
 from .api import InstanceLinkBody as InstanceLinkBody
 from .api import InstanceLinkResponse as InstanceLinkResponse
 from .api import K3W3CompositionReceipt as K3W3CompositionReceipt
+from .api import K3W3CompositionReceiptV4 as K3W3CompositionReceiptV4
 from .api import Logprobs as Logprobs
 from .api import LogprobsContentItem as LogprobsContentItem
 from .api import ModelList as ModelList

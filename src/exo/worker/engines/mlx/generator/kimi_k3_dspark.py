@@ -1305,6 +1305,44 @@ class MlxRankAgreement:
             return None
         return first[1]
 
+    def gather_rank_local_sha256(self, name: str, digest: str) -> tuple[str, ...]:
+        """Gather one different sanitized SHA-256 from each rank in rank order."""
+
+        if (
+            type(name) is not str
+            or not name
+            or not name.isascii()
+            or len(name) > 128
+            or type(digest) is not str
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("rank-local SHA-256 gather input is invalid")
+        raw = bytes.fromhex(digest)
+        words = tuple(
+            int.from_bytes(raw[offset : offset + 2], "big")
+            for offset in range(0, len(raw), 2)
+        )
+        tag = _packed_operation_tag(f"rank-local-sha256:{name}")
+        rows = self._gather_rows((tag, self.rank, *words))
+        if len(rows) != self.size:
+            raise DSparkDistributedStateError(
+                "rank-local SHA-256 gather returned the wrong world size"
+            )
+        result: list[str] = []
+        for expected_rank, row in enumerate(rows):
+            if (
+                len(row) != 18
+                or row[0] != tag
+                or row[1] != expected_rank
+                or any(not 0 <= value <= 0xFFFF for value in row[2:])
+            ):
+                raise DSparkDistributedStateError(
+                    "rank-local SHA-256 gather identity diverged"
+                )
+            result.append(b"".join(value.to_bytes(2, "big") for value in row[2:]).hex())
+        return tuple(result)
+
 
 @dataclass(frozen=True)
 class DSparkRoundTelemetry:
