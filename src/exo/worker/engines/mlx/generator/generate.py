@@ -176,6 +176,22 @@ class _DSparkRequestSetup:
 
 
 @dataclass(frozen=True)
+class _DeferredMlxGenerationResponse:
+    """Structurally safe local placeholder consumed only by fail-closed control."""
+
+    text: str
+    token: int
+    logprobs: object
+    from_draft: bool
+    prompt_tokens: int
+    prompt_tps: float
+    generation_tokens: int
+    generation_tps: float
+    peak_memory: float
+    finish_reason: str | None
+
+
+@dataclass(frozen=True)
 class _TerminalDecodeTiming:
     elapsed_seconds: float
     effective_tps: float
@@ -224,6 +240,11 @@ class _PromptLookupTelemetry:
     visible_accepted_tokens: int = 0
     fallback_rounds: int = 0
     error_rounds: int = 0
+    round_timing_rounds: int = 0
+    round_wall_ns_total: int = 0
+    interround_ns_total: int = 0
+    round_wall_ns_max: int = 0
+    interround_ns_max: int = 0
     composition_receipt: "_PackedFrontReceiptRequest | None" = None
 
     def observe(self, stats: "_SpeculativeRoundStatsLike") -> None:
@@ -254,6 +275,27 @@ class _PromptLookupTelemetry:
         self.committed_tokens += stats.emitted
         self.fallback_rounds += int(stats.fallback)
         self.error_rounds += int(stats.error is not None)
+        timing_values = (stats.round_wall_ms, stats.interround_ms)
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+            for value in timing_values
+        ):
+            raise ValueError(
+                "Kimi K3 round-gap telemetry must be finite and non-negative"
+            )
+        wall_ns = round(float(stats.round_wall_ms) * 1_000_000.0)
+        interround_ns = round(float(stats.interround_ms) * 1_000_000.0)
+        if wall_ns > 10_000_000_000_000 or interround_ns > 10_000_000_000_000:
+            raise ValueError("Kimi K3 round-gap telemetry exceeds its numeric bound")
+        if wall_ns != 0 or interround_ns != 0:
+            self.round_timing_rounds += 1
+        self.round_wall_ns_total += wall_ns
+        self.interround_ns_total += interround_ns
+        self.round_wall_ns_max = max(self.round_wall_ns_max, wall_ns)
+        self.interround_ns_max = max(self.interround_ns_max, interround_ns)
         if self.composition_receipt is not None:
             self.composition_receipt.observe_round(
                 stats,
@@ -930,6 +972,7 @@ class _CompositionSelectors:
     kda: bool
     deferred: bool
     identity_commit: bool
+    bookkeeping_bundle: bool
     arm_code: int
     canonical: bool
     digest: tuple[int, int, int, int]
@@ -950,6 +993,7 @@ def _launch_contract_digest() -> tuple[int, int, int, int]:
         "EXO_MLX_K3_VOCAB_PARALLEL_GREEDY",
         "EXO_MLX_K3_VOCAB_PARALLEL_HEAD",
         "EXO_MLX_KIMI_K3_DEFERRED_ASYNC_WIDTH3",
+        "EXO_MLX_KIMI_K3_DSPARK_DEFER_DEFENSIVE_AGREEMENTS",
         "EXO_MLX_KIMI_K3_DSPARK_AUX_ONLY_PREFILL",
         "EXO_MLX_KIMI_K3_DSPARK_DUAL_PROPOSER",
         "EXO_MLX_KIMI_K3_DSPARK_FORCE_ORDINARY",
@@ -1185,6 +1229,15 @@ def _packed_front_selector_contract(
             "in diagnostic mode"
         )
     identity_commit_enabled = identity_commit_raw == "1"
+    bookkeeping_raw = os.environ.get(
+        "EXO_MLX_KIMI_K3_DSPARK_DEFER_DEFENSIVE_AGREEMENTS"
+    )
+    if bookkeeping_raw not in {"0", "1"}:
+        raise ValueError(
+            "EXO_MLX_KIMI_K3_DSPARK_DEFER_DEFENSIVE_AGREEMENTS must be "
+            "exactly 0 or 1 in diagnostic mode"
+        )
+    bookkeeping_enabled = bookkeeping_raw == "1"
     arm_code = (
         int(packed_enabled) | (int(kda_enabled) << 1) | (int(deferred_enabled) << 2)
     )
@@ -1224,6 +1277,7 @@ def _packed_front_selector_contract(
         _EXO_DEFERRED_WIDTH3_ENV: int(cast(str, deferred_exo)),
         _MLX_DEFERRED_WIDTH3_ENV: int(cast(str, deferred_mlx)),
         _MLX_FULL_ACCEPT_IDENTITY_COMMIT_ENV: int(identity_commit_enabled),
+        "EXO_MLX_KIMI_K3_DSPARK_DEFER_DEFENSIVE_AGREEMENTS": int(bookkeeping_enabled),
         _MLX_DUPLICATING_PACKED_FRONT_ENV: 0,
         _MLX_PACKED_FRONT_WIDTH8_ENV: 0,
         _MLX_MULTIBANK_PACKED_FRONT_ENV: 0,
@@ -1250,6 +1304,7 @@ def _packed_front_selector_contract(
         kda=kda_enabled,
         deferred=deferred_enabled,
         identity_commit=identity_commit_enabled,
+        bookkeeping_bundle=bookkeeping_enabled,
         arm_code=arm_code,
         canonical=canonical,
         digest=cast(tuple[int, int, int, int], words),
@@ -2891,13 +2946,42 @@ class _PackedFrontReceiptRequest:
                     for ordinal, record in enumerate(self._round_records, 1)
                 )
                 timing_rows = runtime.gather_frontier_timing_evidence(
-                    (self._target_commit_ns, self._prelaunch_ns),
+                    (
+                        self._target_commit_ns,
+                        self._prelaunch_ns,
+                        telemetry.round_wall_ns_total,
+                        telemetry.interround_ns_total,
+                        telemetry.round_wall_ns_max,
+                        telemetry.interround_ns_max,
+                    ),
                     local_complete=(
                         not self._poisoned
                         and len(schedule) == telemetry.rounds
                         and telemetry.rounds > 0
+                        and self.selectors is not None
+                        and (
+                            (
+                                self.selectors.bookkeeping_bundle
+                                and telemetry.round_timing_rounds == telemetry.rounds
+                                and telemetry.round_wall_ns_total > 0
+                                and telemetry.round_wall_ns_max > 0
+                                and (
+                                    telemetry.rounds == 1
+                                    or telemetry.interround_ns_total > 0
+                                )
+                            )
+                            or (
+                                not self.selectors.bookkeeping_bundle
+                                and telemetry.round_timing_rounds == 0
+                                and telemetry.round_wall_ns_total == 0
+                                and telemetry.interround_ns_total == 0
+                                and telemetry.round_wall_ns_max == 0
+                                and telemetry.interround_ns_max == 0
+                            )
+                        )
                     ),
                 )
+                assert self.selectors is not None
                 v5_payload = {
                     **v4_payload,
                     "receipt_schema_version": 5,
@@ -2906,6 +2990,18 @@ class _PackedFrontReceiptRequest:
                     "frontier_prelaunch_ns": timing_rows[0][1],
                     "frontier_target_commit_ns_rank1": timing_rows[1][0],
                     "frontier_prelaunch_ns_rank1": timing_rows[1][1],
+                    "bookkeeping_bundle_enabled": (self.selectors.bookkeeping_bundle),
+                    "timing_rounds": (
+                        telemetry.rounds if self.selectors.bookkeeping_bundle else 0
+                    ),
+                    "rank0_round_wall_ns_total": timing_rows[0][2],
+                    "rank0_interround_ns_total": timing_rows[0][3],
+                    "rank0_round_wall_ns_max": timing_rows[0][4],
+                    "rank0_interround_ns_max": timing_rows[0][5],
+                    "rank1_round_wall_ns_total": timing_rows[1][2],
+                    "rank1_interround_ns_total": timing_rows[1][3],
+                    "rank1_round_wall_ns_max": timing_rows[1][4],
+                    "rank1_interround_ns_max": timing_rows[1][5],
                 }
                 agreed_marker = runtime.agree_text(
                     "frontier receipt v5",
@@ -4064,6 +4160,7 @@ def _dspark_setup_fingerprint(
     authoritative_packed_width3: bool = False,
     w3_prework_history: bool = False,
     native_packed_q3: bool = False,
+    defer_defensive_agreements: bool = False,
     eos_token_ids: tuple[int, ...],
     banned_token_ids: tuple[int, ...],
     terminal_token_ids: tuple[int, ...],
@@ -4129,6 +4226,8 @@ def _dspark_setup_fingerprint(
     )
     add_integer(int(w3_prework_history), name="W3 KDA prework flag")
     add_integer(int(native_packed_q3), name="native packed Q3 flag")
+    if defer_defensive_agreements:
+        digest.update(b"exo-kimi-k3-deferred-defensive-agreements/v1\0")
     add_tokens(eos_token_ids, name="EOS tokens")
     add_tokens(banned_token_ids, name="banned tokens")
     add_tokens(terminal_token_ids, name="terminal tokens")
@@ -4579,6 +4678,11 @@ def _prepare_dspark_request_setup(
             "native_packed_q3",
             False,
         ),
+        defer_defensive_agreements=getattr(
+            request_dspark.config,
+            "defer_defensive_agreements",
+            False,
+        ),
         eos_token_ids=eos_token_ids,
         banned_token_ids=banned_token_ids,
         terminal_token_ids=terminal_token_ids,
@@ -4643,8 +4747,13 @@ def _dspark_mlx_responses(
             force_ordinary=force_ordinary,
             round_observer=lambda stats: telemetry.observe_dspark_round(
                 stats,
-                target_cache_tokens=runtime.target_cache_offset,
+                target_cache_tokens=(
+                    stats.target_cache_tokens
+                    if runtime.loaded.config.defer_defensive_agreements
+                    else runtime.target_cache_offset
+                ),
             ),
+            measure_round_gaps=runtime.loaded.config.defer_defensive_agreements,
         ),
         start=1,
     ):
@@ -4664,7 +4773,7 @@ def _dspark_mlx_responses(
                     detokenizer.finalize()
             return detokenizer.last_segment
 
-        text = runtime.agree_text("detokenizer output", render_token)
+        text = runtime.defer_defensive_text("detokenizer output", render_token)
 
         def build_response(
             decoded: object = decoded,
@@ -4686,9 +4795,25 @@ def _dspark_mlx_responses(
                 finish_reason=decoded.finish_reason,
             )
 
-        yield runtime.agree_local_value(
-            "response construction",
-            build_response,
+        deferred_response = _DeferredMlxGenerationResponse(
+            text=text,
+            token=int(decoded.token),
+            logprobs=empty_logprobs,
+            from_draft=bool(decoded.from_draft),
+            prompt_tokens=1,
+            prompt_tps=0.0,
+            generation_tokens=generation_tokens,
+            generation_tps=0.0,
+            peak_memory=0.0,
+            finish_reason=decoded.finish_reason,
+        )
+        yield cast(
+            MlxGenerationResponse,
+            runtime.defer_defensive_value(
+                "response construction",
+                build_response,
+                failure=lambda deferred_response=deferred_response: deferred_response,
+            ),
         )
 
 
@@ -5458,9 +5583,10 @@ def _mlx_generate_impl(
                 )
 
             response = (
-                dspark_runtime.agree_local_value(
+                dspark_runtime.defer_defensive_value(
                     "public response construction",
                     build_public_response,
+                    failure=lambda: cast(GenerationResponse, object()),
                 )
                 if dspark_runtime is not None
                 else build_public_response()
@@ -5468,12 +5594,25 @@ def _mlx_generate_impl(
 
             if on_generation_token is not None:
                 if dspark_runtime is not None:
-                    dspark_runtime.agree_local_side_effect(
+                    dspark_runtime.defer_defensive_side_effect(
                         "generation progress callback",
                         on_generation_token,
                     )
                 else:
                     on_generation_token()
+
+            if (
+                dspark_runtime is not None
+                and dspark_runtime.loaded.config.defer_defensive_agreements
+            ):
+                expected_deferred_operations = (
+                    "public response construction",
+                    *(("generation progress callback",) if on_generation_token else ()),
+                )
+                dspark_runtime.flush_deferred_defensive_operations(
+                    "post-response",
+                    expected_names=expected_deferred_operations,
+                )
 
             if (
                 is_done

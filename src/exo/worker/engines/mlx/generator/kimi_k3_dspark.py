@@ -28,7 +28,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Protocol, cast, final
 
@@ -54,6 +54,9 @@ DSPARK_RANK_ZERO_PROPOSAL_RECOVERY_ENV = (
 DSPARK_PACKED_AGREEMENTS_ENV = "EXO_MLX_KIMI_K3_DSPARK_PACKED_AGREEMENTS"
 DSPARK_TAIL_OVERLAP_ENV = "EXO_MLX_KIMI_K3_DSPARK_TAIL_OVERLAP"
 DSPARK_DEFERRED_ASYNC_WIDTH3_ENV = "EXO_MLX_KIMI_K3_DEFERRED_ASYNC_WIDTH3"
+DSPARK_DEFER_DEFENSIVE_AGREEMENTS_ENV = (
+    "EXO_MLX_KIMI_K3_DSPARK_DEFER_DEFENSIVE_AGREEMENTS"
+)
 
 # These controls live on separate experimental branches.  The first dual
 # proposer deliberately rejects them instead of silently composing untested
@@ -131,6 +134,7 @@ _EXO_COMPANION_ENVS = (
     DSPARK_PACKED_AGREEMENTS_ENV,
     DSPARK_TAIL_OVERLAP_ENV,
     DSPARK_DEFERRED_ASYNC_WIDTH3_ENV,
+    DSPARK_DEFER_DEFENSIVE_AGREEMENTS_ENV,
 )
 
 
@@ -253,6 +257,7 @@ class KimiK3DSparkConfig:
     authoritative_packed_width3: bool = False
     w3_prework_history: bool = False
     native_packed_q3: bool = False
+    defer_defensive_agreements: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -272,6 +277,14 @@ class KimiK3DSparkConfig:
             raise DSparkConfigurationError(
                 "Kimi K3 authoritative packed W3 requires the native Q3 "
                 "triplet selector"
+            )
+        if self.defer_defensive_agreements and (
+            self.verify_width != DSPARK_CONSERVATIVE_VERIFY_WIDTH
+            or not self.packed_agreements
+        ):
+            raise DSparkConfigurationError(
+                "Kimi K3 deferred defensive agreements require verify width "
+                "three and packed agreements"
             )
 
     @property
@@ -334,6 +347,7 @@ class KimiK3DSparkDualConfig:
             "authoritative_packed_width3",
             "w3_prework_history",
             "native_packed_q3",
+            "defer_defensive_agreements",
         )
         if any(
             getattr(self.old, name) != getattr(self.yarn, name)
@@ -374,6 +388,10 @@ class KimiK3DSparkDualConfig:
     @property
     def native_packed_q3(self) -> bool:
         return self.old.native_packed_q3
+
+    @property
+    def defer_defensive_agreements(self) -> bool:
+        return self.old.defer_defensive_agreements
 
 
 KimiK3DSparkDeploymentConfig = KimiK3DSparkConfig | KimiK3DSparkDualConfig
@@ -722,6 +740,10 @@ def kimi_k3_dspark_config(
         DSPARK_PACKED_AGREEMENTS_ENV,
         values.get(DSPARK_PACKED_AGREEMENTS_ENV, "0"),
     )
+    defer_defensive_agreements = _strict_flag(
+        DSPARK_DEFER_DEFENSIVE_AGREEMENTS_ENV,
+        values.get(DSPARK_DEFER_DEFENSIVE_AGREEMENTS_ENV, "0"),
+    )
     tail_overlap = _strict_flag(
         DSPARK_TAIL_OVERLAP_ENV,
         values.get(DSPARK_TAIL_OVERLAP_ENV, "0"),
@@ -809,6 +831,7 @@ def kimi_k3_dspark_config(
         authoritative_packed_width3=authoritative_packed_width3,
         w3_prework_history=w3_prework_history,
         native_packed_q3=native_packed_q3,
+        defer_defensive_agreements=defer_defensive_agreements,
     )
     if not dual_enabled:
         return primary_config
@@ -848,6 +871,7 @@ def kimi_k3_dspark_config(
         authoritative_packed_width3=authoritative_packed_width3,
         w3_prework_history=w3_prework_history,
         native_packed_q3=native_packed_q3,
+        defer_defensive_agreements=defer_defensive_agreements,
     )
     return KimiK3DSparkDualConfig(old=primary_config, yarn=yarn_config)
 
@@ -1396,6 +1420,9 @@ class DSparkRoundTelemetry:
     prelaunch_ms: float = 0.0
     prelaunch_submitted: bool = False
     prelaunch_used: bool = False
+    round_wall_ms: float = 0.0
+    interround_ms: float = 0.0
+    target_cache_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1695,7 +1722,10 @@ def log_dspark_round(telemetry: DSparkRoundTelemetry) -> None:
         f"error={telemetry.error!r}, "
         f"prelaunch_ms={telemetry.prelaunch_ms:.3f}, "
         f"prelaunch_submitted={telemetry.prelaunch_submitted}, "
-        f"prelaunch_used={telemetry.prelaunch_used}"
+        f"prelaunch_used={telemetry.prelaunch_used}, "
+        f"round_wall_ms={telemetry.round_wall_ms:.3f}, "
+        f"interround_ms={telemetry.interround_ms:.3f}, "
+        f"target_cache_tokens={telemetry.target_cache_tokens!r}"
     )
 
 
@@ -1711,7 +1741,10 @@ def _nonthrowing_telemetry_clock(
 
     def read() -> float:
         try:
-            return float(clock())
+            value = float(clock())
+            if not math.isfinite(value):
+                raise ValueError("telemetry clock returned a non-finite value")
+            return value
         except Exception:
             _log_nonfatal_warning("Kimi K3 DSpark telemetry clock failed")
             return 0.0
@@ -2422,6 +2455,11 @@ class KimiK3DSparkRoundEngine:
             emitted=len(emitted_tokens),
             fallback=not planned_tail,
             error=fallback_error,
+            target_cache_tokens=(
+                local_plan.initial_offset + 1
+                if self.config.defer_defensive_agreements
+                else None
+            ),
         )
         self._publish(telemetry)
         self._round_index += 1
@@ -3209,6 +3247,11 @@ class KimiK3DSparkRoundEngine:
             prelaunch_ms=prelaunch_ms,
             prelaunch_submitted=tail is not None and tail.submitted,
             prelaunch_used=prelaunch_used,
+            target_cache_tokens=(
+                agreed_target_offset + accepted + 1
+                if self.config.defer_defensive_agreements
+                else None
+            ),
         )
         self._publish(telemetry)
         self._round_index += 1
@@ -3239,6 +3282,15 @@ def has_replayssm_target_hooks(target_model: object) -> bool:
         "cancel_speculative_cache",
     )
     return all(callable(getattr(target_model, name, None)) for name in required)
+
+
+@dataclass(frozen=True)
+class _TargetCacheValidationTicket:
+    """One rank-local proof that an unchanged speculative cache is open."""
+
+    cache_identity: int
+    initial_offset: int
+    width: int
 
 
 @final
@@ -3380,16 +3432,28 @@ class _PreparedReplaySSMVerification:
         build_verify: Callable[
             [tuple[int, ...], TargetVerificationPlan], _TargetPosteriorGraph
         ],
+        build_verify_memoized: Callable[
+            [
+                tuple[int, ...],
+                TargetVerificationPlan,
+                _TargetCacheValidationTicket,
+            ],
+            _TargetPosteriorGraph,
+        ]
+        | None,
         initial_offset: int,
         validate_closed: Callable[[int], None] | None,
+        validation_ticket: _TargetCacheValidationTicket | None,
     ):
         self._hooks = hooks
         self._transaction = transaction
         self._proposal_block = proposal_block
         self._plan = plan
         self._build_verify = build_verify
+        self._build_verify_memoized = build_verify_memoized
         self._initial_offset = initial_offset
         self._validate_closed = validate_closed
+        self._validation_ticket = validation_ticket
         self._active = True
 
     @property
@@ -3404,7 +3468,18 @@ class _PreparedReplaySSMVerification:
         if not self._active:
             raise RuntimeError("target speculative transaction is no longer active")
         try:
-            graph = self._build_verify(self._proposal_block, self._plan)
+            if self._validation_ticket is None:
+                graph = self._build_verify(self._proposal_block, self._plan)
+            else:
+                if self._build_verify_memoized is None:
+                    raise RuntimeError(
+                        "target cache validation ticket has no memoized builder"
+                    )
+                graph = self._build_verify_memoized(
+                    self._proposal_block,
+                    self._plan,
+                    self._validation_ticket,
+                )
         except BaseException as build_error:
             try:
                 _cancel_replayssm_transaction(
@@ -3461,6 +3536,17 @@ class ReplaySSMTargetAdapter:
         prepare_ordinary: Callable[[int, OrdinaryDecodePlan], PreparedOrdinaryDecode],
         validate_closed: Callable[[int], None] | None = None,
         validate_open: Callable[[int, int], None] | None = None,
+        build_verify_memoized: Callable[
+            [
+                tuple[int, ...],
+                TargetVerificationPlan,
+                _TargetCacheValidationTicket,
+            ],
+            _TargetPosteriorGraph,
+        ]
+        | None = None,
+        validate_initial_closed: Callable[[int], None] | None = None,
+        memoize_validation: bool = False,
     ):
         if not has_replayssm_target_hooks(target_model):
             raise DSparkFeatureUnavailableError(
@@ -3474,6 +3560,15 @@ class ReplaySSMTargetAdapter:
         self._prepare_ordinary = prepare_ordinary
         self._validate_closed = validate_closed
         self._validate_open = validate_open
+        self._build_verify_memoized = build_verify_memoized
+        self._validate_initial_closed = validate_initial_closed
+        self._memoize_validation = memoize_validation
+        if memoize_validation and (
+            build_verify_memoized is None or validate_initial_closed is None
+        ):
+            raise ValueError(
+                "memoized target validation requires exact builder and validator"
+            )
 
     def prepare_verification(
         self,
@@ -3486,7 +3581,11 @@ class ReplaySSMTargetAdapter:
             else 0
         )
         if self._validate_closed is not None:
-            self._validate_closed(initial_offset)
+            if self._memoize_validation:
+                assert self._validate_initial_closed is not None
+                self._validate_initial_closed(initial_offset)
+            else:
+                self._validate_closed(initial_offset)
         transaction: object | None = None
         try:
             transaction = self._hooks.begin_speculative_cache(
@@ -3512,14 +3611,25 @@ class ReplaySSMTargetAdapter:
                     f"not be attested: {type(cancel_error).__name__}: {cancel_error}"
                 ) from begin_error
             raise
+        validation_ticket = (
+            _TargetCacheValidationTicket(
+                cache_identity=id(self._target_cache),
+                initial_offset=initial_offset,
+                width=len(proposal_block),
+            )
+            if self._memoize_validation
+            else None
+        )
         return _PreparedReplaySSMVerification(
             self._hooks,
             transaction,
             proposal_block,
             plan,
             self._build_verify,
+            self._build_verify_memoized,
             initial_offset,
             self._validate_closed,
+            validation_ticket,
         )
 
     def preflight_ordinary(self, anchor_token: int) -> OrdinaryDecodePlan:
@@ -4588,13 +4698,21 @@ def _validate_target_cache(
     require_kda_state: bool,
     speculative_phase: Literal["closed", "open", "staged"] = "closed",
     speculative_width: int | None = None,
+    observed_offset: int | None = None,
 ) -> None:
     if speculative_phase == "closed":
         if speculative_width is not None:
             raise ValueError("closed Kimi K3 target cache cannot have a width")
     elif type(speculative_width) is not int or speculative_width <= 1:
         raise ValueError("active Kimi K3 target cache requires an exact width")
-    if _target_cache_offset(target_cache) != expected_offset:
+    actual_offset = (
+        _target_cache_offset(target_cache)
+        if observed_offset is None
+        else observed_offset
+    )
+    if type(actual_offset) is not int or actual_offset < 0:
+        raise ValueError("Kimi K3 observed target cache offset is invalid")
+    if actual_offset != expected_offset:
         raise ValueError(f"Kimi K3 target cache must be at offset {expected_offset}")
     kda_entries = 0
     for entry in cast(Sequence[object], target_cache):
@@ -5185,6 +5303,11 @@ class KimiK3DSparkRequestRuntime:
         init=False,
         repr=False,
     )
+    _deferred_defensive_operations: list[tuple[int, int]] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.loaded.assert_healthy()
@@ -5351,40 +5474,46 @@ class KimiK3DSparkRequestRuntime:
 
     def gather_frontier_timing_evidence(
         self,
-        local_values: tuple[int, int],
+        local_values: tuple[int, ...],
         *,
         local_complete: bool,
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        """Gather rank-local target-commit/prelaunch totals as bounded integers."""
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Gather bounded request-local timing values in deterministic rank order."""
 
         self.loaded.assert_healthy()
         limit = 10_000_000_000_000
         valid = (
             type(local_complete) is bool
             and local_complete
+            and len(local_values) in {2, 6}
             and all(
                 type(value) is int and 0 <= value <= limit for value in local_values
             )
         )
         limbs: list[int] = []
-        for value in local_values if valid else (0, 0):
+        values_to_encode = local_values if valid else ((0,) * len(local_values))
+        for value in values_to_encode:
             high, low = divmod(value, 1 << 30)
             limbs.extend((high, low))
         rows = self.collective.gather_rank_rows((int(valid), *limbs))
-        if len(rows) != 2 or any(len(row) != 5 or row[0] != 1 for row in rows):
+        expected_width = 1 + 2 * len(local_values)
+        if len(rows) != 2 or any(
+            len(row) != expected_width or row[0] != 1 for row in rows
+        ):
             raise DSparkDistributedStateError(
                 "Kimi K3 frontier timing evidence was invalid on at least one rank"
             ) from None
-        decoded: list[tuple[int, int]] = []
+        decoded: list[tuple[int, ...]] = []
         for row in rows:
             values = tuple(
-                row[index] * (1 << 30) + row[index + 1] for index in range(1, 5, 2)
+                row[index] * (1 << 30) + row[index + 1]
+                for index in range(1, expected_width, 2)
             )
             if any(value > limit for value in values):
                 raise DSparkDistributedStateError(
                     "Kimi K3 frontier timing evidence exceeded its numeric bound"
                 ) from None
-            decoded.append(cast(tuple[int, int], values))
+            decoded.append(values)
         return decoded[0], decoded[1]
 
     @property
@@ -5441,6 +5570,126 @@ class KimiK3DSparkRequestRuntime:
         """Agree local success before a peer can enter another TP graph."""
 
         return self._agreed_operation(name, operation)
+
+    def defer_defensive_value[T](
+        self,
+        name: str,
+        operation: Callable[[], T],
+        *,
+        failure: Callable[[], T],
+    ) -> T:
+        """Run one pure local value and fold its status into the next boundary."""
+
+        if not self.loaded.config.defer_defensive_agreements:
+            return self.agree_local_value(name, operation)
+        self.loaded.assert_healthy()
+        try:
+            result = operation()
+        except Exception as error:
+            failure_digest = hashlib.sha256(
+                b"exo-kimi-k3-deferred-defensive-error/v1\0"
+            )
+            failure_digest.update(_packed_operation_tag(name).to_bytes(4, "big"))
+            failure_digest.update(type(error).__qualname__.encode("utf-8"))
+            error_fingerprint = (
+                int.from_bytes(failure_digest.digest()[:4], "big") & 0x7FFFFFFF
+            ) or 1
+            self._deferred_defensive_operations.append(
+                (_packed_operation_tag(name), error_fingerprint)
+            )
+            return failure()
+        self._deferred_defensive_operations.append((_packed_operation_tag(name), 0))
+        return result
+
+    def defer_defensive_text(
+        self,
+        name: str,
+        operation: Callable[[], str],
+    ) -> str:
+        """Preserve the exact text agreement while the bundle is disabled."""
+
+        if not self.loaded.config.defer_defensive_agreements:
+            return self.agree_text(name, operation)
+        return self.defer_defensive_value(
+            name,
+            operation,
+            failure=lambda: "",
+        )
+
+    def defer_defensive_side_effect(
+        self,
+        name: str,
+        operation: Callable[[], None],
+    ) -> None:
+        """Run one local callback and defer only its numeric success status."""
+
+        if not self.loaded.config.defer_defensive_agreements:
+            self.agree_local_side_effect(name, operation)
+            return
+        self.defer_defensive_value(
+            name,
+            operation,
+            failure=lambda: None,
+        )
+
+    def _deferred_defensive_status(
+        self,
+        expected_names: tuple[str, ...],
+    ) -> tuple[int, int]:
+        expected_tags = tuple(_packed_operation_tag(name) for name in expected_names)
+        actual_tags = tuple(tag for tag, _error in self._deferred_defensive_operations)
+        digest = hashlib.sha256(b"exo-kimi-k3-deferred-defensive-status/v1\0")
+        digest.update(len(actual_tags).to_bytes(4, "big"))
+        for tag, error_fingerprint in self._deferred_defensive_operations:
+            digest.update(tag.to_bytes(4, "big"))
+            digest.update(error_fingerprint.to_bytes(4, "big"))
+        status_digest = int.from_bytes(digest.digest()[:4], "big") & 0x7FFFFFFF
+        error_fingerprint = next(
+            (
+                value
+                for _tag, value in self._deferred_defensive_operations
+                if value != 0
+            ),
+            0,
+        )
+        if actual_tags != expected_tags:
+            error_fingerprint = (
+                _packed_operation_tag("deferred defensive operation order") or 1
+            )
+        return status_digest, error_fingerprint
+
+    def flush_deferred_defensive_operations(
+        self,
+        stage: str,
+        *,
+        expected_names: tuple[str, ...],
+    ) -> None:
+        """Fail closed in one fixed row after post-control local operations."""
+
+        if not self.loaded.config.defer_defensive_agreements:
+            if self._deferred_defensive_operations:
+                raise RuntimeError("disabled deferred defensive state is not empty")
+            return
+        self.loaded.assert_healthy()
+        status_digest, error_fingerprint = self._deferred_defensive_status(
+            expected_names
+        )
+        agreement = self.collective.agree_packed(
+            f"deferred-defensive:{stage}",
+            local_success=error_fingerprint == 0,
+            error_fingerprint=error_fingerprint,
+            payload=(status_digest,),
+        )
+        if (
+            agreement.success is not True
+            or agreement.error_fingerprint != 0
+            or agreement.payload != (status_digest,)
+        ):
+            raise DSparkDistributedStateError(
+                "Kimi K3 deferred defensive operations failed or disagreed "
+                "across ranks; request caches cannot continue"
+            ) from None
+        self._deferred_defensive_operations.clear()
 
     def agree_local_side_effect(self, name: str, operation: Callable[[], None]) -> None:
         """Agree a callback, preserving only a unanimous callback exception."""
@@ -5588,22 +5837,40 @@ class KimiK3DSparkRequestRuntime:
             result: tuple[int, str | None, bool, str, str] | None = None
             control = (0, 0, 0, 0, 0, 0, 0)
             local_error: str | None = None
-            try:
-                result, control = resolve()
-            except Exception as error:
-                local_error = (
-                    f"response control failed: {type(error).__name__}: {error}"
+            deferred_digest = 0
+            local_error_fingerprint = 0
+            if self.loaded.config.defer_defensive_agreements:
+                (
+                    deferred_digest,
+                    local_error_fingerprint,
+                ) = self._deferred_defensive_status(
+                    ("detokenizer output", "response construction")
                 )
+                if local_error_fingerprint != 0:
+                    local_error = "deferred defensive operation failed"
+            if local_error is None:
+                try:
+                    result, control = resolve()
+                except Exception as error:
+                    local_error = (
+                        f"response control failed: {type(error).__name__}: {error}"
+                    )
+                    local_error_fingerprint = _error_fingerprint(local_error)
+            payload = (
+                (*control, deferred_digest)
+                if self.loaded.config.defer_defensive_agreements
+                else control
+            )
             agreement = self.collective.agree_packed(
                 "response-control",
                 local_success=local_error is None,
-                error_fingerprint=_error_fingerprint(local_error),
-                payload=control,
+                error_fingerprint=local_error_fingerprint,
+                payload=payload,
             )
             if (
                 agreement.success is not True
                 or agreement.error_fingerprint != 0
-                or agreement.payload != control
+                or agreement.payload != payload
                 or result is None
             ):
                 detail = (
@@ -5617,6 +5884,8 @@ class KimiK3DSparkRequestRuntime:
                     "Kimi K3 DSpark response control "
                     f"{detail}; request caches cannot continue"
                 ) from None
+            if self.loaded.config.defer_defensive_agreements:
+                self._deferred_defensive_operations.clear()
             return result
 
         result, control = self._agreed_operation("response control", resolve)
@@ -5648,6 +5917,7 @@ class KimiK3DSparkRequestRuntime:
         inputs: mx.array,
         *,
         speculative_width: int | None = None,
+        validation_ticket: _TargetCacheValidationTicket | None = None,
     ) -> int:
         if inputs.ndim != 2 or inputs.shape[0] != 1 or inputs.shape[1] <= 0:
             raise ValueError("Kimi K3 DSpark target input must be non-empty batch one")
@@ -5656,6 +5926,15 @@ class KimiK3DSparkRequestRuntime:
             raise ValueError(
                 "Kimi K3 target verification width does not match its input"
             )
+        if validation_ticket is not None:
+            if (
+                validation_ticket.cache_identity != id(self.target_cache)
+                or validation_ticket.width != width
+                or speculative_width != width
+                or validation_ticket.initial_offset < 0
+            ):
+                raise ValueError("Kimi K3 target cache validation ticket is invalid")
+            return validation_ticket.initial_offset
         initial_offset = _target_cache_offset(self.target_cache)
         _validate_target_cache(
             self.target_cache,
@@ -5673,6 +5952,7 @@ class KimiK3DSparkRequestRuntime:
         initial_offset: int,
         speculative_width: int | None = None,
         defer_async_decode_boundaries: bool = False,
+        validation_ticket: _TargetCacheValidationTicket | None = None,
     ) -> _BuiltKimiK3TargetForward:
         if inputs.ndim != 2 or inputs.shape[0] != 1 or inputs.shape[1] <= 0:
             raise ValueError("Kimi K3 DSpark target input must be non-empty batch one")
@@ -5689,8 +5969,16 @@ class KimiK3DSparkRequestRuntime:
                 "Kimi K3 deferred async decode requires a speculative width-three "
                 "verification"
             )
-        if _target_cache_offset(self.target_cache) != initial_offset:
-            raise ValueError("Kimi K3 target cache moved after its readiness gate")
+        if validation_ticket is None:
+            if _target_cache_offset(self.target_cache) != initial_offset:
+                raise ValueError("Kimi K3 target cache moved after its readiness gate")
+        elif (
+            validation_ticket.cache_identity != id(self.target_cache)
+            or validation_ticket.initial_offset != initial_offset
+            or validation_ticket.width != width
+            or speculative_width != width
+        ):
+            raise ValueError("Kimi K3 target cache validation ticket is invalid")
         forward_method = cast(
             _TargetWithAuxForward,
             self.target_model,
@@ -6042,6 +6330,7 @@ class KimiK3DSparkRequestRuntime:
         self,
         proposal_block: tuple[int, ...],
         plan: TargetVerificationPlan,
+        validation_ticket: _TargetCacheValidationTicket | None = None,
     ) -> _TargetPosteriorGraph:
         proposal_block = _token_tuple(
             proposal_block,
@@ -6054,6 +6343,7 @@ class KimiK3DSparkRequestRuntime:
         initial_offset = self._validate_forward_readiness(
             input_ids,
             speculative_width=len(proposal_block),
+            validation_ticket=validation_ticket,
         )
         if plan.mode == "compact":
             forward_method = cast(
@@ -6119,6 +6409,7 @@ class KimiK3DSparkRequestRuntime:
             initial_offset=initial_offset,
             speculative_width=len(proposal_block),
             defer_async_decode_boundaries=plan.deferred_async_width3,
+            validation_ticket=validation_ticket,
         )
         tokens = _build_greedy_dspark_posterior_tokens(
             forward.forward.logits,
@@ -6129,6 +6420,18 @@ class KimiK3DSparkRequestRuntime:
             forward,
             tokens,
             len(proposal_block),
+        )
+
+    def _build_verification_memoized(
+        self,
+        proposal_block: tuple[int, ...],
+        plan: TargetVerificationPlan,
+        validation_ticket: _TargetCacheValidationTicket,
+    ) -> _TargetPosteriorGraph:
+        return self._build_verification(
+            proposal_block,
+            plan,
+            validation_ticket=validation_ticket,
         )
 
     def _preflight_ordinary(self, anchor_token: int) -> OrdinaryDecodePlan:
@@ -6232,6 +6535,14 @@ class KimiK3DSparkRequestRuntime:
                 speculative_phase="open",
                 speculative_width=width,
             ),
+            build_verify_memoized=self._build_verification_memoized,
+            validate_initial_closed=lambda observed_offset: _validate_target_cache(
+                self.target_cache,
+                expected_offset=observed_offset,
+                require_kda_state=True,
+                observed_offset=observed_offset,
+            ),
+            memoize_validation=self.loaded.config.defer_defensive_agreements,
         )
         recorder: DSparkConfidenceRecorder | None = None
         capture_config = self.loaded.config.confidence_capture
@@ -6350,22 +6661,48 @@ def dspark_decode_tokens(
     force_ordinary: bool = False,
     round_observer: Callable[[DSparkRoundTelemetry], None] | None = None,
     token_observer: Callable[[bool], None] | None = None,
+    measure_round_gaps: bool = False,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> Iterator[DSparkDecodedToken]:
     """Flatten committed rounds while preserving earliest EOS and length limits."""
 
     if type(max_tokens) is not int or max_tokens <= 0:
         raise ValueError("Kimi K3 DSpark max tokens must be positive")
+    if type(measure_round_gaps) is not bool:
+        raise TypeError("Kimi K3 round-gap telemetry selector must be boolean")
     eos = frozenset(eos_token_ids)
     emitted = 0
     next_anchor = anchor_token
+    previous_round_returned: float | None = None
+    telemetry_clock = _nonthrowing_telemetry_clock(clock)
     try:
         while emitted < max_tokens:
             remaining = max_tokens - emitted
+            round_called = telemetry_clock() if measure_round_gaps else 0.0
+            interround_ms = (
+                0.0
+                if not measure_round_gaps or previous_round_returned is None
+                else max(0.0, (round_called - previous_round_returned) * 1000.0)
+            )
             result = (
                 engine.decode_ordinary_tail(next_anchor)
                 if force_ordinary or remaining < engine.verify_width
                 else engine.decode_round(next_anchor, remaining=remaining)
             )
+            if measure_round_gaps:
+                previous_round_returned = telemetry_clock()
+                round_wall_ms = max(
+                    0.0,
+                    (previous_round_returned - round_called) * 1000.0,
+                )
+                result = replace(
+                    result,
+                    telemetry=replace(
+                        result.telemetry,
+                        round_wall_ms=round_wall_ms,
+                        interround_ms=interround_ms,
+                    ),
+                )
             if round_observer is not None:
                 try:
                     round_observer(result.telemetry)

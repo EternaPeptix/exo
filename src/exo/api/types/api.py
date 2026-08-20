@@ -391,6 +391,16 @@ class K3W3CompositionReceiptV5(K3W3CompositionReceiptV4):
     frontier_prelaunch_ns: int
     frontier_target_commit_ns_rank1: int
     frontier_prelaunch_ns_rank1: int
+    bookkeeping_bundle_enabled: bool
+    timing_rounds: int
+    rank0_round_wall_ns_total: int
+    rank0_interround_ns_total: int
+    rank0_round_wall_ns_max: int
+    rank0_interround_ns_max: int
+    rank1_round_wall_ns_total: int
+    rank1_interround_ns_total: int
+    rank1_round_wall_ns_max: int
+    rank1_interround_ns_max: int
 
     @model_validator(mode="after")
     def _validate_frontier_schedule_and_timing(self) -> "K3W3CompositionReceiptV5":
@@ -400,6 +410,16 @@ class K3W3CompositionReceiptV5(K3W3CompositionReceiptV4):
             row.width == 2 and row.consumed == 2 for row in self.frontier_round_schedule
         )
         partial_accept_rows = width2_rows - full_accept_rows
+        bookkeeping_values = (
+            self.rank0_round_wall_ns_total,
+            self.rank0_interround_ns_total,
+            self.rank0_round_wall_ns_max,
+            self.rank0_interround_ns_max,
+            self.rank1_round_wall_ns_total,
+            self.rank1_interround_ns_total,
+            self.rank1_round_wall_ns_max,
+            self.rank1_interround_ns_max,
+        )
         if (
             not self.frontier_round_schedule
             or len(self.frontier_round_schedule) > 32768
@@ -414,6 +434,7 @@ class K3W3CompositionReceiptV5(K3W3CompositionReceiptV4):
                     self.frontier_prelaunch_ns,
                     self.frontier_target_commit_ns_rank1,
                     self.frontier_prelaunch_ns_rank1,
+                    *bookkeeping_values,
                 )
             )
             or len(self.frontier_round_schedule)
@@ -429,6 +450,31 @@ class K3W3CompositionReceiptV5(K3W3CompositionReceiptV4):
             or self.emitted_tokens
             != len(self.frontier_round_schedule)
             + sum(row.consumed for row in self.frontier_round_schedule)
+            or (
+                self.bookkeeping_bundle_enabled
+                and (
+                    self.timing_rounds != len(self.frontier_round_schedule)
+                    or self.rank0_round_wall_ns_total <= 0
+                    or self.rank0_round_wall_ns_max <= 0
+                    or self.rank1_round_wall_ns_total <= 0
+                    or self.rank1_round_wall_ns_max <= 0
+                    or self.rank0_round_wall_ns_max > self.rank0_round_wall_ns_total
+                    or self.rank0_interround_ns_max > self.rank0_interround_ns_total
+                    or self.rank1_round_wall_ns_max > self.rank1_round_wall_ns_total
+                    or self.rank1_interround_ns_max > self.rank1_interround_ns_total
+                    or (
+                        self.timing_rounds > 1
+                        and (
+                            self.rank0_interround_ns_total <= 0
+                            or self.rank1_interround_ns_total <= 0
+                        )
+                    )
+                )
+            )
+            or (
+                not self.bookkeeping_bundle_enabled
+                and (self.timing_rounds != 0 or any(bookkeeping_values))
+            )
         ):
             raise ValueError("Kimi K3 frontier v5 schedule/timing/core join is invalid")
         return self
