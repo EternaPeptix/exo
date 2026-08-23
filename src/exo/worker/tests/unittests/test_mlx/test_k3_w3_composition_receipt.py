@@ -2291,6 +2291,15 @@ def _scenario_frontier_receipt_v5(generate_module: ModuleType) -> None:
         K3W3CompositionReceiptV4,
         K3W3CompositionReceiptV5,
     )
+    from exo.shared.types.chunks import TokenChunk
+    from exo.shared.types.common import (
+        CommandId,
+        ModelId,
+        NodeId,
+        SessionId,
+        SystemId,
+    )
+    from exo.shared.types.events import ChunkGenerated, LocalForwarderEvent
     from exo.shared.types.memory import Memory
 
     fixture = _build_fixture(generate_module, identity_enabled=True)
@@ -2406,6 +2415,74 @@ def _scenario_frontier_receipt_v5(generate_module: ModuleType) -> None:
     assert "frontier_telemetry_file_digest_rank1_word_3" in serialized_receipt
     assert not any(
         key.startswith(("process_rss_", "rss_", "metal_")) for key in serialized_receipt
+    )
+
+    forwarded = LocalForwarderEvent(
+        origin_idx=7,
+        origin=SystemId("rank0-system"),
+        session=SessionId(master_node_id=NodeId("master"), election_clock=3),
+        event=ChunkGenerated(
+            command_id=CommandId("command"),
+            chunk=TokenChunk(
+                model=ModelId("model"),
+                text="token",
+                token_id=42,
+                usage=None,
+                stats=GenerationStats(
+                    prompt_tps=1.0,
+                    generation_tps=2.0,
+                    prompt_tokens=3,
+                    generation_tokens=4,
+                    peak_memory_usage=Memory.from_bytes(5),
+                    frontier_round_schedule=receipt.frontier_round_schedule,
+                    frontier_target_commit_ns=receipt.frontier_target_commit_ns,
+                    frontier_prelaunch_ns=receipt.frontier_prelaunch_ns,
+                    k3_w3_composition_receipt=receipt,
+                ),
+            ),
+        ),
+    )
+    forwarded_wire = forwarded.model_dump_json()
+    restored_forwarded = LocalForwarderEvent.model_validate_json(forwarded_wire)
+    assert restored_forwarded == forwarded
+    assert isinstance(restored_forwarded.event, ChunkGenerated)
+    assert isinstance(restored_forwarded.event.chunk, TokenChunk)
+    assert restored_forwarded.event.chunk.stats is not None
+    restored_receipt = (
+        restored_forwarded.event.chunk.stats.k3_w3_composition_receipt
+    )
+    assert isinstance(restored_receipt, K3W3CompositionReceiptV5)
+    assert restored_receipt.frontier_round_schedule == receipt.frontier_round_schedule
+
+    forwarded_payload = json.loads(forwarded_wire)
+    forwarded_receipt = forwarded_payload["event"]["ChunkGenerated"]["chunk"][
+        "TokenChunk"
+    ]["stats"]["k3_w3_composition_receipt"]
+    wrong_shape = json.loads(forwarded_wire)
+    wrong_shape_receipt = wrong_shape["event"]["ChunkGenerated"]["chunk"][
+        "TokenChunk"
+    ]["stats"]["k3_w3_composition_receipt"]
+    wrong_shape_receipt["frontier_round_schedule"] = {
+        "first": forwarded_receipt["frontier_round_schedule"][0]
+    }
+    _expect_error(
+        Exception,
+        "frontier round schedule must be an exact list or tuple",
+        lambda: LocalForwarderEvent.model_validate_json(
+            json.dumps(wrong_shape, sort_keys=True, separators=(",", ":"))
+        ),
+    )
+    algebra_tamper = json.loads(forwarded_wire)
+    algebra_receipt = algebra_tamper["event"]["ChunkGenerated"]["chunk"][
+        "TokenChunk"
+    ]["stats"]["k3_w3_composition_receipt"]
+    algebra_receipt["frontier_round_schedule"][0]["consumed"] = 1
+    _expect_error(
+        Exception,
+        "schedule/timing/core join is invalid",
+        lambda: LocalForwarderEvent.model_validate_json(
+            json.dumps(algebra_tamper, sort_keys=True, separators=(",", ":"))
+        ),
     )
 
     substituted = receipt.model_dump(mode="json", by_alias=True)

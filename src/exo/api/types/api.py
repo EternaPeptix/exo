@@ -402,6 +402,17 @@ class K3W3CompositionReceiptV5(K3W3CompositionReceiptV4):
     rank1_round_wall_ns_max: int
     rank1_interround_ns_max: int
 
+    @field_validator("frontier_round_schedule", mode="before")
+    @classmethod
+    def _normalize_json_round_schedule(cls, value: Any) -> Any:
+        if type(value) is list:
+            return tuple(value)
+        if type(value) is tuple:
+            return value
+        raise ValueError(
+            "Kimi K3 frontier round schedule must be an exact list or tuple"
+        )
+
     @model_validator(mode="after")
     def _validate_frontier_schedule_and_timing(self) -> "K3W3CompositionReceiptV5":
         width2_rows = sum(row.width == 2 for row in self.frontier_round_schedule)
