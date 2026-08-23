@@ -399,7 +399,7 @@ def _metal_sample(mx_module: _MxMemory) -> tuple[int, int, int, int]:
     cache = _nonnegative_int(mx_module.get_cache_memory(), "Metal cache memory")
     peak = _nonnegative_int(mx_module.get_peak_memory(), "Metal active peak memory")
     residency = active + cache
-    if residency > _MAX_COUNTER or peak < active:
+    if residency > _MAX_COUNTER:
         raise ValueError("Metal memory counters violate allocator algebra")
     return active, cache, residency, peak
 

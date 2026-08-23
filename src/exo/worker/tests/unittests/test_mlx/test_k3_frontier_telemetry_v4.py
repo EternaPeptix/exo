@@ -170,6 +170,23 @@ class TestDisabledDefault(TelemetryCase):
 
 
 class TestSequenceAndEvidence(TelemetryCase):
+    def test_post_reset_zero_peak_with_live_model_memory_is_valid(self) -> None:
+        self._enable()
+        context = self._claim(1)
+        assert context is not None
+
+        # MLX reset_peak_memory() sets the request peak to zero without
+        # releasing the already-loaded model represented by active memory.
+        self.mx.peak = 0
+        self.mod.capture_reset_baseline(context)
+
+        assert context.baseline is not None
+        self.assertEqual(context.baseline.metal_active_bytes, 2_000)
+        self.assertEqual(context.baseline.metal_cache_bytes, 300)
+        self.assertEqual(context.baseline.metal_residency_bytes, 2_300)
+        self.assertEqual(context.baseline.metal_active_peak_bytes, 0)
+        self.mod.abort(context)
+
     def test_one_request_is_sanitized_and_hash_bound(self) -> None:
         self._enable()
         evidence = self._finish(1)
