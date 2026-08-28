@@ -220,6 +220,9 @@ def prepare(work_dir: Path) -> None:
                 plan.source.name: _tensor_manifest(plan, full_weights.name)
                 for plan in plans
             }
+            # Mirror the converter: the loader requires the per-file record to
+            # carry its own tensors mapping (rank_local_loader._verify_manifest).
+            record["tensors"] = tensors
             manifest = {
                 "schema": SCHEMA,
                 "complete": True,
