@@ -91,6 +91,7 @@ ALLOWED_METADATA_FILENAMES = frozenset(
         "preprocessor_config.json",
         "processor_config.json",
         "special_tokens_map.json",
+        "tiktoken.model",
         "tokenization_kimi.py",
         "tokenizer.json",
         "tokenizer_config.json",
